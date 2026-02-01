@@ -288,10 +288,10 @@ pub fn openai_to_codex_request(raw: &Value, model: &str, stream: bool) -> Value 
     out
 }
 
-pub fn codex_stream_to_openai_events(
+pub fn codex_stream_to_openai_chunks(
     response: reqwest::Response,
     original_request: Value,
-) -> impl Stream<Item = Result<Event, Infallible>> {
+) -> impl Stream<Item = String> {
     let reverse_map = build_reverse_map_from_original_openai(&original_request);
     async_stream::stream! {
         let mut state = CodexStreamState {
@@ -324,17 +324,25 @@ pub fn codex_stream_to_openai_events(
                     continue;
                 }
                 if data == "[DONE]" {
-                    yield Ok(Event::default().data("[DONE]"));
+                    yield "[DONE]".to_string();
                     return;
                 }
                 for chunk in convert_codex_stream_chunk(data, &mut state) {
-                    yield Ok(Event::default().data(chunk));
+                    yield chunk;
                 }
             }
         }
 
-        yield Ok(Event::default().data("[DONE]"));
+        yield "[DONE]".to_string();
     }
+}
+
+pub fn codex_stream_to_openai_events(
+    response: reqwest::Response,
+    original_request: Value,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    codex_stream_to_openai_chunks(response, original_request)
+        .map(|chunk| Ok(Event::default().data(chunk)))
 }
 
 pub async fn collect_non_stream_response(

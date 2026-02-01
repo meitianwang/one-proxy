@@ -1,8 +1,10 @@
 // API request handlers
 
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
-    response::{Html, IntoResponse, Json, Response, Sse},
+    http::{header, HeaderValue, StatusCode},
+    response::{sse::Event, Html, IntoResponse, Json, Response, Sse},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -15,8 +17,12 @@ use super::AppState;
 use crate::auth::{self, providers::{google, anthropic, antigravity as antigravity_oauth, openai}, AuthFile, TokenInfo};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use futures::{StreamExt, TryStreamExt};
+use flate2::read::GzDecoder;
+use std::io::Read;
 
 #[derive(Debug, Clone)]
 struct GeminiAuth {
@@ -259,6 +265,327 @@ fn normalize_provider_prefix(prefix: &str) -> Option<String> {
         "claude" => Some("claude".to_string()),
         "antigravity" => Some("antigravity".to_string()),
         _ => None,
+    }
+}
+
+fn completions_prompt_text(raw: &Value) -> String {
+    if let Some(prompt) = raw.get("prompt") {
+        if let Some(text) = prompt.as_str() {
+            if !text.is_empty() {
+                return text.to_string();
+            }
+        }
+        if let Some(arr) = prompt.as_array() {
+            let mut combined = String::new();
+            for item in arr {
+                if let Some(text) = item.as_str() {
+                    combined.push_str(text);
+                }
+            }
+            if !combined.is_empty() {
+                return combined;
+            }
+        }
+    }
+    "Complete this:".to_string()
+}
+
+fn convert_completions_request_to_chat(raw: &Value) -> Value {
+    let prompt = completions_prompt_text(raw);
+    let mut out = json!({
+        "model": "",
+        "messages": [{
+            "role": "user",
+            "content": ""
+        }]
+    });
+
+    if let Some(model) = raw.get("model").and_then(|v| v.as_str()) {
+        out["model"] = json!(model);
+    }
+    out["messages"][0]["content"] = json!(prompt);
+
+    for (key, dest_key) in [
+        ("max_tokens", "max_tokens"),
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("frequency_penalty", "frequency_penalty"),
+        ("presence_penalty", "presence_penalty"),
+        ("stop", "stop"),
+        ("stream", "stream"),
+        ("logprobs", "logprobs"),
+        ("top_logprobs", "top_logprobs"),
+        ("echo", "echo"),
+    ] {
+        if let Some(value) = raw.get(key) {
+            out[dest_key] = value.clone();
+        }
+    }
+
+    out
+}
+
+fn convert_chat_response_to_completions(raw: &Value) -> Value {
+    let mut out = json!({
+        "id": "",
+        "object": "text_completion",
+        "created": 0,
+        "model": "",
+        "choices": []
+    });
+
+    if let Some(id) = raw.get("id") {
+        out["id"] = id.clone();
+    }
+    if let Some(created) = raw.get("created") {
+        out["created"] = created.clone();
+    }
+    if let Some(model) = raw.get("model") {
+        out["model"] = model.clone();
+    }
+    if let Some(usage) = raw.get("usage") {
+        out["usage"] = usage.clone();
+    }
+
+    if let Some(choices) = raw.get("choices").and_then(|v| v.as_array()) {
+        let mut converted = Vec::with_capacity(choices.len());
+        for choice in choices {
+            let mut item = serde_json::Map::new();
+            if let Some(index) = choice.get("index") {
+                item.insert("index".to_string(), index.clone());
+            }
+            if let Some(message) = choice.get("message") {
+                if let Some(content) = message.get("content") {
+                    item.insert("text".to_string(), content.clone());
+                }
+            } else if let Some(delta) = choice.get("delta") {
+                if let Some(content) = delta.get("content") {
+                    item.insert("text".to_string(), content.clone());
+                }
+            }
+            if let Some(finish) = choice.get("finish_reason") {
+                item.insert("finish_reason".to_string(), finish.clone());
+            }
+            if let Some(logprobs) = choice.get("logprobs") {
+                item.insert("logprobs".to_string(), logprobs.clone());
+            }
+            converted.push(Value::Object(item));
+        }
+        out["choices"] = Value::Array(converted);
+    }
+
+    out
+}
+
+fn convert_chat_stream_chunk_to_completions(chunk: &str) -> Option<String> {
+    let raw: Value = serde_json::from_str(chunk).ok()?;
+    let choices = raw.get("choices")?.as_array()?;
+
+    let mut has_content = false;
+    for choice in choices {
+        if let Some(delta) = choice.get("delta") {
+            if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                if !content.is_empty() {
+                    has_content = true;
+                    break;
+                }
+            }
+        }
+        if let Some(finish) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+            if !finish.is_empty() && finish != "null" {
+                has_content = true;
+                break;
+            }
+        }
+    }
+
+    if !has_content {
+        return None;
+    }
+
+    let converted = convert_chat_response_to_completions(&raw);
+    serde_json::to_string(&converted).ok()
+}
+
+fn maybe_decompress_gzip(bytes: &[u8]) -> Vec<u8> {
+    if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+        let mut decoder = GzDecoder::new(bytes);
+        let mut out = Vec::new();
+        if decoder.read_to_end(&mut out).is_ok() {
+            return out;
+        }
+    }
+    bytes.to_vec()
+}
+
+#[derive(Default)]
+struct ClaudeStreamState {
+    message_id: String,
+    model: String,
+    message_started: bool,
+    content_started: bool,
+    finish_reason: Option<String>,
+}
+
+fn map_openai_finish_reason(reason: Option<&str>) -> Option<&'static str> {
+    match reason {
+        Some("stop") => Some("end_turn"),
+        Some("length") => Some("max_tokens"),
+        Some("tool_calls") => Some("tool_use"),
+        Some("content_filter") => Some("stop_sequence"),
+        _ => None,
+    }
+}
+
+fn build_claude_event(event: &str, payload: Value) -> Event {
+    Event::default().event(event).data(payload.to_string())
+}
+
+fn openai_chunk_to_claude_events(chunk: &str, state: &mut ClaudeStreamState) -> Vec<Event> {
+    let mut events = Vec::new();
+    let parsed: Value = match serde_json::from_str(chunk) {
+        Ok(v) => v,
+        Err(_) => return events,
+    };
+
+    if !state.message_started {
+        if state.message_id.is_empty() {
+            if let Some(id) = parsed.get("id").and_then(|v| v.as_str()) {
+                if !id.is_empty() {
+                    state.message_id = id.to_string();
+                }
+            }
+            if state.message_id.is_empty() {
+                state.message_id = format!("msg_{}", uuid::Uuid::new_v4());
+            }
+        }
+        if state.model.is_empty() {
+            if let Some(model) = parsed.get("model").and_then(|v| v.as_str()) {
+                if !model.is_empty() {
+                    state.model = model.to_string();
+                }
+            }
+        }
+
+        let payload = json!({
+            "type": "message_start",
+            "message": {
+                "id": state.message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": state.model,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0
+                }
+            }
+        });
+        events.push(build_claude_event("message_start", payload));
+        state.message_started = true;
+    }
+
+    if let Some(choice) = parsed
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .and_then(|v| v.first())
+    {
+        if let Some(finish) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+            if !finish.is_empty() {
+                state.finish_reason = Some(finish.to_string());
+            }
+        }
+        if let Some(delta) = choice.get("delta") {
+            if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                if !content.is_empty() {
+                    if !state.content_started {
+                        let payload = json!({
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {
+                                "type": "text",
+                                "text": ""
+                            }
+                        });
+                        events.push(build_claude_event("content_block_start", payload));
+                        state.content_started = true;
+                    }
+                    let payload = json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {
+                            "type": "text_delta",
+                            "text": content
+                        }
+                    });
+                    events.push(build_claude_event("content_block_delta", payload));
+                }
+            }
+        }
+    }
+
+    events
+}
+
+fn finalize_claude_stream(state: &mut ClaudeStreamState) -> Vec<Event> {
+    let mut events = Vec::new();
+    if state.content_started {
+        events.push(build_claude_event(
+            "content_block_stop",
+            json!({
+                "type": "content_block_stop",
+                "index": 0
+            }),
+        ));
+    }
+    let stop_reason = map_openai_finish_reason(state.finish_reason.as_deref());
+    events.push(build_claude_event(
+        "message_delta",
+        json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": stop_reason,
+                "stop_sequence": null
+            }
+        }),
+    ));
+    events.push(build_claude_event(
+        "message_stop",
+        json!({ "type": "message_stop" }),
+    ));
+    events
+}
+
+fn openai_chunks_to_claude_events<S>(
+    upstream: S,
+    model_hint: &str,
+) -> impl futures::Stream<Item = Result<Event, Infallible>>
+where
+    S: futures::Stream<Item = String>,
+{
+    let model_hint = model_hint.to_string();
+    async_stream::stream! {
+        let mut state = ClaudeStreamState {
+            model: model_hint,
+            ..ClaudeStreamState::default()
+        };
+        futures::pin_mut!(upstream);
+        while let Some(chunk) = upstream.next().await {
+            if chunk == "[DONE]" {
+                for event in finalize_claude_stream(&mut state) {
+                    yield Ok::<Event, Infallible>(event);
+                }
+                return;
+            }
+            for event in openai_chunk_to_claude_events(&chunk, &mut state) {
+                yield Ok::<Event, Infallible>(event);
+            }
+        }
+        for event in finalize_claude_stream(&mut state) {
+            yield Ok::<Event, Infallible>(event);
+        }
     }
 }
 
@@ -1268,53 +1595,945 @@ pub async fn chat_completions(
 
 pub async fn completions(
     State(_state): State<AppState>,
-    Json(_request): Json<Value>,
-) -> impl IntoResponse {
-    // TODO: Implement completions endpoint
+    Json(raw): Json<Value>,
+) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let is_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let chat_request = convert_completions_request_to_chat(&raw);
+    let raw_model = chat_request.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let (provider_override, model) = parse_provider_prefix(&raw_model);
+
+    if provider_override.is_none() {
+        return Json(json!({
+            "error": {
+                "message": "Model must include provider prefix (e.g. 'gemini/...', 'claude/...', 'codex/...', 'antigravity/...').",
+                "type": "invalid_request_error",
+                "code": 400
+            }
+        }))
+        .into_response();
+    }
+
+    if provider_override.as_deref() == Some("gemini") {
+        let auth = match get_gemini_auth(&model).await {
+            Some(a) => a,
+            None => {
+                return Json(json!({
+                    "error": {
+                        "message": "No valid Gemini credentials found. Please login with Google first.",
+                        "type": "authentication_error",
+                        "code": 401
+                    }
+                }))
+                .into_response();
+            }
+        };
+
+        let client = GeminiClient::new(auth.access_token);
+        let mut gemini_request = gemini::openai_to_gemini_cli_request(&chat_request, &model);
+        if let Some(project_id) = auth.project_id {
+            gemini_request["project"] = json!(project_id);
+        }
+
+        if is_stream {
+            match client.stream_generate_content(&gemini_request).await {
+                Ok(response) => {
+                    let upstream = gemini::gemini_cli_stream_to_openai_chunks(response);
+                    let stream = async_stream::stream! {
+                        futures::pin_mut!(upstream);
+                        while let Some(chunk) = upstream.next().await {
+                            if chunk == "[DONE]" {
+                                yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
+                                return;
+                            }
+                            if let Some(converted) = convert_chat_stream_chunk_to_completions(&chunk) {
+                                yield Ok::<Event, Infallible>(Event::default().data(converted));
+                            }
+                        }
+                        yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
+                    };
+                    return Sse::new(stream).into_response();
+                }
+                Err(e) => {
+                    tracing::error!("Gemini API error: {}", e);
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Gemini API error: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            }
+        }
+
+        match client.generate_content(&gemini_request).await {
+            Ok(response) => {
+                let openai_response =
+                    gemini::gemini_to_openai_response(&response, &model, &request_id);
+                let completions_response = convert_chat_response_to_completions(&openai_response);
+                return Json(completions_response).into_response();
+            }
+            Err(e) => {
+                tracing::error!("Gemini API error: {}", e);
+                return Json(json!({
+                    "error": {
+                        "message": format!("Gemini API error: {}", e),
+                        "type": "api_error",
+                        "code": 500
+                    }
+                }))
+                .into_response();
+            }
+        }
+    }
+
+    if provider_override.as_deref() == Some("codex") {
+        let token = match get_codex_token(&model).await {
+            Some(t) => t,
+            None => {
+                return Json(json!({
+                    "error": {
+                        "message": "No valid Codex credentials found. Please login with Codex first.",
+                        "type": "authentication_error",
+                        "code": 401
+                    }
+                }))
+                .into_response();
+            }
+        };
+
+        let client = CodexClient::new(token);
+        let codex_request = codex::openai_to_codex_request(&chat_request, &model, true);
+
+        if is_stream {
+            match client.stream_responses(&codex_request, true).await {
+                Ok(response) => {
+                    let upstream = codex::codex_stream_to_openai_chunks(response, chat_request.clone());
+                    let stream = async_stream::stream! {
+                        futures::pin_mut!(upstream);
+                        while let Some(chunk) = upstream.next().await {
+                            if chunk == "[DONE]" {
+                                yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
+                                return;
+                            }
+                            if let Some(converted) = convert_chat_stream_chunk_to_completions(&chunk) {
+                                yield Ok::<Event, Infallible>(Event::default().data(converted));
+                            }
+                        }
+                        yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
+                    };
+                    return Sse::new(stream).into_response();
+                }
+                Err(e) => {
+                    tracing::error!("Codex API error: {}", e);
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Codex API error: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            }
+        }
+
+        match client.stream_responses(&codex_request, true).await {
+            Ok(response) => match codex::collect_non_stream_response(response, &chat_request).await {
+                Ok(openai_response) => {
+                    let completions_response = convert_chat_response_to_completions(&openai_response);
+                    return Json(completions_response).into_response();
+                }
+                Err(e) => {
+                    tracing::error!("Codex API error: {}", e);
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Codex API error: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            },
+            Err(e) => {
+                tracing::error!("Codex API error: {}", e);
+                return Json(json!({
+                    "error": {
+                        "message": format!("Codex API error: {}", e),
+                        "type": "api_error",
+                        "code": 500
+                    }
+                }))
+                .into_response();
+            }
+        }
+    }
+
+    if provider_override.as_deref() == Some("antigravity") {
+        let auth = match get_antigravity_auth(&model).await {
+            Some(a) => a,
+            None => {
+                return Json(json!({
+                    "error": {
+                        "message": "No valid Antigravity credentials found. Please login with Antigravity first.",
+                        "type": "authentication_error",
+                        "code": 401
+                    }
+                }))
+                .into_response();
+            }
+        };
+
+        let AntigravityAuth {
+            access_token,
+            project_id,
+        } = auth;
+        let client = AntigravityClient::new(access_token);
+        let antigravity_request =
+            antigravity::openai_to_antigravity_request(&chat_request, &model, project_id);
+
+        if is_stream {
+            match client.stream_generate_content(&antigravity_request, None).await {
+                Ok(response) => {
+                    let upstream = antigravity::antigravity_stream_to_openai_chunks(response);
+                    let stream = async_stream::stream! {
+                        futures::pin_mut!(upstream);
+                        while let Some(chunk) = upstream.next().await {
+                            if chunk == "[DONE]" {
+                                yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
+                                return;
+                            }
+                            if let Some(converted) = convert_chat_stream_chunk_to_completions(&chunk) {
+                                yield Ok::<Event, Infallible>(Event::default().data(converted));
+                            }
+                        }
+                        yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
+                    };
+                    return Sse::new(stream).into_response();
+                }
+                Err(e) => {
+                    tracing::error!("Antigravity API error: {}", e);
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Antigravity API error: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            }
+        }
+
+        if antigravity::should_use_stream_for_non_stream(&model) {
+            match client.stream_generate_content(&antigravity_request, None).await {
+                Ok(response) => match antigravity::collect_antigravity_stream(response).await {
+                    Ok(payload) => {
+                        let openai_response =
+                            gemini::gemini_to_openai_response(&payload, &model, &request_id);
+                        let completions_response = convert_chat_response_to_completions(&openai_response);
+                        return Json(completions_response).into_response();
+                    }
+                    Err(e) => {
+                        tracing::error!("Antigravity API error: {}", e);
+                        return Json(json!({
+                            "error": {
+                                "message": format!("Antigravity API error: {}", e),
+                                "type": "api_error",
+                                "code": 500
+                            }
+                        }))
+                        .into_response();
+                    }
+                },
+                Err(e) => {
+                    tracing::error!("Antigravity API error: {}", e);
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Antigravity API error: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            }
+        }
+
+        match client.generate_content(&antigravity_request, None).await {
+            Ok(response) => {
+                let openai_response =
+                    gemini::gemini_to_openai_response(&response, &model, &request_id);
+                let completions_response = convert_chat_response_to_completions(&openai_response);
+                return Json(completions_response).into_response();
+            }
+            Err(e) => {
+                tracing::error!("Antigravity API error: {}", e);
+                return Json(json!({
+                    "error": {
+                        "message": format!("Antigravity API error: {}", e),
+                        "type": "api_error",
+                        "code": 500
+                    }
+                }))
+                .into_response();
+            }
+        }
+    }
+
+    if provider_override.as_deref() == Some("claude") {
+        let request: ChatCompletionRequest = match serde_json::from_value(chat_request.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                return Json(json!({
+                    "error": {
+                        "message": format!("Invalid request: {}", e),
+                        "type": "invalid_request_error",
+                        "code": 400
+                    }
+                }))
+                .into_response();
+            }
+        };
+
+        let token = match get_claude_token(&model).await {
+            Some(t) => t,
+            None => {
+                return Json(json!({
+                    "error": {
+                        "message": "No valid Claude credentials found. Please login with Anthropic first.",
+                        "type": "authentication_error",
+                        "code": 401
+                    }
+                }))
+                .into_response();
+            }
+        };
+
+        let client = ClaudeClient::new(token);
+        let (messages, system) = claude::openai_to_claude_messages(&request.messages);
+        let claude_request = ClaudeRequest {
+            model: request.model.clone(),
+            messages,
+            max_tokens: request.max_tokens.unwrap_or(4096),
+            temperature: request.temperature,
+            system,
+        };
+
+        match client.create_message(claude_request).await {
+            Ok(response) => {
+                let openai_response =
+                    claude::claude_to_openai_response(&response, &request.model, &request_id);
+                let completions_response = convert_chat_response_to_completions(&openai_response);
+                return Json(completions_response).into_response();
+            }
+            Err(e) => {
+                tracing::error!("Claude API error: {}", e);
+                return Json(json!({
+                    "error": {
+                        "message": format!("Claude API error: {}", e),
+                        "type": "api_error",
+                        "code": 500
+                    }
+                }))
+                .into_response();
+            }
+        }
+    }
+
     Json(json!({
-        "error": "Completions endpoint not yet implemented"
+        "error": {
+            "message": "Unsupported provider. Use a supported provider prefix (gemini/..., claude/..., codex/..., antigravity/...).",
+            "type": "invalid_request_error",
+            "code": 400
+        }
     }))
+    .into_response()
 }
 
 // Claude compatible endpoint
 pub async fn claude_messages(
     State(_state): State<AppState>,
-    Json(_request): Json<Value>,
-) -> impl IntoResponse {
-    // TODO: Implement Claude messages endpoint
+    Json(raw): Json<Value>,
+) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let raw_model = raw.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let (provider_override, model) = parse_provider_prefix(&raw_model);
+    let is_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if provider_override.is_none() {
+        return Json(json!({
+            "error": {
+                "message": "Model must include provider prefix (e.g. 'gemini/...', 'claude/...', 'codex/...', 'antigravity/...').",
+                "type": "invalid_request_error",
+                "code": 400
+            }
+        }))
+        .into_response();
+    }
+
+    if provider_override.as_deref() == Some("claude") {
+        let token = match get_claude_token(&model).await {
+            Some(t) => t,
+            None => {
+                return Json(json!({
+                    "error": {
+                        "message": "No valid Claude credentials found. Please login with Anthropic first.",
+                        "type": "authentication_error",
+                        "code": 401
+                    }
+                }))
+                .into_response();
+            }
+        };
+
+        let mut payload = raw.clone();
+        payload["model"] = json!(model);
+        if is_stream {
+            payload["stream"] = json!(true);
+        }
+
+        let url = "https://api.anthropic.com/v1/messages";
+        let client = reqwest::Client::new();
+        let response = match client
+            .post(url)
+            .header("x-api-key", token)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Json(json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": format!("Claude API error: {}", e)
+                    }
+                }))
+                .into_response();
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.bytes().await.unwrap_or_default();
+            let mut resp = Response::new(Body::from(body));
+            *resp.status_mut() = status;
+            resp.headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            return resp;
+        }
+
+        if is_stream {
+            let stream = response
+                .bytes_stream()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+            let mut resp = Response::new(Body::from_stream(stream));
+            *resp.status_mut() = StatusCode::OK;
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            return resp;
+        }
+
+        let body = response.bytes().await.unwrap_or_default();
+        let body = maybe_decompress_gzip(&body);
+        let json_body: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+        return Json(json_body).into_response();
+    }
+
+    let openai_raw = claude::claude_request_to_openai_chat(&raw, &model);
+
+    if provider_override.as_deref() == Some("gemini") {
+        let auth = match get_gemini_auth(&model).await {
+            Some(a) => a,
+            None => {
+                return Json(json!({
+                    "error": {
+                        "message": "No valid Gemini credentials found. Please login with Google first.",
+                        "type": "authentication_error",
+                        "code": 401
+                    }
+                }))
+                .into_response();
+            }
+        };
+
+        let client = GeminiClient::new(auth.access_token);
+        let mut gemini_request = gemini::openai_to_gemini_cli_request(&openai_raw, &model);
+        if let Some(project_id) = auth.project_id {
+            gemini_request["project"] = json!(project_id);
+        }
+
+        if is_stream {
+            match client.stream_generate_content(&gemini_request).await {
+                Ok(response) => {
+                    let upstream = gemini::gemini_cli_stream_to_openai_chunks(response);
+                    let stream = openai_chunks_to_claude_events(upstream, &model);
+                    return Sse::new(stream).into_response();
+                }
+                Err(e) => {
+                    tracing::error!("Gemini API error: {}", e);
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Gemini API error: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            }
+        }
+
+        match client.generate_content(&gemini_request).await {
+            Ok(response) => {
+                let openai_response =
+                    gemini::gemini_to_openai_response(&response, &model, &request_id);
+                let claude_response =
+                    claude::openai_to_claude_response(&openai_response, &model, &request_id);
+                return Json(claude_response).into_response();
+            }
+            Err(e) => {
+                tracing::error!("Gemini API error: {}", e);
+                return Json(json!({
+                    "error": {
+                        "message": format!("Gemini API error: {}", e),
+                        "type": "api_error",
+                        "code": 500
+                    }
+                }))
+                .into_response();
+            }
+        }
+    }
+
+    if provider_override.as_deref() == Some("codex") {
+        let token = match get_codex_token(&model).await {
+            Some(t) => t,
+            None => {
+                return Json(json!({
+                    "error": {
+                        "message": "No valid Codex credentials found. Please login with Codex first.",
+                        "type": "authentication_error",
+                        "code": 401
+                    }
+                }))
+                .into_response();
+            }
+        };
+
+        let client = CodexClient::new(token);
+        let codex_request = codex::openai_to_codex_request(&openai_raw, &model, true);
+
+        if is_stream {
+            match client.stream_responses(&codex_request, true).await {
+                Ok(response) => {
+                    let upstream = codex::codex_stream_to_openai_chunks(response, openai_raw.clone());
+                    let stream = openai_chunks_to_claude_events(upstream, &model);
+                    return Sse::new(stream).into_response();
+                }
+                Err(e) => {
+                    tracing::error!("Codex API error: {}", e);
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Codex API error: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            }
+        }
+
+        match client.stream_responses(&codex_request, true).await {
+            Ok(response) => match codex::collect_non_stream_response(response, &openai_raw).await {
+                Ok(openai_response) => {
+                    let claude_response =
+                        claude::openai_to_claude_response(&openai_response, &model, &request_id);
+                    return Json(claude_response).into_response();
+                }
+                Err(e) => {
+                    tracing::error!("Codex API error: {}", e);
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Codex API error: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            },
+            Err(e) => {
+                tracing::error!("Codex API error: {}", e);
+                return Json(json!({
+                    "error": {
+                        "message": format!("Codex API error: {}", e),
+                        "type": "api_error",
+                        "code": 500
+                    }
+                }))
+                .into_response();
+            }
+        }
+    }
+
+    if provider_override.as_deref() == Some("antigravity") {
+        let auth = match get_antigravity_auth(&model).await {
+            Some(a) => a,
+            None => {
+                return Json(json!({
+                    "error": {
+                        "message": "No valid Antigravity credentials found. Please login with Antigravity first.",
+                        "type": "authentication_error",
+                        "code": 401
+                    }
+                }))
+                .into_response();
+            }
+        };
+
+        let AntigravityAuth {
+            access_token,
+            project_id,
+        } = auth;
+        let client = AntigravityClient::new(access_token);
+        let antigravity_request =
+            antigravity::openai_to_antigravity_request(&openai_raw, &model, project_id);
+
+        if is_stream {
+            match client.stream_generate_content(&antigravity_request, None).await {
+                Ok(response) => {
+                    let upstream = antigravity::antigravity_stream_to_openai_chunks(response);
+                    let stream = openai_chunks_to_claude_events(upstream, &model);
+                    return Sse::new(stream).into_response();
+                }
+                Err(e) => {
+                    tracing::error!("Antigravity API error: {}", e);
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Antigravity API error: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            }
+        }
+
+        if antigravity::should_use_stream_for_non_stream(&model) {
+            match client.stream_generate_content(&antigravity_request, None).await {
+                Ok(response) => match antigravity::collect_antigravity_stream(response).await {
+                    Ok(payload) => {
+                        let openai_response =
+                            gemini::gemini_to_openai_response(&payload, &model, &request_id);
+                        let claude_response =
+                            claude::openai_to_claude_response(&openai_response, &model, &request_id);
+                        return Json(claude_response).into_response();
+                    }
+                    Err(e) => {
+                        tracing::error!("Antigravity API error: {}", e);
+                        return Json(json!({
+                            "error": {
+                                "message": format!("Antigravity API error: {}", e),
+                                "type": "api_error",
+                                "code": 500
+                            }
+                        }))
+                        .into_response();
+                    }
+                },
+                Err(e) => {
+                    tracing::error!("Antigravity API error: {}", e);
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Antigravity API error: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            }
+        }
+
+        match client.generate_content(&antigravity_request, None).await {
+            Ok(response) => {
+                let openai_response =
+                    gemini::gemini_to_openai_response(&response, &model, &request_id);
+                let claude_response =
+                    claude::openai_to_claude_response(&openai_response, &model, &request_id);
+                return Json(claude_response).into_response();
+            }
+            Err(e) => {
+                tracing::error!("Antigravity API error: {}", e);
+                return Json(json!({
+                    "error": {
+                        "message": format!("Antigravity API error: {}", e),
+                        "type": "api_error",
+                        "code": 500
+                    }
+                }))
+                .into_response();
+            }
+        }
+    }
+
     Json(json!({
-        "error": "Claude messages endpoint not yet implemented"
+        "error": {
+            "message": "Unsupported provider. Use a supported provider prefix (gemini/..., claude/..., codex/..., antigravity/...).",
+            "type": "invalid_request_error",
+            "code": 400
+        }
     }))
+    .into_response()
+}
+
+pub async fn claude_count_tokens(
+    State(_state): State<AppState>,
+    Json(raw): Json<Value>,
+) -> Response {
+    let raw_model = raw.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let (provider_override, model) = parse_provider_prefix(&raw_model);
+
+    if provider_override.as_deref() != Some("claude") {
+        return Json(json!({
+            "error": {
+                "message": "Model must include claude/ prefix for Claude token counting.",
+                "type": "invalid_request_error",
+                "code": 400
+            }
+        }))
+        .into_response();
+    }
+
+    let token = match get_claude_token(&model).await {
+        Some(t) => t,
+        None => {
+            return Json(json!({
+                "error": {
+                    "message": "No valid Claude credentials found. Please login with Anthropic first.",
+                    "type": "authentication_error",
+                    "code": 401
+                }
+            }))
+            .into_response();
+        }
+    };
+
+    let mut payload = raw.clone();
+    payload["model"] = json!(model);
+
+    let url = "https://api.anthropic.com/v1/messages/count_tokens";
+    let client = reqwest::Client::new();
+    let response = match client
+        .post(url)
+        .header("x-api-key", token)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": format!("Claude API error: {}", e)
+                }
+            }))
+            .into_response();
+        }
+    };
+
+    let status = response.status();
+    let body = response.bytes().await.unwrap_or_default();
+    let mut resp = Response::new(Body::from(body));
+    *resp.status_mut() = status;
+    resp.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    resp
 }
 
 // Gemini compatible endpoints
 pub async fn gemini_models(State(_state): State<AppState>) -> Json<Value> {
-    // TODO: Fetch actual Gemini models
+    let base = get_gemini_models();
+    let mut models = Vec::new();
+    for model in base {
+        let name = if model.id.starts_with("models/") {
+            model.id.clone()
+        } else {
+            format!("models/{}", model.id)
+        };
+        models.push(json!({
+            "name": name,
+            "displayName": model.id,
+            "description": model.id,
+            "supportedGenerationMethods": ["generateContent"]
+        }));
+    }
+    Json(json!({ "models": models }))
+}
+
+pub async fn gemini_get_handler(
+    State(_state): State<AppState>,
+    Path(action): Path<String>,
+) -> impl IntoResponse {
+    let action = action.trim_start_matches('/');
+    let available = get_gemini_models();
+    for model in available {
+        let name = if model.id.starts_with("models/") {
+            model.id.clone()
+        } else {
+            format!("models/{}", model.id)
+        };
+        if name == action || model.id == action {
+            return Json(json!({
+                "name": name,
+                "displayName": model.id,
+                "description": model.id,
+                "supportedGenerationMethods": ["generateContent"]
+            }))
+            .into_response();
+        }
+    }
+
     Json(json!({
-        "models": [
-            {
-                "name": "models/gemini-2.5-pro",
-                "displayName": "Gemini 2.5 Pro",
-                "description": "Gemini 2.5 Pro model"
-            },
-            {
-                "name": "models/gemini-2.5-flash",
-                "displayName": "Gemini 2.5 Flash",
-                "description": "Gemini 2.5 Flash model"
-            }
-        ]
+        "error": {
+            "message": "Not Found",
+            "type": "not_found"
+        }
     }))
+    .into_response()
 }
 
 pub async fn gemini_handler(
     State(_state): State<AppState>,
     Path(action): Path<String>,
-    Json(_request): Json<Value>,
+    Query(params): Query<HashMap<String, String>>,
+    Json(request): Json<Value>,
 ) -> impl IntoResponse {
-    // TODO: Implement Gemini API handler
-    Json(json!({
-        "error": format!("Gemini action '{}' not yet implemented", action)
-    }))
+    let action = action.trim_start_matches('/').to_string();
+    let parts: Vec<&str> = action.split(':').collect();
+    if parts.len() != 2 {
+        return Json(json!({
+            "error": {
+                "message": format!("{} not found.", action),
+                "type": "invalid_request_error"
+            }
+        }))
+        .into_response();
+    }
+
+    let method = parts[1];
+    let mut model_name = parts[0].to_string();
+    if let Some(stripped) = model_name.strip_prefix("models/") {
+        model_name = stripped.to_string();
+    }
+
+    let auth = match get_gemini_auth(&model_name).await {
+        Some(a) => a,
+        None => {
+            return Json(json!({
+                "error": {
+                    "message": "No valid Gemini credentials found. Please login with Google first.",
+                    "type": "authentication_error",
+                    "code": 401
+                }
+            }))
+            .into_response();
+        }
+    };
+
+    let mut payload = json!({
+        "model": model_name,
+        "request": request
+    });
+    if let Some(project_id) = auth.project_id {
+        payload["project"] = json!(project_id);
+    }
+
+    let client = GeminiClient::new(auth.access_token);
+    match method {
+        "generateContent" => match client.generate_content(&payload).await {
+            Ok(response) => Json(response).into_response(),
+            Err(e) => Json(json!({
+                "error": {
+                    "message": format!("Gemini API error: {}", e),
+                    "type": "api_error",
+                    "code": 500
+                }
+            }))
+            .into_response(),
+        },
+        "streamGenerateContent" => {
+            let alt = params.get("alt").map(|v| v.as_str());
+            match client.stream_generate_content_with_alt(&payload, alt).await {
+                Ok(response) => {
+                    let stream = response
+                        .bytes_stream()
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+                    let mut resp = Response::new(Body::from_stream(stream));
+                    *resp.status_mut() = StatusCode::OK;
+                    let content_type = if alt.unwrap_or("sse") == "sse" {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    resp.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static(content_type),
+                    );
+                    resp.into_response()
+                }
+                Err(e) => Json(json!({
+                    "error": {
+                        "message": format!("Gemini API error: {}", e),
+                        "type": "api_error",
+                        "code": 500
+                    }
+                }))
+                .into_response(),
+            }
+        }
+        "countTokens" => {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.remove("project");
+                obj.remove("model");
+            }
+            match client.count_tokens(&payload).await {
+                Ok(response) => Json(response).into_response(),
+                Err(e) => Json(json!({
+                    "error": {
+                        "message": format!("Gemini API error: {}", e),
+                        "type": "api_error",
+                        "code": 500
+                    }
+                }))
+                .into_response(),
+            }
+        }
+        _ => Json(json!({
+            "error": {
+                "message": format!("Gemini action '{}' not yet implemented", method),
+                "type": "invalid_request_error",
+                "code": 400
+            }
+        }))
+        .into_response(),
+    }
 }
 
 // OAuth callback handlers

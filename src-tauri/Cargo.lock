@@ -4312,6 +4312,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dirs",
+ "flate2",
  "futures",
  "notify",
  "oauth2",

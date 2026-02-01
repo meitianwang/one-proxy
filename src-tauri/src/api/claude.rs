@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const CLAUDE_API_BASE: &str = "https://api.anthropic.com/v1";
 
@@ -181,6 +181,159 @@ pub fn claude_to_openai_response(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens
+        }
+    })
+}
+
+fn extract_claude_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => {
+            let mut parts = Vec::new();
+            for item in items {
+                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+            parts.join("\n")
+        }
+        _ => String::new(),
+    }
+}
+
+pub fn claude_request_to_openai_chat(raw: &Value, model: &str) -> Value {
+    let mut messages = Vec::new();
+
+    if let Some(system) = raw.get("system") {
+        let system_text = extract_claude_text(system);
+        if !system_text.is_empty() {
+            messages.push(json!({
+                "role": "system",
+                "content": system_text
+            }));
+        }
+    }
+
+    if let Some(msgs) = raw.get("messages").and_then(|v| v.as_array()) {
+        for msg in msgs {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            let content = msg.get("content").unwrap_or(&Value::Null);
+            let text = extract_claude_text(content);
+            messages.push(json!({
+                "role": role,
+                "content": text
+            }));
+        }
+    }
+
+    let mut out = json!({
+        "model": model,
+        "messages": messages
+    });
+
+    if let Some(v) = raw.get("stream") {
+        out["stream"] = v.clone();
+    }
+    if let Some(v) = raw.get("temperature") {
+        out["temperature"] = v.clone();
+    }
+    if let Some(v) = raw.get("max_tokens") {
+        out["max_tokens"] = v.clone();
+    }
+    if let Some(v) = raw.get("top_p") {
+        out["top_p"] = v.clone();
+    }
+    if let Some(v) = raw.get("top_k") {
+        out["top_k"] = v.clone();
+    }
+    if let Some(v) = raw.get("reasoning_effort") {
+        out["reasoning_effort"] = v.clone();
+    }
+    if let Some(v) = raw.get("stop") {
+        out["stop"] = v.clone();
+    }
+
+    out
+}
+
+fn map_openai_finish_reason(reason: Option<&str>) -> Option<&'static str> {
+    match reason {
+        Some("stop") => Some("end_turn"),
+        Some("length") => Some("max_tokens"),
+        Some("tool_calls") => Some("tool_use"),
+        Some("content_filter") => Some("stop_sequence"),
+        _ => None,
+    }
+}
+
+pub fn openai_to_claude_response(
+    openai_response: &Value,
+    model: &str,
+    request_id: &str,
+) -> Value {
+    if let Some(error) = openai_response.get("error") {
+        return json!({
+            "error": error
+        });
+    }
+
+    let choice = openai_response
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .and_then(|v| v.first())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
+    let content_text = message
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut content_blocks = Vec::new();
+    if !content_text.is_empty() {
+        content_blocks.push(json!({
+            "type": "text",
+            "text": content_text
+        }));
+    }
+
+    let stop_reason = map_openai_finish_reason(
+        choice
+            .get("finish_reason")
+            .and_then(|v| v.as_str()),
+    );
+
+    let (input_tokens, output_tokens) = openai_response
+        .get("usage")
+        .and_then(|v| v.as_object())
+        .map(|u| {
+            let prompt = u
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let completion = u
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            (prompt, completion)
+        })
+        .unwrap_or((0, 0));
+
+    json!({
+        "id": format!("msg_{}", request_id),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content_blocks,
+        "stop_reason": stop_reason,
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens
         }
     })
 }

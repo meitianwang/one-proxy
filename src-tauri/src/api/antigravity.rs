@@ -292,9 +292,9 @@ pub fn should_use_stream_for_non_stream(model: &str) -> bool {
     model.contains("claude") || model.contains("gemini-3-pro")
 }
 
-pub fn antigravity_stream_to_openai_events(
+pub fn antigravity_stream_to_openai_chunks(
     response: reqwest::Response,
-) -> impl Stream<Item = Result<Event, Infallible>> {
+) -> impl Stream<Item = String> {
     async_stream::stream! {
         let mut state = AntigravityStreamState {
             unix_timestamp: 0,
@@ -324,18 +324,25 @@ pub fn antigravity_stream_to_openai_events(
                     continue;
                 }
                 if data == "[DONE]" {
-                    yield Ok(Event::default().data("[DONE]"));
+                    yield "[DONE]".to_string();
                     return;
                 }
 
                 for chunk in convert_antigravity_stream_chunk(data, &mut state) {
-                    yield Ok(Event::default().data(chunk));
+                    yield chunk;
                 }
             }
         }
 
-        yield Ok(Event::default().data("[DONE]"));
+        yield "[DONE]".to_string();
     }
+}
+
+pub fn antigravity_stream_to_openai_events(
+    response: reqwest::Response,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    antigravity_stream_to_openai_chunks(response)
+        .map(|chunk| Ok(Event::default().data(chunk)))
 }
 
 pub async fn collect_antigravity_stream(response: reqwest::Response) -> Result<Value> {

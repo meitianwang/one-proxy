@@ -157,10 +157,20 @@ impl GeminiClient {
 
     /// Stream content using Cloud Code Assist endpoint (same as CLIProxyAPI)
     pub async fn stream_generate_content(&self, payload: &Value) -> Result<reqwest::Response> {
+        self.stream_generate_content_with_alt(payload, None).await
+    }
+
+    pub async fn stream_generate_content_with_alt(
+        &self,
+        payload: &Value,
+        alt: Option<&str>,
+    ) -> Result<reqwest::Response> {
+        let alt_param = alt.filter(|v| !v.trim().is_empty()).unwrap_or("sse");
         let url = format!(
-            "{}/{}:streamGenerateContent?alt=sse",
+            "{}/{}:streamGenerateContent?alt={}",
             CODE_ASSIST_ENDPOINT,
-            CODE_ASSIST_VERSION
+            CODE_ASSIST_VERSION,
+            alt_param
         );
 
         let response = self
@@ -168,7 +178,14 @@ impl GeminiClient {
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.access_token))
             .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
+            .header(
+                "Accept",
+                if alt_param == "sse" {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
+            )
             .header("User-Agent", "google-api-nodejs-client/9.15.1")
             .header("X-Goog-Api-Client", "gl-node/22.17.0")
             .header("Client-Metadata", "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI")
@@ -183,6 +200,36 @@ impl GeminiClient {
         }
 
         Ok(response)
+    }
+
+    pub async fn count_tokens(&self, payload: &Value) -> Result<Value> {
+        let url = format!(
+            "{}/{}:countTokens",
+            CODE_ASSIST_ENDPOINT,
+            CODE_ASSIST_VERSION
+        );
+
+        let response = self
+            .http_client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.access_token))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("User-Agent", "google-api-nodejs-client/9.15.1")
+            .header("X-Goog-Api-Client", "gl-node/22.17.0")
+            .header("Client-Metadata", "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI")
+            .json(payload)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let body: Value = response.json().await?;
+
+        if !status.is_success() {
+            return Ok(body);
+        }
+
+        Ok(body)
     }
 
     pub async fn list_models(&self) -> Result<Value> {
@@ -616,9 +663,9 @@ struct GeminiCliStreamState {
     function_index: i32,
 }
 
-pub fn gemini_cli_stream_to_openai_events(
+pub fn gemini_cli_stream_to_openai_chunks(
     response: reqwest::Response,
-) -> impl Stream<Item = Result<Event, Infallible>> {
+) -> impl Stream<Item = String> {
     async_stream::stream! {
         let mut state = GeminiCliStreamState {
             unix_timestamp: 0,
@@ -648,18 +695,25 @@ pub fn gemini_cli_stream_to_openai_events(
                     continue;
                 }
                 if data == "[DONE]" {
-                    yield Ok(Event::default().data("[DONE]"));
+                    yield "[DONE]".to_string();
                     return;
                 }
 
                 for chunk in convert_gemini_cli_stream_chunk(data, &mut state) {
-                    yield Ok(Event::default().data(chunk));
+                    yield chunk;
                 }
             }
         }
 
-        yield Ok(Event::default().data("[DONE]"));
+        yield "[DONE]".to_string();
     }
+}
+
+pub fn gemini_cli_stream_to_openai_events(
+    response: reqwest::Response,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    gemini_cli_stream_to_openai_chunks(response)
+        .map(|chunk| Ok(Event::default().data(chunk)))
 }
 
 fn convert_gemini_cli_stream_chunk(data: &str, state: &mut GeminiCliStreamState) -> Vec<String> {

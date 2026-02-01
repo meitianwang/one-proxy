@@ -93,8 +93,10 @@ pub async fn start_server(app_handle: tauri::AppHandle) -> Result<()> {
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/completions", post(handlers::completions))
         .route("/v1/messages", post(handlers::claude_messages))
+        .route("/v1/messages/count_tokens", post(handlers::claude_count_tokens))
         .route("/v1beta/models", get(handlers::gemini_models))
         .route("/v1beta/models/*action", post(handlers::gemini_handler))
+        .route("/v1beta/models/*action", get(handlers::gemini_get_handler))
         // OAuth callbacks
         .route("/oauth2callback", get(handlers::google_callback))
         .route("/google/callback", get(handlers::google_callback))
