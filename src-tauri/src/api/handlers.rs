@@ -2139,7 +2139,13 @@ pub async fn claude_messages(
         return Json(json_body).into_response();
     }
 
-    let openai_raw = claude::claude_request_to_openai_chat(&raw, &model);
+    let image_handling = match provider_override.as_deref() {
+        Some("gemini") => claude::ClaudeImageHandling::Base64Any,
+        Some("codex") => claude::ClaudeImageHandling::Base64Any,
+        Some("antigravity") => claude::ClaudeImageHandling::Base64TypeOnly,
+        _ => claude::ClaudeImageHandling::Base64AndUrl,
+    };
+    let openai_raw = claude::claude_request_to_openai_chat(&raw, &model, image_handling);
 
     if provider_override.as_deref() == Some("gemini") {
         let auth = match get_gemini_auth(&model).await {

@@ -185,6 +185,14 @@ pub fn claude_to_openai_response(
     })
 }
 
+#[derive(Clone, Copy)]
+pub enum ClaudeImageHandling {
+    Drop,
+    Base64Any,
+    Base64TypeOnly,
+    Base64AndUrl,
+}
+
 fn extract_claude_thinking_text(value: &Value) -> String {
     value
         .get("thinking")
@@ -194,7 +202,25 @@ fn extract_claude_thinking_text(value: &Value) -> String {
         .to_string()
 }
 
-fn convert_claude_content_part(part: &Value) -> Option<Value> {
+fn extract_base64_image(source: &Value) -> Option<(String, String)> {
+    let data = source
+        .get("data")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .or_else(|| source.get("base64").and_then(|v| v.as_str()).filter(|v| !v.is_empty()))?;
+    let mime_type = source
+        .get("media_type")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .or_else(|| source.get("mime_type").and_then(|v| v.as_str()).filter(|v| !v.is_empty()))
+        .unwrap_or("application/octet-stream");
+    Some((mime_type.to_string(), data.to_string()))
+}
+
+fn convert_claude_content_part(
+    part: &Value,
+    image_handling: ClaudeImageHandling,
+) -> Option<Value> {
     let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match part_type {
         "text" => {
@@ -206,37 +232,55 @@ fn convert_claude_content_part(part: &Value) -> Option<Value> {
             }
         }
         "image" => {
-            let mut image_url = String::new();
-            if let Some(source) = part.get("source") {
-                let source_type = source.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                match source_type {
-                    "base64" => {
-                        let media_type = source
-                            .get("media_type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("application/octet-stream");
-                        let data = source.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                        if !data.is_empty() {
-                            image_url = format!("data:{};base64,{}", media_type, data);
-                        }
+            match image_handling {
+                ClaudeImageHandling::Drop => None,
+                ClaudeImageHandling::Base64Any => {
+                    let source = part.get("source")?;
+                    let (mime, data) = extract_base64_image(source)?;
+                    Some(json!({
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:{};base64,{}", mime, data) }
+                    }))
+                }
+                ClaudeImageHandling::Base64TypeOnly => {
+                    let source = part.get("source")?;
+                    let source_type = source.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if source_type != "base64" {
+                        return None;
                     }
-                    "url" => {
+                    let (mime, data) = extract_base64_image(source)?;
+                    Some(json!({
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:{};base64,{}", mime, data) }
+                    }))
+                }
+                ClaudeImageHandling::Base64AndUrl => {
+                    if let Some(source) = part.get("source") {
+                        if let Some((mime, data)) = extract_base64_image(source) {
+                            return Some(json!({
+                                "type": "image_url",
+                                "image_url": { "url": format!("data:{};base64,{}", mime, data) }
+                            }));
+                        }
                         if let Some(url) = source.get("url").and_then(|v| v.as_str()) {
-                            image_url = url.to_string();
+                            if !url.is_empty() {
+                                return Some(json!({
+                                    "type": "image_url",
+                                    "image_url": { "url": url }
+                                }));
+                            }
                         }
                     }
-                    _ => {}
+                    if let Some(url) = part.get("url").and_then(|v| v.as_str()) {
+                        if !url.is_empty() {
+                            return Some(json!({
+                                "type": "image_url",
+                                "image_url": { "url": url }
+                            }));
+                        }
+                    }
+                    None
                 }
-            }
-            if image_url.is_empty() {
-                if let Some(url) = part.get("url").and_then(|v| v.as_str()) {
-                    image_url = url.to_string();
-                }
-            }
-            if image_url.is_empty() {
-                None
-            } else {
-                Some(json!({ "type": "image_url", "image_url": { "url": image_url } }))
             }
         }
         _ => None,
@@ -293,7 +337,11 @@ fn convert_budget_to_level(budget: i64) -> Option<&'static str> {
     }
 }
 
-pub fn claude_request_to_openai_chat(raw: &Value, model: &str) -> Value {
+pub fn claude_request_to_openai_chat(
+    raw: &Value,
+    model: &str,
+    image_handling: ClaudeImageHandling,
+) -> Value {
     let mut out = json!({
         "model": model,
         "messages": []
@@ -355,7 +403,7 @@ pub fn claude_request_to_openai_chat(raw: &Value, model: &str) -> Value {
             }
             Value::Array(items) => {
                 for item in items {
-                    if let Some(part) = convert_claude_content_part(item) {
+                    if let Some(part) = convert_claude_content_part(item, image_handling) {
                         system_items.push(part);
                     }
                 }
@@ -393,7 +441,7 @@ pub fn claude_request_to_openai_chat(raw: &Value, model: &str) -> Value {
                             }
                         }
                         "text" | "image" => {
-                            if let Some(item) = convert_claude_content_part(part) {
+                            if let Some(item) = convert_claude_content_part(part, image_handling) {
                                 content_items.push(item);
                             }
                         }
