@@ -8,9 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::claude::{self, ClaudeClient, ClaudeRequest};
-use super::gemini::{
-    self, GeminiClient, GeminiGenerateRequest, GeminiGenerationConfig,
-};
+use super::gemini::{self, GeminiClient};
 use super::AppState;
 use crate::auth::{self, providers::{google, anthropic, antigravity, openai}, AuthFile, TokenInfo};
 
@@ -479,12 +477,13 @@ async fn get_claude_token() -> Option<String> {
 
 pub async fn chat_completions(
     State(_state): State<AppState>,
-    Json(request): Json<ChatCompletionRequest>,
+    Json(raw): Json<Value>,
 ) -> impl IntoResponse {
     let request_id = uuid::Uuid::new_v4().to_string();
+    let model = raw.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
     // Check if this is a Gemini model
-    if request.model.starts_with("gemini") {
+    if model.starts_with("gemini") {
         // Get Gemini token
         let auth = match get_gemini_auth().await {
             Some(a) => a,
@@ -501,28 +500,15 @@ pub async fn chat_completions(
 
         let client = GeminiClient::new(auth.access_token);
 
-        // Convert messages to Gemini format
-        let contents = gemini::openai_to_gemini_messages(&request.messages);
+        let mut gemini_request = gemini::openai_to_gemini_cli_request(&raw, &model);
+        if let Some(project_id) = auth.project_id {
+            gemini_request["project"] = json!(project_id);
+        }
 
-        let gemini_request = GeminiGenerateRequest {
-            contents,
-            generation_config: Some(GeminiGenerationConfig {
-                temperature: request.temperature,
-                max_output_tokens: request.max_tokens,
-                top_p: None,
-                top_k: None,
-            }),
-            model: None,    // Will be set by generate_content
-            project: auth.project_id,
-        };
-
-        match client.generate_content(&request.model, gemini_request).await {
+        match client.generate_content(&gemini_request).await {
             Ok(response) => {
-                let openai_response = gemini::gemini_to_openai_response(
-                    &response,
-                    &request.model,
-                    &request_id,
-                );
+                let openai_response =
+                    gemini::gemini_to_openai_response(&response, &model, &request_id);
                 return Json(openai_response);
             }
             Err(e) => {
@@ -539,6 +525,19 @@ pub async fn chat_completions(
     }
 
     // Check if this is a Claude model
+    let request: ChatCompletionRequest = match serde_json::from_value(raw.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(json!({
+                "error": {
+                    "message": format!("Invalid request: {}", e),
+                    "type": "invalid_request_error",
+                    "code": 400
+                }
+            }));
+        }
+    };
+
     if request.model.starts_with("claude") {
         // Get Claude token
         let token = match get_claude_token().await {
