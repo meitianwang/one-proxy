@@ -23,7 +23,7 @@ interface DashboardProps {
 export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [loading, setLoading] = useState(true);
-  const [selectedProtocol, setSelectedProtocol] = useState<"openai" | "anthropic" | "gemini">("openai");
+  const [selectedProtocol, setSelectedProtocol] = useState<"openai" | "anthropic">("openai");
   const [selectedModel, setSelectedModel] = useState("gemini-2.5-flash");
   const [models, setModels] = useState<{ id: string; name: string; desc: string }[]>([]);
   const [copied, setCopied] = useState(false);
@@ -47,12 +47,6 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
     "model": "${selectedModel}",
     "max_tokens": 1024,
     "messages": [{"role": "user", "content": "Hello"}]
-  }'`,
-    gemini: `curl -X POST "${baseUrl}/v1beta/models/${selectedModel}:generateContent" \\
-  -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer ${apiKey}" \\
-  -d '{
-    "contents": [{"parts": [{"text": "Hello"}]}]
   }'`,
   };
 
@@ -304,14 +298,14 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
           </div>
           <div>
             <h3 className="text-lg font-semibold text-gray-800 dark:text-white">多协议支持</h3>
-            <p className="text-sm text-gray-500 dark:text-gray-400">支持 OpenAI、Anthropic 和 Gemini 协议</p>
+            <p className="text-sm text-gray-500 dark:text-gray-400">支持 OpenAI 和 Anthropic 协议</p>
           </div>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Protocol Selection */}
           <div>
-            <div className="grid grid-cols-3 gap-3 mb-4">
+            <div className="grid grid-cols-2 gap-3 mb-4">
               <button
                 onClick={() => setSelectedProtocol("openai")}
                 className={`p-3 rounded-lg border text-left transition-colors ${
@@ -337,19 +331,6 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
                   Anthropic 协议
                 </p>
                 <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">/v1/messages</p>
-              </button>
-              <button
-                onClick={() => setSelectedProtocol("gemini")}
-                className={`p-3 rounded-lg border text-left transition-colors ${
-                  selectedProtocol === "gemini"
-                    ? "border-blue-500 bg-blue-50 dark:bg-blue-900/30"
-                    : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
-                }`}
-              >
-                <p className={`text-sm font-medium ${selectedProtocol === "gemini" ? "text-blue-600 dark:text-blue-400" : "text-gray-800 dark:text-white"}`}>
-                  Gemini 协议
-                </p>
-                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">/v1beta/models/...</p>
               </button>
             </div>
 
