@@ -7,14 +7,25 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::antigravity::{self, AntigravityClient};
 use super::claude::{self, ClaudeClient, ClaudeRequest};
 use super::codex::{self, CodexClient};
 use super::gemini::{self, GeminiClient};
 use super::AppState;
-use crate::auth::{self, providers::{google, anthropic, antigravity, openai}, AuthFile, TokenInfo};
+use crate::auth::{self, providers::{google, anthropic, antigravity as antigravity_oauth, openai}, AuthFile, TokenInfo};
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
 struct GeminiAuth {
+    access_token: String,
+    project_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AntigravityAuth {
     access_token: String,
     project_id: Option<String>,
 }
@@ -64,15 +75,28 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
                 let path = entry.path();
                 if path.extension().map(|e| e == "json").unwrap_or(false) {
                     if let Ok(content) = std::fs::read_to_string(&path) {
-                        if let Ok(auth_file) = serde_json::from_str::<AuthFile>(&content) {
-                            if auth_file.enabled {
-                                match auth_file.provider.as_str() {
-                                    "gemini" => has_gemini = true,
-                                    "codex" => has_codex = true,
-                                    "antigravity" => has_antigravity = true,
-                                    "claude" => has_claude = true,
-                                    _ => {}
-                                }
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                            let provider = json
+                                .get("provider")
+                                .or_else(|| json.get("type"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim()
+                                .to_lowercase();
+                            if provider.is_empty() {
+                                continue;
+                            }
+                            let disabled = json.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let enabled = json.get("enabled").and_then(|v| v.as_bool()).unwrap_or(!disabled);
+                            if disabled || !enabled {
+                                continue;
+                            }
+                            match provider.as_str() {
+                                "gemini" => has_gemini = true,
+                                "codex" => has_codex = true,
+                                "antigravity" => has_antigravity = true,
+                                "claude" => has_claude = true,
+                                _ => {}
                             }
                         }
                     }
@@ -84,48 +108,24 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
     // Add Gemini models if available
     if has_gemini {
         let base = get_gemini_models();
-        models.extend(base.iter().map(|m| ModelInfo {
-            id: m.id.clone(),
-            object: m.object.clone(),
-            created: m.created,
-            owned_by: m.owned_by.clone(),
-        }));
         models.extend(build_prefixed_models("gemini", &base));
     }
 
     // Add Codex/OpenAI models if available
     if has_codex {
         let base = get_codex_models();
-        models.extend(base.iter().map(|m| ModelInfo {
-            id: m.id.clone(),
-            object: m.object.clone(),
-            created: m.created,
-            owned_by: m.owned_by.clone(),
-        }));
         models.extend(build_prefixed_models("codex", &base));
     }
 
     // Add Antigravity models if available
     if has_antigravity {
         let base = get_antigravity_models();
-        models.extend(base.iter().map(|m| ModelInfo {
-            id: m.id.clone(),
-            object: m.object.clone(),
-            created: m.created,
-            owned_by: m.owned_by.clone(),
-        }));
         models.extend(build_prefixed_models("antigravity", &base));
     }
 
     // Add Claude models if available
     if has_claude {
         let base = get_claude_models();
-        models.extend(base.iter().map(|m| ModelInfo {
-            id: m.id.clone(),
-            object: m.object.clone(),
-            created: m.created,
-            owned_by: m.owned_by.clone(),
-        }));
         models.extend(build_prefixed_models("claude", &base));
     }
 
@@ -234,13 +234,6 @@ fn get_codex_models() -> Vec<ModelInfo> {
             owned_by: "openai".to_string(),
         },
     ]
-}
-
-fn is_codex_model(model: &str) -> bool {
-    if model.is_empty() {
-        return false;
-    }
-    get_codex_models().iter().any(|m| m.id == model)
 }
 
 fn parse_provider_prefix(model: &str) -> (Option<String>, String) {
@@ -383,217 +376,572 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-/// Get a valid Gemini access token from stored credentials
-/// Supports CLIProxyAPI format (gemini-*.json)
-async fn get_gemini_auth() -> Option<GeminiAuth> {
-    let auth_dir = crate::config::resolve_auth_dir();
-    if !auth_dir.exists() {
+#[derive(Clone)]
+struct AuthCandidate {
+    id: String,
+    path: PathBuf,
+    priority: i32,
+}
+
+static AUTH_SELECTOR: Lazy<Mutex<HashMap<String, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn collect_json_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                continue;
+            }
+            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                out.push(path);
+            }
+        }
+    }
+}
+
+fn parse_candidate_priority(json: &Value) -> i32 {
+    match json.get("priority") {
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0) as i32,
+        Some(Value::String(s)) => s.trim().parse::<i32>().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn candidate_from_path(
+    provider: &str,
+    auth_dir: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<AuthCandidate> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let json: Value = serde_json::from_str(&content).ok()?;
+
+    let provider_key = provider.trim().to_lowercase();
+    let json_provider = json
+        .get("provider")
+        .or_else(|| json.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    if json_provider != provider_key {
         return None;
     }
 
-    // Look for gemini auth files
-    if let Ok(entries) = std::fs::read_dir(&auth_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                // Match gemini-*.json (CLIProxyAPI format)
-                let is_gemini_file = name.starts_with("gemini-") && name.ends_with(".json");
+    let disabled = json.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    let enabled = json.get("enabled").and_then(|v| v.as_bool()).unwrap_or(!disabled);
+    if disabled || !enabled {
+        return None;
+    }
 
-                if is_gemini_file {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) {
-                            // Check if enabled (default true)
-                            let enabled = json.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-                            if !enabled {
-                                continue;
-                            }
+    let priority = parse_candidate_priority(&json);
+    let id = path
+        .strip_prefix(auth_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string();
+    Some(AuthCandidate {
+        id,
+        path: path.to_path_buf(),
+        priority,
+    })
+}
 
-                            // Extract token info from token object
-                            if let Some(token_obj) = json.get("token") {
-                                let access_token = token_obj.get("access_token").and_then(|v| v.as_str()).unwrap_or("");
-                                let refresh_token = token_obj.get("refresh_token").and_then(|v| v.as_str());
-                                let expiry = token_obj.get("expiry").and_then(|v| v.as_str());
-                                let project_id = json
-                                    .get("project_id")
-                                    .and_then(|v| v.as_str())
-                                    .map(|v| v.trim().to_string())
-                                    .and_then(|v| {
-                                        if v.is_empty() {
-                                            return None;
-                                        }
-                                        if v.eq_ignore_ascii_case("all") {
-                                            return None;
-                                        }
-                                        if let Some(first) = v.split(',').map(|s| s.trim()).find(|s| !s.is_empty()) {
-                                            return Some(first.to_string());
-                                        }
-                                        None
-                                    });
+fn select_auth_candidates(provider: &str, model: &str) -> Vec<AuthCandidate> {
+    let auth_dir = crate::config::resolve_auth_dir();
+    if !auth_dir.exists() {
+        return Vec::new();
+    }
 
-                                if access_token.is_empty() {
-                                    continue;
-                                }
+    let mut files = Vec::new();
+    collect_json_files(&auth_dir, &mut files);
 
-                                // Check if token is expired
-                                let is_expired = if let Some(expiry_str) = expiry {
-                                    if let Ok(expiry_time) = chrono::DateTime::parse_from_rfc3339(expiry_str) {
-                                        expiry_time < chrono::Utc::now()
-                                    } else {
-                                        false // Can't parse, assume not expired
-                                    }
-                                } else {
-                                    false // No expiry, assume not expired
-                                };
+    let mut candidates = Vec::new();
+    for path in files {
+        if let Some(candidate) = candidate_from_path(provider, &auth_dir, &path) {
+            candidates.push(candidate);
+        }
+    }
 
-                                if !is_expired {
-                                    return Some(GeminiAuth {
-                                        access_token: access_token.to_string(),
-                                        project_id,
-                                    });
-                                }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
 
-                                // Token expired, try to refresh
-                                if let Some(refresh_tok) = refresh_token {
-                                    if let Ok(new_tokens) = google::refresh_token(refresh_tok).await {
-                                        // Update the token in the JSON
-                                        let new_expiry = new_tokens.expires_in.map(|secs| {
-                                            (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
-                                        });
+    let max_priority = candidates.iter().map(|c| c.priority).max().unwrap_or(0);
+    let mut available: Vec<AuthCandidate> = candidates
+        .into_iter()
+        .filter(|c| c.priority == max_priority)
+        .collect();
+    available.sort_by(|a, b| a.id.cmp(&b.id));
 
-                                        if let Some(token_obj) = json.get_mut("token") {
-                                            if let Some(obj) = token_obj.as_object_mut() {
-                                                obj.insert("access_token".to_string(), serde_json::json!(new_tokens.access_token));
-                                                if let Some(new_refresh) = &new_tokens.refresh_token {
-                                                    obj.insert("refresh_token".to_string(), serde_json::json!(new_refresh));
-                                                }
-                                                if let Some(exp) = new_expiry {
-                                                    obj.insert("expiry".to_string(), serde_json::json!(exp));
-                                                }
-                                            }
-                                        }
+    if available.len() <= 1 {
+        return available;
+    }
 
-                                        // Save updated file
-                                        if let Ok(updated_content) = serde_json::to_string_pretty(&json) {
-                                            let _ = std::fs::write(&path, updated_content);
-                                        }
+    let strategy = crate::config::get_config()
+        .map(|c| c.routing.strategy)
+        .unwrap_or_else(|| "round-robin".to_string());
+    let strategy = strategy.trim().to_lowercase();
+    let use_round_robin = strategy.is_empty()
+        || matches!(strategy.as_str(), "round-robin" | "roundrobin" | "rr");
+    if !use_round_robin {
+        return available;
+    }
 
-                                        return Some(GeminiAuth {
-                                            access_token: new_tokens.access_token,
-                                            project_id,
-                                        });
-                                    }
-                                }
-                            }
+    let key = format!("{}:{}", provider.trim().to_lowercase(), model.trim());
+    let start = {
+        let mut cursor = AUTH_SELECTOR.lock().unwrap();
+        let entry = cursor.entry(key).or_insert(0);
+        let idx = *entry % available.len();
+        *entry = entry.wrapping_add(1);
+        idx
+    };
+
+    available.rotate_left(start);
+    available
+}
+
+#[derive(Clone, Copy)]
+enum TokenLocation {
+    Nested,
+    Root,
+}
+
+struct TokenSnapshot {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    location: TokenLocation,
+    expiry_key: Option<&'static str>,
+}
+
+fn parse_rfc3339(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+fn parse_token_snapshot(json: &Value) -> Option<TokenSnapshot> {
+    if let Some(token_obj) = json.get("token").and_then(|v| v.as_object()) {
+        let access = token_obj
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !access.is_empty() {
+            let refresh = token_obj
+                .get("refresh_token")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let expiry_value = token_obj.get("expires_at").or_else(|| token_obj.get("expiry"));
+            let expires_at = expiry_value
+                .and_then(|v| v.as_str())
+                .and_then(parse_rfc3339);
+            let expiry_key = if token_obj.contains_key("expires_at") {
+                "expires_at"
+            } else {
+                "expiry"
+            };
+            return Some(TokenSnapshot {
+                access_token: access,
+                refresh_token: refresh,
+                expires_at,
+                location: TokenLocation::Nested,
+                expiry_key: Some(expiry_key),
+            });
+        }
+    }
+
+    let access = json
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if access.is_empty() {
+        return None;
+    }
+    let refresh = json
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let expires_at = json
+        .get("expired")
+        .and_then(|v| v.as_str())
+        .and_then(parse_rfc3339);
+    Some(TokenSnapshot {
+        access_token: access,
+        refresh_token: refresh,
+        expires_at,
+        location: TokenLocation::Root,
+        expiry_key: Some("expired"),
+    })
+}
+
+fn is_expired(expires_at: Option<chrono::DateTime<chrono::Utc>>) -> bool {
+    if let Some(expiry) = expires_at {
+        return expiry <= chrono::Utc::now();
+    }
+    false
+}
+
+/// Get a valid Gemini access token from stored credentials
+/// Supports CLIProxyAPI format (gemini-*.json)
+async fn get_gemini_auth(model: &str) -> Option<GeminiAuth> {
+    let candidates = select_auth_candidates("gemini", model);
+    for candidate in candidates {
+        let content = match std::fs::read_to_string(&candidate.path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let mut json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let snapshot = match parse_token_snapshot(&json) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let project_id = json
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        if !is_expired(snapshot.expires_at) {
+            return Some(GeminiAuth {
+                access_token: snapshot.access_token,
+                project_id,
+            });
+        }
+
+        let refresh_token = match snapshot.refresh_token {
+            Some(v) => v,
+            None => continue,
+        };
+
+        if let Ok(new_tokens) = google::refresh_token(&refresh_token).await {
+            let new_expiry = new_tokens.expires_in.map(|secs| {
+                (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
+            });
+
+            match snapshot.location {
+                TokenLocation::Nested => {
+                    if json.get("token").is_none() {
+                        json["token"] = json!({});
+                    }
+                    if let Some(obj) = json.get_mut("token").and_then(|v| v.as_object_mut()) {
+                        obj.insert(
+                            "access_token".to_string(),
+                            serde_json::json!(new_tokens.access_token),
+                        );
+                        if let Some(new_refresh) = &new_tokens.refresh_token {
+                            obj.insert("refresh_token".to_string(), serde_json::json!(new_refresh));
                         }
+                        if let Some(exp) = new_expiry {
+                            let key = snapshot.expiry_key.unwrap_or("expiry");
+                            obj.insert(key.to_string(), serde_json::json!(exp));
+                        }
+                        obj.insert(
+                            "token_type".to_string(),
+                            serde_json::json!(new_tokens.token_type),
+                        );
                     }
                 }
+                TokenLocation::Root => {
+                    json["access_token"] = serde_json::json!(new_tokens.access_token);
+                    if let Some(new_refresh) = &new_tokens.refresh_token {
+                        json["refresh_token"] = serde_json::json!(new_refresh);
+                    }
+                    if let Some(exp) = new_expiry {
+                        json["expired"] = serde_json::json!(exp);
+                    }
+                    json["token_type"] = serde_json::json!(new_tokens.token_type);
+                }
             }
+
+            if let Ok(updated_content) = serde_json::to_string_pretty(&json) {
+                let _ = std::fs::write(&candidate.path, updated_content);
+            }
+
+            return Some(GeminiAuth {
+                access_token: new_tokens.access_token,
+                project_id,
+            });
         }
     }
     None
 }
 
 /// Get a valid Claude access token from stored credentials
-async fn get_claude_token() -> Option<String> {
-    let auth_dir = crate::config::resolve_auth_dir();
-    if !auth_dir.exists() {
-        return None;
-    }
+async fn get_claude_token(model: &str) -> Option<String> {
+    let candidates = select_auth_candidates("claude", model);
+    for candidate in candidates {
+        let content = match std::fs::read_to_string(&candidate.path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let mut json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
 
-    // Look for claude auth files
-    if let Ok(entries) = std::fs::read_dir(&auth_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("claude_") && name.ends_with(".json") {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        if let Ok(auth_file) = serde_json::from_str::<AuthFile>(&content) {
-                            if auth_file.enabled {
-                                // Check if token is expired
-                                if let Some(expires_at) = auth_file.token.expires_at {
-                                    if expires_at > chrono::Utc::now() {
-                                        return Some(auth_file.token.access_token);
-                                    }
-                                    // Token expired, try to refresh
-                                    if let Some(refresh_token) = auth_file.token.refresh_token {
-                                        if let Ok(new_tokens) = anthropic::refresh_token(&refresh_token).await {
-                                            // Update the auth file with new tokens
-                                            let new_expires_at = new_tokens.expires_in.map(|secs| {
-                                                chrono::Utc::now() + chrono::Duration::seconds(secs as i64)
-                                            });
-                                            let updated_auth = AuthFile {
-                                                token: TokenInfo {
-                                                    access_token: new_tokens.access_token.clone(),
-                                                    refresh_token: new_tokens.refresh_token.or(Some(refresh_token)),
-                                                    expires_at: new_expires_at,
-                                                    token_type: new_tokens.token_type,
-                                                },
-                                                ..auth_file
-                                            };
-                                            let _ = auth::save_auth_file(&updated_auth, &path);
-                                            return Some(new_tokens.access_token);
-                                        }
-                                    }
-                                } else {
-                                    // No expiry set, assume valid
-                                    return Some(auth_file.token.access_token);
-                                }
-                            }
+        let snapshot = match parse_token_snapshot(&json) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        if !is_expired(snapshot.expires_at) {
+            return Some(snapshot.access_token);
+        }
+
+        let refresh_token = match snapshot.refresh_token {
+            Some(v) => v,
+            None => continue,
+        };
+
+        if let Ok(new_tokens) = anthropic::refresh_token(&refresh_token).await {
+            let new_expiry = new_tokens.expires_in.map(|secs| {
+                (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
+            });
+
+            match snapshot.location {
+                TokenLocation::Nested => {
+                    if json.get("token").is_none() {
+                        json["token"] = json!({});
+                    }
+                    if let Some(obj) = json.get_mut("token").and_then(|v| v.as_object_mut()) {
+                        obj.insert(
+                            "access_token".to_string(),
+                            serde_json::json!(new_tokens.access_token),
+                        );
+                        if let Some(new_refresh) = &new_tokens.refresh_token {
+                            obj.insert("refresh_token".to_string(), serde_json::json!(new_refresh));
                         }
+                        if let Some(exp) = new_expiry {
+                            let key = snapshot.expiry_key.unwrap_or("expires_at");
+                            obj.insert(key.to_string(), serde_json::json!(exp));
+                        }
+                        obj.insert(
+                            "token_type".to_string(),
+                            serde_json::json!(new_tokens.token_type),
+                        );
+                    }
+                }
+                TokenLocation::Root => {
+                    json["access_token"] = serde_json::json!(new_tokens.access_token);
+                    if let Some(new_refresh) = &new_tokens.refresh_token {
+                        json["refresh_token"] = serde_json::json!(new_refresh);
+                    }
+                    if let Some(exp) = new_expiry {
+                        json["expired"] = serde_json::json!(exp);
                     }
                 }
             }
+
+            if let Ok(updated_content) = serde_json::to_string_pretty(&json) {
+                let _ = std::fs::write(&candidate.path, updated_content);
+            }
+
+            return Some(new_tokens.access_token);
         }
     }
     None
 }
 
 /// Get a valid Codex access token from stored credentials
-async fn get_codex_token() -> Option<String> {
-    let auth_dir = crate::config::resolve_auth_dir();
-    if !auth_dir.exists() {
-        return None;
-    }
+async fn get_codex_token(model: &str) -> Option<String> {
+    let candidates = select_auth_candidates("codex", model);
+    for candidate in candidates {
+        let content = match std::fs::read_to_string(&candidate.path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let mut json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
 
-    if let Ok(entries) = std::fs::read_dir(&auth_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(auth_file) = serde_json::from_str::<AuthFile>(&content) {
-                        if auth_file.provider != "codex" || !auth_file.enabled {
-                            continue;
+        let snapshot = match parse_token_snapshot(&json) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        if !is_expired(snapshot.expires_at) {
+            return Some(snapshot.access_token);
+        }
+
+        let refresh_token = match snapshot.refresh_token {
+            Some(v) => v,
+            None => continue,
+        };
+
+        if let Ok(new_tokens) = openai::refresh_token(&refresh_token).await {
+            let new_expiry = new_tokens.expires_in.map(|secs| {
+                (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
+            });
+
+            match snapshot.location {
+                TokenLocation::Nested => {
+                    if json.get("token").is_none() {
+                        json["token"] = json!({});
+                    }
+                    if let Some(obj) = json.get_mut("token").and_then(|v| v.as_object_mut()) {
+                        obj.insert(
+                            "access_token".to_string(),
+                            serde_json::json!(new_tokens.access_token),
+                        );
+                        if let Some(new_refresh) = &new_tokens.refresh_token {
+                            obj.insert("refresh_token".to_string(), serde_json::json!(new_refresh));
                         }
-                        if let Some(expires_at) = auth_file.token.expires_at {
-                            if expires_at > chrono::Utc::now() {
-                                return Some(auth_file.token.access_token);
-                            }
-                            if let Some(refresh_token) = auth_file.token.refresh_token.clone() {
-                                if let Ok(new_tokens) = openai::refresh_token(&refresh_token).await {
-                                    let new_expires_at = new_tokens.expires_in.map(|secs| {
-                                        chrono::Utc::now() + chrono::Duration::seconds(secs as i64)
-                                    });
-                                    let updated_auth = AuthFile {
-                                        token: TokenInfo {
-                                            access_token: new_tokens.access_token.clone(),
-                                            refresh_token: new_tokens
-                                                .refresh_token
-                                                .or(Some(refresh_token)),
-                                            expires_at: new_expires_at,
-                                            token_type: new_tokens.token_type,
-                                        },
-                                        ..auth_file
-                                    };
-                                    let _ = auth::save_auth_file(&updated_auth, &path);
-                                    return Some(new_tokens.access_token);
-                                }
-                            }
-                        } else {
-                            return Some(auth_file.token.access_token);
+                        if let Some(exp) = new_expiry {
+                            let key = snapshot.expiry_key.unwrap_or("expires_at");
+                            obj.insert(key.to_string(), serde_json::json!(exp));
+                        }
+                        obj.insert(
+                            "token_type".to_string(),
+                            serde_json::json!(new_tokens.token_type),
+                        );
+                        if let Some(id_token) = &new_tokens.id_token {
+                            obj.insert("id_token".to_string(), serde_json::json!(id_token));
+                        }
+                    }
+                }
+                TokenLocation::Root => {
+                    json["access_token"] = serde_json::json!(new_tokens.access_token);
+                    if let Some(new_refresh) = &new_tokens.refresh_token {
+                        json["refresh_token"] = serde_json::json!(new_refresh);
+                    }
+                    if let Some(exp) = new_expiry {
+                        json["expired"] = serde_json::json!(exp);
+                    }
+                    if let Some(id_token) = &new_tokens.id_token {
+                        json["id_token"] = serde_json::json!(id_token);
+                    }
+                }
+            }
+
+            if let Ok(updated_content) = serde_json::to_string_pretty(&json) {
+                let _ = std::fs::write(&candidate.path, updated_content);
+            }
+
+            return Some(new_tokens.access_token);
+        }
+    }
+    None
+}
+
+/// Get a valid Antigravity access token from stored credentials
+async fn get_antigravity_auth(model: &str) -> Option<AntigravityAuth> {
+    let candidates = select_auth_candidates("antigravity", model);
+    for candidate in candidates {
+        let content = match std::fs::read_to_string(&candidate.path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let mut json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let snapshot = match parse_token_snapshot(&json) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let mut project_id = json
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        if !is_expired(snapshot.expires_at) {
+            if project_id.is_none() {
+                if let Ok(pid) = antigravity_oauth::fetch_project_id(&snapshot.access_token).await {
+                    if !pid.trim().is_empty() {
+                        project_id = Some(pid.clone());
+                        json["project_id"] = serde_json::json!(pid);
+                        if let Ok(updated_content) = serde_json::to_string_pretty(&json) {
+                            let _ = std::fs::write(&candidate.path, updated_content);
                         }
                     }
                 }
             }
+            return Some(AntigravityAuth {
+                access_token: snapshot.access_token,
+                project_id,
+            });
+        }
+
+        let refresh_token = match snapshot.refresh_token {
+            Some(v) => v,
+            None => continue,
+        };
+
+        if let Ok(new_tokens) = antigravity_oauth::refresh_token(&refresh_token).await {
+            let new_expiry = new_tokens.expires_in.map(|secs| {
+                (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
+            });
+
+            match snapshot.location {
+                TokenLocation::Nested => {
+                    if json.get("token").is_none() {
+                        json["token"] = json!({});
+                    }
+                    if let Some(obj) = json.get_mut("token").and_then(|v| v.as_object_mut()) {
+                        obj.insert(
+                            "access_token".to_string(),
+                            serde_json::json!(new_tokens.access_token),
+                        );
+                        if let Some(new_refresh) = &new_tokens.refresh_token {
+                            obj.insert("refresh_token".to_string(), serde_json::json!(new_refresh));
+                        }
+                        if let Some(exp) = new_expiry.clone() {
+                            let key = snapshot.expiry_key.unwrap_or("expires_at");
+                            obj.insert(key.to_string(), serde_json::json!(exp));
+                        }
+                        obj.insert(
+                            "token_type".to_string(),
+                            serde_json::json!(new_tokens.token_type),
+                        );
+                    }
+                }
+                TokenLocation::Root => {
+                    json["access_token"] = serde_json::json!(new_tokens.access_token);
+                    if let Some(new_refresh) = &new_tokens.refresh_token {
+                        json["refresh_token"] = serde_json::json!(new_refresh);
+                    }
+                    if let Some(exp) = new_expiry.clone() {
+                        json["expired"] = serde_json::json!(exp);
+                    }
+                    if let Some(secs) = new_tokens.expires_in {
+                        json["expires_in"] = serde_json::json!(secs);
+                        json["timestamp"] = serde_json::json!(chrono::Utc::now().timestamp_millis());
+                    }
+                    json["token_type"] = serde_json::json!(new_tokens.token_type);
+                    json["type"] = serde_json::json!("antigravity");
+                }
+            }
+
+            if project_id.is_none() {
+                if let Ok(pid) = antigravity_oauth::fetch_project_id(&new_tokens.access_token).await {
+                    if !pid.trim().is_empty() {
+                        project_id = Some(pid.clone());
+                        json["project_id"] = serde_json::json!(pid);
+                    }
+                }
+            }
+
+            if let Ok(updated_content) = serde_json::to_string_pretty(&json) {
+                let _ = std::fs::write(&candidate.path, updated_content);
+            }
+
+            return Some(AntigravityAuth {
+                access_token: new_tokens.access_token,
+                project_id,
+            });
         }
     }
     None
@@ -608,9 +956,20 @@ pub async fn chat_completions(
     let is_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let (provider_override, model) = parse_provider_prefix(&raw_model);
 
-    if provider_override.as_deref() == Some("gemini") || model.starts_with("gemini") {
+    if provider_override.is_none() {
+        return Json(json!({
+            "error": {
+                "message": "Model must include provider prefix (e.g. 'gemini/...', 'claude/...', 'codex/...', 'antigravity/...').",
+                "type": "invalid_request_error",
+                "code": 400
+            }
+        }))
+        .into_response();
+    }
+
+    if provider_override.as_deref() == Some("gemini") {
         // Get Gemini token
-        let auth = match get_gemini_auth().await {
+        let auth = match get_gemini_auth(&model).await {
             Some(a) => a,
             None => {
                 return Json(json!({
@@ -671,8 +1030,8 @@ pub async fn chat_completions(
         }
     }
 
-    if provider_override.as_deref() == Some("codex") || is_codex_model(&model) {
-        let token = match get_codex_token().await {
+    if provider_override.as_deref() == Some("codex") {
+        let token = match get_codex_token(&model).await {
             Some(t) => t,
             None => {
                 return Json(json!({
@@ -739,34 +1098,118 @@ pub async fn chat_completions(
     }
 
     if provider_override.as_deref() == Some("antigravity") {
-        return Json(json!({
-            "error": {
-                "message": "Provider 'antigravity' is not supported yet.",
-                "type": "invalid_request_error",
-                "code": 400
+        let auth = match get_antigravity_auth(&model).await {
+            Some(a) => a,
+            None => {
+                return Json(json!({
+                    "error": {
+                        "message": "No valid Antigravity credentials found. Please login with Antigravity first.",
+                        "type": "authentication_error",
+                        "code": 401
+                    }
+                }))
+                .into_response();
             }
-        }))
-        .into_response();
+        };
+
+        let AntigravityAuth {
+            access_token,
+            project_id,
+        } = auth;
+        let client = AntigravityClient::new(access_token);
+        let antigravity_request =
+            antigravity::openai_to_antigravity_request(&raw, &model, project_id);
+
+        if is_stream {
+            match client.stream_generate_content(&antigravity_request, None).await {
+                Ok(response) => {
+                    let stream = antigravity::antigravity_stream_to_openai_events(response);
+                    return Sse::new(stream).into_response();
+                }
+                Err(e) => {
+                    tracing::error!("Antigravity API error: {}", e);
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Antigravity API error: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            }
+        }
+
+        if antigravity::should_use_stream_for_non_stream(&model) {
+            match client.stream_generate_content(&antigravity_request, None).await {
+                Ok(response) => match antigravity::collect_antigravity_stream(response).await {
+                    Ok(payload) => {
+                        let openai_response =
+                            gemini::gemini_to_openai_response(&payload, &model, &request_id);
+                        return Json(openai_response).into_response();
+                    }
+                    Err(e) => {
+                        tracing::error!("Antigravity API error: {}", e);
+                        return Json(json!({
+                            "error": {
+                                "message": format!("Antigravity API error: {}", e),
+                                "type": "api_error",
+                                "code": 500
+                            }
+                        }))
+                        .into_response();
+                    }
+                },
+                Err(e) => {
+                    tracing::error!("Antigravity API error: {}", e);
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Antigravity API error: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            }
+        }
+
+        match client.generate_content(&antigravity_request, None).await {
+            Ok(response) => {
+                let openai_response =
+                    gemini::gemini_to_openai_response(&response, &model, &request_id);
+                return Json(openai_response).into_response();
+            }
+            Err(e) => {
+                tracing::error!("Antigravity API error: {}", e);
+                return Json(json!({
+                    "error": {
+                        "message": format!("Antigravity API error: {}", e),
+                        "type": "api_error",
+                        "code": 500
+                    }
+                }))
+                .into_response();
+            }
+        }
     }
 
-    // Check if this is a Claude model
-    let request: ChatCompletionRequest = match serde_json::from_value(raw.clone()) {
-        Ok(r) => r,
-        Err(e) => {
-            return Json(json!({
-                "error": {
-                    "message": format!("Invalid request: {}", e),
-                    "type": "invalid_request_error",
-                    "code": 400
-                }
-            }))
-            .into_response();
-        }
-    };
-
-    if provider_override.as_deref() == Some("claude") || request.model.starts_with("claude") {
+    if provider_override.as_deref() == Some("claude") {
+        let request: ChatCompletionRequest = match serde_json::from_value(raw.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                return Json(json!({
+                    "error": {
+                        "message": format!("Invalid request: {}", e),
+                        "type": "invalid_request_error",
+                        "code": 400
+                    }
+                }))
+                .into_response();
+            }
+        };
         // Get Claude token
-        let token = match get_claude_token().await {
+        let token = match get_claude_token(&model).await {
             Some(t) => t,
             None => {
                 return Json(json!({
@@ -795,13 +1238,10 @@ pub async fn chat_completions(
 
         match client.create_message(claude_request).await {
             Ok(response) => {
-                let openai_response = claude::claude_to_openai_response(
-                    &response,
-                    &request.model,
-                    &request_id,
-                );
-                return Json(openai_response).into_response();
-            }
+            let openai_response =
+                claude::claude_to_openai_response(&response, &request.model, &request_id);
+            return Json(openai_response).into_response();
+        }
             Err(e) => {
                 tracing::error!("Claude API error: {}", e);
                 return Json(json!({
@@ -816,10 +1256,9 @@ pub async fn chat_completions(
         }
     }
 
-    // Default placeholder response for unsupported models
     Json(json!({
         "error": {
-            "message": format!("Model '{}' is not supported. Please use a Gemini or Claude model and add appropriate credentials.", request.model),
+            "message": "Unsupported provider. Use a supported provider prefix (gemini/..., claude/..., codex/..., antigravity/...).",
             "type": "invalid_request_error",
             "code": 400
         }
@@ -1085,6 +1524,7 @@ pub async fn anthropic_callback(
                     expires_at,
                     token_type: token_response.token_type,
                 },
+                project_id: None,
                 enabled: true,
                 prefix: None,
             };
@@ -1167,6 +1607,7 @@ pub async fn codex_callback(
                     expires_at,
                     token_type: token_response.token_type,
                 },
+                project_id: None,
                 enabled: true,
                 prefix: None,
             };
@@ -1218,12 +1659,12 @@ pub async fn antigravity_callback(
     tracing::info!("Received Antigravity OAuth callback with code and state");
 
     // Exchange code for tokens
-    match antigravity::exchange_code(&code, &state).await {
+    match antigravity_oauth::exchange_code(&code, &state).await {
         Ok(token_response) => {
             tracing::info!("Successfully exchanged code for Antigravity tokens");
 
             // Get user info
-            let email = match antigravity::get_user_info(&token_response.access_token).await {
+            let email = match antigravity_oauth::get_user_info(&token_response.access_token).await {
                 Ok(user_info) => user_info.email,
                 Err(e) => {
                     tracing::warn!("Failed to get user info: {}", e);
@@ -1237,6 +1678,15 @@ pub async fn antigravity_callback(
             });
 
             // Create auth file
+            let project_id = match antigravity_oauth::fetch_project_id(&token_response.access_token).await {
+                Ok(pid) if !pid.trim().is_empty() => Some(pid),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!("Failed to fetch Antigravity project id: {}", e);
+                    None
+                }
+            };
+
             let auth_file = AuthFile {
                 provider: "antigravity".to_string(),
                 email: email.clone(),
@@ -1246,6 +1696,7 @@ pub async fn antigravity_callback(
                     expires_at,
                     token_type: token_response.token_type,
                 },
+                project_id,
                 enabled: true,
                 prefix: None,
             };

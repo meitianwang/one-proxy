@@ -22,6 +22,8 @@ pub struct AuthFile {
     pub email: Option<String>,
     pub token: TokenInfo,
     #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub prefix: Option<String>,
@@ -228,6 +230,7 @@ pub async fn start_oauth(provider: OAuthProvider, project_id: Option<String>) ->
                             expires_at,
                             token_type: result.token_response.token_type,
                         },
+                        project_id: None,
                         enabled: true,
                         prefix: None,
                     };

@@ -16,6 +16,12 @@ const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v1/userinfo?alt=js
 const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 const CLIENT_SECRET: &str = "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";
 const REDIRECT_URI: &str = "http://localhost:8417/antigravity/callback";
+const API_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
+const API_VERSION: &str = "v1internal";
+const API_USER_AGENT: &str = "google-api-nodejs-client/9.15.1";
+const API_CLIENT: &str = "google-cloud-sdk vscode_cloudshelleditor/0.1";
+const CLIENT_METADATA: &str =
+    r#"{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}"#;
 
 // Store pending OAuth sessions
 static PENDING_SESSIONS: Lazy<Mutex<HashMap<String, OAuthSession>>> =
@@ -190,6 +196,146 @@ pub async fn refresh_token(refresh_token: &str) -> Result<TokenResponse> {
 
     let token_response: TokenResponse = response.json().await?;
     Ok(token_response)
+}
+
+/// Fetch Antigravity project id (loadCodeAssist + onboardUser fallback)
+pub async fn fetch_project_id(access_token: &str) -> Result<String> {
+    let access_token = access_token.trim();
+    if access_token.is_empty() {
+        return Err(anyhow::anyhow!("missing access token"));
+    }
+
+    let load_resp = load_code_assist(access_token).await?;
+    if let Some(project_id) = extract_project_id(&load_resp) {
+        return Ok(project_id);
+    }
+
+    let tier_id = extract_default_tier(&load_resp).unwrap_or_else(|| "legacy-tier".to_string());
+    onboard_user(access_token, &tier_id).await
+}
+
+async fn load_code_assist(access_token: &str) -> Result<serde_json::Value> {
+    let body = serde_json::json!({
+        "metadata": {
+            "ideType": "ANTIGRAVITY",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI"
+        }
+    });
+
+    let endpoint = format!("{}/{}:loadCodeAssist", API_ENDPOINT, API_VERSION);
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Content-Type", "application/json")
+        .header("User-Agent", API_USER_AGENT)
+        .header("X-Goog-Api-Client", API_CLIENT)
+        .header("Client-Metadata", CLIENT_METADATA)
+        .json(&body)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "loadCodeAssist failed: {} {}",
+            status,
+            text
+        ));
+    }
+
+    let value: serde_json::Value = response.json().await?;
+    Ok(value)
+}
+
+async fn onboard_user(access_token: &str, tier_id: &str) -> Result<String> {
+    let body = serde_json::json!({
+        "tierId": tier_id,
+        "metadata": {
+            "ideType": "ANTIGRAVITY",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI"
+        }
+    });
+
+    let endpoint = format!("{}/{}:onboardUser", API_ENDPOINT, API_VERSION);
+    let client = reqwest::Client::new();
+
+    for _ in 0..5 {
+        let response = client
+            .post(&endpoint)
+            .bearer_auth(access_token)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", API_USER_AGENT)
+            .header("X-Goog-Api-Client", API_CLIENT)
+            .header("Client-Metadata", CLIENT_METADATA)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if status.is_success() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                let done = value.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
+                if done {
+                    if let Some(resp) = value.get("response") {
+                        if let Some(project_id) = extract_project_id(resp) {
+                            return Ok(project_id);
+                        }
+                    }
+                    return Err(anyhow::anyhow!("no project_id in onboard response"));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
+        }
+        return Err(anyhow::anyhow!(
+            "onboardUser failed: {} {}",
+            status,
+            text
+        ));
+    }
+
+    Err(anyhow::anyhow!("onboardUser did not complete"))
+}
+
+fn extract_project_id(value: &serde_json::Value) -> Option<String> {
+    if let Some(project) = value.get("cloudaicompanionProject") {
+        if let Some(id) = project.as_str() {
+            let id = id.trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+        if let Some(id) = project.get("id").and_then(|v| v.as_str()) {
+            let id = id.trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_default_tier(value: &serde_json::Value) -> Option<String> {
+    value.get("allowedTiers").and_then(|tiers| tiers.as_array()).and_then(|tiers| {
+        for tier in tiers {
+            let is_default = tier.get("isDefault").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !is_default {
+                continue;
+            }
+            if let Some(id) = tier.get("id").and_then(|v| v.as_str()) {
+                let id = id.trim();
+                if !id.is_empty() {
+                    return Some(id.to_string());
+                }
+            }
+        }
+        None
+    })
 }
 
 /// Clean up OAuth sessions older than 10 minutes
