@@ -117,10 +117,10 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
         models.extend(build_prefixed_models("gemini", &base));
     }
 
-    // Add Codex/OpenAI models if available
+    // Add Codex/OpenAI models if available (with reasoning_effort variants)
     if has_codex {
         let base = get_codex_models();
-        models.extend(build_prefixed_models("codex", &base));
+        models.extend(build_codex_models_with_reasoning(&base));
     }
 
     // Add Antigravity models if available
@@ -150,6 +150,37 @@ fn build_prefixed_models(prefix: &str, base: &[ModelInfo]) -> Vec<ModelInfo> {
             owned_by: m.owned_by.clone(),
         })
         .collect()
+}
+
+/// Build Codex models with reasoning_effort variants
+fn build_codex_models_with_reasoning(base: &[ModelInfo]) -> Vec<ModelInfo> {
+    let efforts = ["low", "medium", "high", "xhigh"];
+    let mut models = Vec::new();
+    for m in base {
+        for effort in &efforts {
+            models.push(ModelInfo {
+                id: format!("codex/{}/{}", effort, m.id),
+                object: m.object.clone(),
+                created: m.created,
+                owned_by: m.owned_by.clone(),
+            });
+        }
+    }
+    models
+}
+
+/// Parse Codex model name with reasoning_effort
+/// e.g. "codex/high/gpt-5-codex" -> ("gpt-5-codex", Some("high"))
+fn parse_codex_model_with_effort(model: &str) -> (String, Option<String>) {
+    let efforts = ["low", "medium", "high", "xhigh"];
+    let parts: Vec<&str> = model.splitn(2, '/').collect();
+    if parts.len() == 2 {
+        let potential_effort = parts[0];
+        if efforts.contains(&potential_effort) {
+            return (parts[1].to_string(), Some(potential_effort.to_string()));
+        }
+    }
+    (model.to_string(), None)
 }
 
 /// Get static Gemini model definitions
@@ -1448,7 +1479,10 @@ pub async fn chat_completions(
     }
 
     if provider_override.as_deref() == Some("codex") {
-        let token = match get_codex_token(&model).await {
+        // Parse reasoning_effort from model name (e.g., "high/gpt-5-codex")
+        let (actual_model, reasoning_effort) = parse_codex_model_with_effort(&model);
+
+        let token = match get_codex_token(&actual_model).await {
             Some(t) => t,
             None => {
                 return Json(json!({
@@ -1462,8 +1496,14 @@ pub async fn chat_completions(
             }
         };
 
+        // Inject reasoning_effort into request if parsed from model name
+        let mut modified_raw = raw.clone();
+        if let Some(effort) = reasoning_effort {
+            modified_raw["reasoning_effort"] = json!(effort);
+        }
+
         let client = CodexClient::new(token);
-        let codex_request = codex::openai_to_codex_request(&raw, &model, true);
+        let codex_request = codex::openai_to_codex_request(&modified_raw, &actual_model, true);
 
         if is_stream {
             match client.stream_responses(&codex_request, true).await {
@@ -1780,7 +1820,10 @@ pub async fn completions(
     }
 
     if provider_override.as_deref() == Some("codex") {
-        let token = match get_codex_token(&model).await {
+        // Parse reasoning_effort from model name (e.g., "high/gpt-5-codex")
+        let (actual_model, reasoning_effort) = parse_codex_model_with_effort(&model);
+
+        let token = match get_codex_token(&actual_model).await {
             Some(t) => t,
             None => {
                 return Json(json!({
@@ -1794,8 +1837,14 @@ pub async fn completions(
             }
         };
 
+        // Inject reasoning_effort into request if parsed from model name
+        let mut modified_request = chat_request.clone();
+        if let Some(effort) = reasoning_effort {
+            modified_request["reasoning_effort"] = json!(effort);
+        }
+
         let client = CodexClient::new(token);
-        let codex_request = codex::openai_to_codex_request(&chat_request, &model, true);
+        let codex_request = codex::openai_to_codex_request(&modified_request, &actual_model, true);
 
         if is_stream {
             match client.stream_responses(&codex_request, true).await {
@@ -2212,7 +2261,10 @@ pub async fn claude_messages(
     }
 
     if provider_override.as_deref() == Some("codex") {
-        let token = match get_codex_token(&model).await {
+        // Parse reasoning_effort from model name (e.g., "high/gpt-5-codex")
+        let (actual_model, reasoning_effort) = parse_codex_model_with_effort(&model);
+
+        let token = match get_codex_token(&actual_model).await {
             Some(t) => t,
             None => {
                 return Json(json!({
@@ -2226,14 +2278,20 @@ pub async fn claude_messages(
             }
         };
 
+        // Inject reasoning_effort into request if parsed from model name
+        let mut modified_openai_raw = openai_raw.clone();
+        if let Some(effort) = reasoning_effort {
+            modified_openai_raw["reasoning_effort"] = json!(effort);
+        }
+
         let client = CodexClient::new(token);
-        let codex_request = codex::openai_to_codex_request(&openai_raw, &model, true);
+        let codex_request = codex::openai_to_codex_request(&modified_openai_raw, &actual_model, true);
 
         if is_stream {
             match client.stream_responses(&codex_request, true).await {
                 Ok(response) => {
-                    let upstream = codex::codex_stream_to_openai_chunks(response, openai_raw.clone());
-                    let stream = openai_chunks_to_claude_events(upstream, &model);
+                    let upstream = codex::codex_stream_to_openai_chunks(response, modified_openai_raw.clone());
+                    let stream = openai_chunks_to_claude_events(upstream, &actual_model);
                     return Sse::new(stream).into_response();
                 }
                 Err(e) => {
@@ -2251,10 +2309,10 @@ pub async fn claude_messages(
         }
 
         match client.stream_responses(&codex_request, true).await {
-            Ok(response) => match codex::collect_non_stream_response(response, &openai_raw).await {
+            Ok(response) => match codex::collect_non_stream_response(response, &modified_openai_raw).await {
                 Ok(openai_response) => {
                     let claude_response =
-                        claude::openai_to_claude_response(&openai_response, &model, &request_id);
+                        claude::openai_to_claude_response(&openai_response, &actual_model, &request_id);
                     return Json(claude_response).into_response();
                 }
                 Err(e) => {
