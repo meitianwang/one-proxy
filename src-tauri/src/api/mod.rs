@@ -16,6 +16,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 mod handlers;
 pub mod antigravity;
+pub mod kiro;
 mod schema_cleaner;
 pub mod claude;
 pub mod codex;
