@@ -308,3 +308,23 @@ pub fn delete_account(account_id: &str) -> Result<()> {
         Err(anyhow::anyhow!("Account file not found: {}", account_id))
     }
 }
+
+pub fn set_account_enabled(account_id: &str, enabled: bool) -> Result<()> {
+    let auth_dir = crate::config::resolve_auth_dir();
+    let path = auth_dir.join(format!("{}.json", account_id));
+
+    if !path.exists() {
+        return Err(anyhow::anyhow!("Account file not found: {}", account_id));
+    }
+
+    let content = std::fs::read_to_string(&path)?;
+    let mut json: serde_json::Value = serde_json::from_str(&content)?;
+
+    json["enabled"] = serde_json::json!(enabled);
+    json["disabled"] = serde_json::json!(!enabled);
+
+    let content = serde_json::to_string_pretty(&json)?;
+    std::fs::write(&path, content)?;
+    tracing::info!("Set account {} enabled={}", account_id, enabled);
+    Ok(())
+}

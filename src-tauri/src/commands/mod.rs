@@ -125,6 +125,11 @@ pub async fn delete_account(account_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn set_account_enabled(account_id: String, enabled: bool) -> Result<(), String> {
+    crate::auth::set_account_enabled(&account_id, enabled).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn set_gemini_project_id(account_id: String, project_id: String) -> Result<(), String> {
     crate::auth::set_gemini_project_id(&account_id, &project_id).map_err(|e| e.to_string())
 }

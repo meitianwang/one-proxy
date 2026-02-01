@@ -37,6 +37,7 @@ export function Accounts() {
   const [pendingGeminiAccountId, setPendingGeminiAccountId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [showAddMenu, setShowAddMenu] = useState(false);
+  const [viewMode, setViewMode] = useState<"list" | "card">("list");
   const addMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -208,6 +209,44 @@ export function Accounts() {
     }
   }
 
+  async function handleToggleEnabled(accountId: string, enabled: boolean) {
+    try {
+      await invoke("set_account_enabled", { accountId, enabled });
+      await fetchAccounts();
+    } catch (error) {
+      console.error("Failed to toggle account:", error);
+      alert(`操作失败: ${error}`);
+    }
+  }
+
+  async function handleBatchEnable() {
+    if (selectedIds.size === 0) return;
+    try {
+      for (const id of selectedIds) {
+        await invoke("set_account_enabled", { accountId: id, enabled: true });
+      }
+      await fetchAccounts();
+      setSelectedIds(new Set());
+    } catch (error) {
+      console.error("Failed to enable accounts:", error);
+      alert(`批量启用失败: ${error}`);
+    }
+  }
+
+  async function handleBatchDisable() {
+    if (selectedIds.size === 0) return;
+    try {
+      for (const id of selectedIds) {
+        await invoke("set_account_enabled", { accountId: id, enabled: false });
+      }
+      await fetchAccounts();
+      setSelectedIds(new Set());
+    } catch (error) {
+      console.error("Failed to disable accounts:", error);
+      alert(`批量禁用失败: ${error}`);
+    }
+  }
+
   const filteredAccounts = accounts;
 
   const allSelected = filteredAccounts.length > 0 && filteredAccounts.every((a) => selectedIds.has(a.id));
@@ -288,77 +327,205 @@ export function Accounts() {
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
               </svg>
             </button>
+
+            {/* View Mode Toggle */}
+            <div className="flex border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
+              <button
+                onClick={() => setViewMode("list")}
+                className={`p-2 ${viewMode === "list" ? "bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600" : "hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-500"}`}
+                title="列表视图"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h16" />
+                </svg>
+              </button>
+              <button
+                onClick={() => setViewMode("card")}
+                className={`p-2 ${viewMode === "card" ? "bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600" : "hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-500"}`}
+                title="卡片视图"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
+                </svg>
+              </button>
+            </div>
           </div>
         </div>
 
         {/* Select All & Count */}
         <div className="flex items-center justify-between">
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={allSelected}
-              onChange={toggleSelectAll}
-              className="w-4 h-4 rounded border-gray-300 text-emerald-500 focus:ring-emerald-500"
-            />
-            <span className="text-sm text-emerald-600 dark:text-emerald-400">全选</span>
-          </label>
+          <div className="flex items-center gap-4">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={allSelected}
+                onChange={toggleSelectAll}
+                className="w-4 h-4 rounded border-gray-300 text-emerald-500 focus:ring-emerald-500"
+              />
+              <span className="text-sm text-emerald-600 dark:text-emerald-400">全选</span>
+            </label>
+            {selectedIds.size > 0 && (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleBatchEnable}
+                  className="px-3 py-1 text-xs rounded-lg bg-emerald-100 text-emerald-700 hover:bg-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/50"
+                >
+                  批量启用 ({selectedIds.size})
+                </button>
+                <button
+                  onClick={handleBatchDisable}
+                  className="px-3 py-1 text-xs rounded-lg bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600"
+                >
+                  批量禁用 ({selectedIds.size})
+                </button>
+              </div>
+            )}
+          </div>
           <span className="text-sm text-emerald-600 dark:text-emerald-400">
             共 {filteredAccounts.length} 个账号
           </span>
         </div>
 
-        {/* Table */}
-        <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-x-auto">
-          <table className="w-full min-w-[600px]">
-            <thead className="bg-emerald-50 dark:bg-emerald-900/20">
-              <tr>
-                <th className="w-10 px-3 py-3"></th>
-                <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">邮箱</th>
-                <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">账号类型</th>
-                <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">状态</th>
-                <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">操作</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-100 dark:divide-gray-700">
-              {loading ? (
+        {/* Table View */}
+        {viewMode === "list" && (
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-x-auto">
+            <table className="w-full min-w-[600px]">
+              <thead className="bg-emerald-50 dark:bg-emerald-900/20">
                 <tr>
-                  <td colSpan={5} className="px-3 py-8 text-center text-gray-500 dark:text-gray-400">
-                    加载中...
-                  </td>
+                  <th className="w-10 px-3 py-3"></th>
+                  <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">邮箱</th>
+                  <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">账号类型</th>
+                  <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">状态</th>
+                  <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">操作</th>
                 </tr>
-              ) : filteredAccounts.length === 0 ? (
-                <tr>
-                  <td colSpan={5} className="px-3 py-8 text-center text-gray-500 dark:text-gray-400">
-                    暂无账号，请点击「添加账号」按钮
-                  </td>
-                </tr>
-              ) : (
-                filteredAccounts.map((account) => {
+              </thead>
+              <tbody className="divide-y divide-gray-100 dark:divide-gray-700">
+                {loading ? (
+                  <tr>
+                    <td colSpan={5} className="px-3 py-8 text-center text-gray-500 dark:text-gray-400">
+                      加载中...
+                    </td>
+                  </tr>
+                ) : filteredAccounts.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="px-3 py-8 text-center text-gray-500 dark:text-gray-400">
+                      暂无账号，请点击「添加账号」按钮
+                    </td>
+                  </tr>
+                ) : (
+                  filteredAccounts.map((account) => {
+                    const providerInfo = getProviderInfo(account.provider);
+                    return (
+                      <tr key={account.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
+                        <td className="px-3 py-3">
+                          <input
+                            type="checkbox"
+                            checked={selectedIds.has(account.id)}
+                            onChange={() => toggleSelect(account.id)}
+                            className="w-4 h-4 rounded border-gray-300 text-emerald-500 focus:ring-emerald-500"
+                          />
+                        </td>
+                        <td className="px-3 py-3">
+                          <div>
+                            <p className="text-sm font-medium text-gray-800 dark:text-white">
+                              {account.email || account.id}
+                            </p>
+                            <p className="text-xs text-emerald-500">{account.provider} 账号</p>
+                          </div>
+                        </td>
+                        <td className="px-3 py-3">
+                          <span className={`inline-block px-2 py-1 text-xs rounded border ${providerInfo.color}`}>
+                            {providerInfo.label}
+                          </span>
+                        </td>
+                        <td className="px-3 py-3">
+                          <span className={`inline-block px-2 py-1 text-xs rounded ${
+                            account.enabled
+                              ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300"
+                              : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
+                          }`}>
+                            {account.enabled ? "正常" : "禁用"}
+                          </span>
+                        </td>
+                        <td className="px-3 py-3">
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() => handleToggleEnabled(account.id, !account.enabled)}
+                              className={`text-sm ${
+                                account.enabled
+                                  ? "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300"
+                                  : "text-emerald-500 hover:text-emerald-700 dark:text-emerald-400 dark:hover:text-emerald-300"
+                              }`}
+                            >
+                              {account.enabled ? "禁用" : "启用"}
+                            </button>
+                            <span className="text-gray-300 dark:text-gray-600">|</span>
+                            <button
+                              onClick={() => handleDelete(account.id)}
+                              className="text-sm text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
+                            >
+                              删除
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* Card View */}
+        {viewMode === "card" && (
+          <div>
+            {loading ? (
+              <div className="text-center py-8 text-gray-500 dark:text-gray-400">加载中...</div>
+            ) : filteredAccounts.length === 0 ? (
+              <div className="text-center py-8 text-gray-500 dark:text-gray-400">
+                暂无账号，请点击「添加账号」按钮
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {filteredAccounts.map((account) => {
                   const providerInfo = getProviderInfo(account.provider);
                   return (
-                    <tr key={account.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
-                      <td className="px-3 py-3">
-                        <input
-                          type="checkbox"
-                          checked={selectedIds.has(account.id)}
-                          onChange={() => toggleSelect(account.id)}
-                          className="w-4 h-4 rounded border-gray-300 text-emerald-500 focus:ring-emerald-500"
-                        />
-                      </td>
-                      <td className="px-3 py-3">
-                        <div>
-                          <p className="text-sm font-medium text-gray-800 dark:text-white">
-                            {account.email || account.id}
-                          </p>
-                          <p className="text-xs text-emerald-500">{account.provider} 账号</p>
+                    <div
+                      key={account.id}
+                      className={`bg-white dark:bg-gray-800 rounded-lg shadow p-4 border-2 transition-colors ${
+                        selectedIds.has(account.id)
+                          ? "border-emerald-500"
+                          : "border-transparent hover:border-gray-200 dark:hover:border-gray-700"
+                      }`}
+                    >
+                      <div className="flex items-start justify-between">
+                        <div className="flex items-center gap-3">
+                          <input
+                            type="checkbox"
+                            checked={selectedIds.has(account.id)}
+                            onChange={() => toggleSelect(account.id)}
+                            className="w-4 h-4 rounded border-gray-300 text-emerald-500 focus:ring-emerald-500"
+                          />
+                          <div className="w-10 h-10 rounded-full bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center">
+                            <span className="text-emerald-600 dark:text-emerald-400 font-medium">
+                              {(account.email || account.id).charAt(0).toUpperCase()}
+                            </span>
+                          </div>
                         </div>
-                      </td>
-                      <td className="px-3 py-3">
                         <span className={`inline-block px-2 py-1 text-xs rounded border ${providerInfo.color}`}>
                           {providerInfo.label}
                         </span>
-                      </td>
-                      <td className="px-3 py-3">
+                      </div>
+                      <div className="mt-3 ml-7">
+                        <p className="text-sm font-medium text-gray-800 dark:text-white truncate">
+                          {account.email || account.id}
+                        </p>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                          {account.provider} 账号
+                        </p>
+                      </div>
+                      <div className="mt-4 ml-7 flex items-center justify-between">
                         <span className={`inline-block px-2 py-1 text-xs rounded ${
                           account.enabled
                             ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300"
@@ -366,22 +533,33 @@ export function Accounts() {
                         }`}>
                           {account.enabled ? "正常" : "禁用"}
                         </span>
-                      </td>
-                      <td className="px-3 py-3">
-                        <button
-                          onClick={() => handleDelete(account.id)}
-                          className="text-sm text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
-                        >
-                          删除
-                        </button>
-                      </td>
-                    </tr>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => handleToggleEnabled(account.id, !account.enabled)}
+                            className={`text-sm ${
+                              account.enabled
+                                ? "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300"
+                                : "text-emerald-500 hover:text-emerald-700 dark:text-emerald-400 dark:hover:text-emerald-300"
+                            }`}
+                          >
+                            {account.enabled ? "禁用" : "启用"}
+                          </button>
+                          <span className="text-gray-300 dark:text-gray-600">|</span>
+                          <button
+                            onClick={() => handleDelete(account.id)}
+                            className="text-sm text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
+                          >
+                            删除
+                          </button>
+                        </div>
+                      </div>
+                    </div>
                   );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
+                })}
+              </div>
+            )}
+          </div>
+        )}
       </div>
       {showProjectPrompt && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">

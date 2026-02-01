@@ -59,6 +59,7 @@ pub fn run() {
             commands::get_server_status,
             commands::start_oauth_login,
             commands::delete_account,
+            commands::set_account_enabled,
             commands::set_gemini_project_id,
         ])
         .run(tauri::generate_context!())
