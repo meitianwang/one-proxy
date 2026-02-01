@@ -14,6 +14,7 @@ use tower_http::cors::{Any, CorsLayer};
 mod handlers;
 pub mod claude;
 pub mod gemini;
+mod mime_types;
 pub mod management;
 pub mod streaming;
 

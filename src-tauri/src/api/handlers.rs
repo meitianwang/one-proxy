@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    response::{Html, IntoResponse, Json},
+    response::{Html, IntoResponse, Json, Response, Sse},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -478,9 +478,10 @@ async fn get_claude_token() -> Option<String> {
 pub async fn chat_completions(
     State(_state): State<AppState>,
     Json(raw): Json<Value>,
-) -> impl IntoResponse {
+) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
     let model = raw.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let is_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Check if this is a Gemini model
     if model.starts_with("gemini") {
@@ -494,7 +495,8 @@ pub async fn chat_completions(
                         "type": "authentication_error",
                         "code": 401
                     }
-                }));
+                }))
+                .into_response();
             }
         };
 
@@ -505,11 +507,31 @@ pub async fn chat_completions(
             gemini_request["project"] = json!(project_id);
         }
 
+        if is_stream {
+            match client.stream_generate_content(&gemini_request).await {
+                Ok(response) => {
+                    let stream = gemini::gemini_cli_stream_to_openai_events(response);
+                    return Sse::new(stream).into_response();
+                }
+                Err(e) => {
+                    tracing::error!("Gemini API error: {}", e);
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Gemini API error: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            }
+        }
+
         match client.generate_content(&gemini_request).await {
             Ok(response) => {
                 let openai_response =
                     gemini::gemini_to_openai_response(&response, &model, &request_id);
-                return Json(openai_response);
+                return Json(openai_response).into_response();
             }
             Err(e) => {
                 tracing::error!("Gemini API error: {}", e);
@@ -519,7 +541,8 @@ pub async fn chat_completions(
                         "type": "api_error",
                         "code": 500
                     }
-                }));
+                }))
+                .into_response();
             }
         }
     }
@@ -534,7 +557,8 @@ pub async fn chat_completions(
                     "type": "invalid_request_error",
                     "code": 400
                 }
-            }));
+            }))
+            .into_response();
         }
     };
 
@@ -549,7 +573,8 @@ pub async fn chat_completions(
                         "type": "authentication_error",
                         "code": 401
                     }
-                }));
+                }))
+                .into_response();
             }
         };
 
@@ -573,7 +598,7 @@ pub async fn chat_completions(
                     &request.model,
                     &request_id,
                 );
-                return Json(openai_response);
+                return Json(openai_response).into_response();
             }
             Err(e) => {
                 tracing::error!("Claude API error: {}", e);
@@ -583,7 +608,8 @@ pub async fn chat_completions(
                         "type": "api_error",
                         "code": 500
                     }
-                }));
+                }))
+                .into_response();
             }
         }
     }
@@ -596,6 +622,7 @@ pub async fn chat_completions(
             "code": 400
         }
     }))
+    .into_response()
 }
 
 pub async fn completions(

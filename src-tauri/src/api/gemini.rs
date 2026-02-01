@@ -1,11 +1,15 @@
 // Gemini API client for proxying requests
 // Uses Cloud Code Assist endpoint for OAuth tokens (same as CLIProxyAPI)
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+use axum::response::sse::Event;
+use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
+use std::convert::Infallible;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use super::mime_types::mime_type_for_extension;
 
 // Cloud Code Assist endpoint for OAuth tokens (same as CLIProxyAPI gemini_cli_executor.go)
 const CODE_ASSIST_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
@@ -151,6 +155,36 @@ impl GeminiClient {
         Ok(body)
     }
 
+    /// Stream content using Cloud Code Assist endpoint (same as CLIProxyAPI)
+    pub async fn stream_generate_content(&self, payload: &Value) -> Result<reqwest::Response> {
+        let url = format!(
+            "{}/{}:streamGenerateContent?alt=sse",
+            CODE_ASSIST_ENDPOINT,
+            CODE_ASSIST_VERSION
+        );
+
+        let response = self
+            .http_client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.access_token))
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .header("User-Agent", "google-api-nodejs-client/9.15.1")
+            .header("X-Goog-Api-Client", "gl-node/22.17.0")
+            .header("Client-Metadata", "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI")
+            .json(payload)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("Gemini streaming request failed: {} {}", status, body));
+        }
+
+        Ok(response)
+    }
+
     pub async fn list_models(&self) -> Result<Value> {
         // For listing models, we can use the standard endpoint
         let url = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -218,12 +252,17 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
     if let Some(top_p) = raw.get("top_p").and_then(|v| v.as_f64()) {
         generation_config.insert("topP".to_string(), json!(top_p));
     }
-    if let Some(top_k) = raw.get("top_k").and_then(|v| v.as_i64()) {
+    if let Some(top_k) = raw.get("top_k").and_then(|v| v.as_f64()) {
         generation_config.insert("topK".to_string(), json!(top_k));
     }
-    if let Some(n) = raw.get("n").and_then(|v| v.as_i64()) {
-        if n > 1 {
-            generation_config.insert("candidateCount".to_string(), json!(n));
+    if let Some(n_val) = raw.get("n") {
+        let n = n_val
+            .as_i64()
+            .or_else(|| n_val.as_f64().map(|v| v as i64));
+        if let Some(n) = n {
+            if n > 1 {
+                generation_config.insert("candidateCount".to_string(), json!(n));
+            }
         }
     }
     if let Some(mods) = raw.get("modalities").and_then(|v| v.as_array()) {
@@ -270,7 +309,11 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                             continue;
                         }
                         let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                        let name = tc.get("function").and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                        let name = tc
+                            .get("function")
+                            .and_then(|v| v.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
                         if !id.is_empty() && !name.is_empty() {
                             tc_id_to_name.insert(id.to_string(), name.to_string());
                         }
@@ -279,12 +322,14 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
             }
         }
 
-        let mut tool_responses: HashMap<String, Value> = HashMap::new();
+        let mut tool_responses: HashMap<String, String> = HashMap::new();
         for m in messages {
             if m.get("role").and_then(|v| v.as_str()) == Some("tool") {
                 if let Some(tool_call_id) = m.get("tool_call_id").and_then(|v| v.as_str()) {
                     if let Some(content) = m.get("content") {
-                        tool_responses.insert(tool_call_id.to_string(), content.clone());
+                        if let Ok(raw) = serde_json::to_string(content) {
+                            tool_responses.insert(tool_call_id.to_string(), raw);
+                        }
                     }
                 }
             }
@@ -315,7 +360,8 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                 continue;
             }
 
-            if role == "user" || ((role == "system" || role == "developer") && !has_multiple_messages) {
+            if role == "user" || ((role == "system" || role == "developer") && !has_multiple_messages)
+            {
                 let mut parts = Vec::new();
                 if let Some(content) = content {
                     if let Some(text) = content.as_str() {
@@ -324,12 +370,17 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                         for item in items {
                             match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
                                 "text" => {
-                                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                                    if let Some(text) = item.get("text").and_then(|v| v.as_str())
+                                    {
                                         parts.push(json!({ "text": text }));
                                     }
                                 }
                                 "image_url" => {
-                                    if let Some(url) = item.get("image_url").and_then(|v| v.get("url")).and_then(|v| v.as_str()) {
+                                    if let Some(url) = item
+                                        .get("image_url")
+                                        .and_then(|v| v.get("url"))
+                                        .and_then(|v| v.as_str())
+                                    {
                                         if let Some((mime, data)) = parse_data_url(url) {
                                             parts.push(json!({
                                                 "inlineData": { "mime_type": mime, "data": data },
@@ -338,7 +389,31 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                                         }
                                     }
                                 }
-                                "file" => {}
+                                "file" => {
+                                    let file = item.get("file");
+                                    let filename = file
+                                        .and_then(|v| v.get("filename"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let file_data = file
+                                        .and_then(|v| v.get("file_data"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let ext = filename
+                                        .rsplit_once('.')
+                                        .map(|(_, e)| e)
+                                        .unwrap_or("");
+                                    if let Some(mime_type) = mime_type_for_extension(ext) {
+                                        parts.push(json!({
+                                            "inlineData": { "mime_type": mime_type, "data": file_data }
+                                        }));
+                                    } else {
+                                        tracing::warn!(
+                                            "Unknown file name extension '{}' in user message, skip",
+                                            ext
+                                        );
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -357,12 +432,17 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                         for item in items {
                             match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
                                 "text" => {
-                                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                                    if let Some(text) = item.get("text").and_then(|v| v.as_str())
+                                    {
                                         parts.push(json!({ "text": text }));
                                     }
                                 }
                                 "image_url" => {
-                                    if let Some(url) = item.get("image_url").and_then(|v| v.get("url")).and_then(|v| v.as_str()) {
+                                    if let Some(url) = item
+                                        .get("image_url")
+                                        .and_then(|v| v.get("url"))
+                                        .and_then(|v| v.as_str())
+                                    {
                                         if let Some((mime, data)) = parse_data_url(url) {
                                             parts.push(json!({
                                                 "inlineData": { "mime_type": mime, "data": data },
@@ -384,12 +464,23 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                             continue;
                         }
                         let fid = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                        let fname = tc.get("function").and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                        let fname = tc
+                            .get("function")
+                            .and_then(|v| v.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
                         let fargs_raw = tc.get("function").and_then(|v| v.get("arguments"));
                         let args_value = if let Some(args_str) = fargs_raw.and_then(|v| v.as_str()) {
-                            serde_json::from_str(args_str).unwrap_or(Value::String(args_str.to_string()))
+                            if args_str.is_empty() {
+                                Value::String(String::new())
+                            } else {
+                                serde_json::from_str(args_str)
+                                    .unwrap_or(Value::String(args_str.to_string()))
+                            }
+                        } else if let Some(raw_value) = fargs_raw {
+                            raw_value.clone()
                         } else {
-                            fargs_raw.cloned().unwrap_or(Value::Null)
+                            Value::String(String::new())
                         };
                         parts.push(json!({
                             "functionCall": { "name": fname, "args": args_value },
@@ -407,11 +498,16 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                     let mut tool_parts = Vec::new();
                     for fid in fids {
                         if let Some(name) = tc_id_to_name.get(&fid) {
-                            let resp = tool_responses.get(&fid).cloned().unwrap_or(json!("{}"));
+                            let raw = tool_responses.get(&fid).cloned().unwrap_or_default();
+                            let resp_value = if raw.is_empty() {
+                                json!({})
+                            } else {
+                                serde_json::from_str(&raw).unwrap_or(json!(raw))
+                            };
                             tool_parts.push(json!({
                                 "functionResponse": {
                                     "name": name,
-                                    "response": { "result": resp }
+                                    "response": { "result": resp_value }
                                 }
                             }));
                         }
@@ -426,15 +522,21 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
 
     request.insert("contents".to_string(), json!(contents));
     if !system_parts.is_empty() {
-        request.insert("systemInstruction".to_string(), json!({
-            "role": "user",
-            "parts": system_parts
-        }));
+        request.insert(
+            "systemInstruction".to_string(),
+            json!({
+                "role": "user",
+                "parts": system_parts
+            }),
+        );
     }
 
     if let Some(tools) = raw.get("tools").and_then(|v| v.as_array()) {
-        let mut tools_node = Vec::new();
         let mut function_decls = Vec::new();
+        let mut google_nodes = Vec::new();
+        let mut code_nodes = Vec::new();
+        let mut url_nodes = Vec::new();
+
         for t in tools {
             if t.get("type").and_then(|v| v.as_str()) == Some("function") {
                 if let Some(mut fn_obj) = t.get("function").cloned() {
@@ -444,7 +546,8 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                         }
                         fn_obj["parametersJsonSchema"] = params;
                     } else {
-                        fn_obj["parametersJsonSchema"] = json!({ "type": "object", "properties": {} });
+                        fn_obj["parametersJsonSchema"] =
+                            json!({ "type": "object", "properties": {} });
                     }
                     if let Some(obj) = fn_obj.as_object_mut() {
                         obj.remove("strict");
@@ -453,24 +556,32 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                 }
             }
             if let Some(gs) = t.get("google_search") {
-                tools_node.push(json!({ "googleSearch": gs }));
+                google_nodes.push(json!({ "googleSearch": gs }));
             }
             if let Some(ce) = t.get("code_execution") {
-                tools_node.push(json!({ "codeExecution": ce }));
+                code_nodes.push(json!({ "codeExecution": ce }));
             }
             if let Some(uc) = t.get("url_context") {
-                tools_node.push(json!({ "urlContext": uc }));
+                url_nodes.push(json!({ "urlContext": uc }));
             }
         }
+
+        let mut tools_node = Vec::new();
         if !function_decls.is_empty() {
-            tools_node.insert(0, json!({ "functionDeclarations": function_decls }));
+            tools_node.push(json!({ "functionDeclarations": function_decls }));
         }
+        tools_node.extend(google_nodes);
+        tools_node.extend(code_nodes);
+        tools_node.extend(url_nodes);
+
         if !tools_node.is_empty() {
             request.insert("tools".to_string(), json!(tools_node));
         }
     }
 
-    request.insert("safetySettings".to_string(), json!(default_safety_settings()));
+    if !request.contains_key("safetySettings") {
+        request.insert("safetySettings".to_string(), json!(default_safety_settings()));
+    }
 
     json!({
         "project": "",
@@ -483,11 +594,14 @@ fn parse_data_url(url: &str) -> Option<(String, String)> {
     if !url.starts_with("data:") {
         return None;
     }
+    if url.len() <= 5 {
+        return None;
+    }
     let without_prefix = &url[5..];
     let mut parts = without_prefix.splitn(2, ';');
     let mime = parts.next()?.to_string();
     let rest = parts.next()?;
-    if !rest.starts_with("base64,") {
+    if rest.len() <= 7 {
         return None;
     }
     let data = rest[7..].to_string();
@@ -495,6 +609,249 @@ fn parse_data_url(url: &str) -> Option<(String, String)> {
         return None;
     }
     Some((mime, data))
+}
+
+struct GeminiCliStreamState {
+    unix_timestamp: i64,
+    function_index: i32,
+}
+
+pub fn gemini_cli_stream_to_openai_events(
+    response: reqwest::Response,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    async_stream::stream! {
+        let mut state = GeminiCliStreamState {
+            unix_timestamp: 0,
+            function_index: 0,
+        };
+        let mut buffer = String::new();
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let bytes = match chunk {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            buffer.push_str(&text);
+
+            while let Some(pos) = buffer.find('\n') {
+                let mut line = buffer[..pos].to_string();
+                buffer = buffer[pos + 1..].to_string();
+                line = line.trim_end_matches('\r').to_string();
+
+                if !line.starts_with("data:") {
+                    continue;
+                }
+                let data = line[5..].trim();
+                if data.is_empty() {
+                    continue;
+                }
+                if data == "[DONE]" {
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+
+                for chunk in convert_gemini_cli_stream_chunk(data, &mut state) {
+                    yield Ok(Event::default().data(chunk));
+                }
+            }
+        }
+
+        yield Ok(Event::default().data("[DONE]"));
+    }
+}
+
+fn convert_gemini_cli_stream_chunk(data: &str, state: &mut GeminiCliStreamState) -> Vec<String> {
+    let parsed: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let response = match parsed.get("response") {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+
+    let mut template = json!({
+        "id": "",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "model",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": null,
+                "content": null,
+                "reasoning_content": null,
+                "tool_calls": null
+            },
+            "finish_reason": null,
+            "native_finish_reason": null
+        }]
+    });
+
+    if let Some(model_version) = response.get("modelVersion").and_then(|v| v.as_str()) {
+        template["model"] = json!(model_version);
+    }
+
+    if let Some(create_time) = response.get("createTime").and_then(|v| v.as_str()) {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(create_time) {
+            state.unix_timestamp = dt.timestamp();
+        }
+        template["created"] = json!(state.unix_timestamp);
+    } else {
+        template["created"] = json!(state.unix_timestamp);
+    }
+
+    if let Some(response_id) = response.get("responseId").and_then(|v| v.as_str()) {
+        template["id"] = json!(response_id);
+    }
+
+    if let Some(finish_reason) = response
+        .get("candidates")
+        .and_then(|v| v.get(0))
+        .and_then(|v| v.get("finishReason"))
+        .and_then(|v| v.as_str())
+    {
+        let lower = finish_reason.to_ascii_lowercase();
+        template["choices"][0]["finish_reason"] = json!(lower);
+        template["choices"][0]["native_finish_reason"] = json!(lower);
+    }
+
+    if let Some(usage) = response.get("usageMetadata") {
+        if let Some(candidates) = usage.get("candidatesTokenCount").and_then(|v| v.as_i64()) {
+            template["usage"]["completion_tokens"] = json!(candidates);
+        }
+        if let Some(total) = usage.get("totalTokenCount").and_then(|v| v.as_i64()) {
+            template["usage"]["total_tokens"] = json!(total);
+        }
+        let prompt = usage.get("promptTokenCount").and_then(|v| v.as_i64()).unwrap_or(0);
+        let thoughts = usage.get("thoughtsTokenCount").and_then(|v| v.as_i64()).unwrap_or(0);
+        template["usage"]["prompt_tokens"] = json!(prompt + thoughts);
+        if thoughts > 0 {
+            template["usage"]["completion_tokens_details"]["reasoning_tokens"] = json!(thoughts);
+        }
+    }
+
+    let mut has_function_call = false;
+
+    if let Some(parts) = response
+        .get("candidates")
+        .and_then(|v| v.get(0))
+        .and_then(|v| v.get("content"))
+        .and_then(|v| v.get("parts"))
+        .and_then(|v| v.as_array())
+    {
+        for part in parts {
+            let part_text = part.get("text").and_then(|v| v.as_str());
+            let function_call = part.get("functionCall");
+            let thought_sig = part
+                .get("thoughtSignature")
+                .or_else(|| part.get("thought_signature"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let inline_data = part.get("inlineData").or_else(|| part.get("inline_data"));
+
+            let has_thought_signature = !thought_sig.is_empty();
+            let has_content_payload =
+                part_text.is_some() || function_call.is_some() || inline_data.is_some();
+
+            if has_thought_signature && !has_content_payload {
+                continue;
+            }
+
+            if let Some(text) = part_text {
+                if part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    template["choices"][0]["delta"]["reasoning_content"] = json!(text);
+                } else {
+                    template["choices"][0]["delta"]["content"] = json!(text);
+                }
+                template["choices"][0]["delta"]["role"] = json!("assistant");
+                continue;
+            }
+
+            if let Some(function_call) = function_call {
+                has_function_call = true;
+                let mut index = state.function_index;
+                if let Some(arr) = template["choices"][0]["delta"]["tool_calls"].as_array() {
+                    index = arr.len() as i32;
+                } else {
+                    template["choices"][0]["delta"]["tool_calls"] = json!([]);
+                }
+                let fc_name = function_call.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let counter = FUNCTION_CALL_ID_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let mut tool_call = json!({
+                    "id": format!("{}-{}-{}", fc_name, nanos, counter),
+                    "index": index,
+                    "type": "function",
+                    "function": {
+                        "name": fc_name,
+                        "arguments": ""
+                    }
+                });
+                if let Some(args) = function_call.get("args") {
+                    tool_call["function"]["arguments"] = args.clone();
+                }
+                if let Some(arr) = template["choices"][0]["delta"]["tool_calls"].as_array_mut() {
+                    arr.push(tool_call);
+                }
+                template["choices"][0]["delta"]["role"] = json!("assistant");
+                state.function_index += 1;
+                continue;
+            }
+
+            if let Some(inline_data) = inline_data {
+                let data = inline_data.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                if data.is_empty() {
+                    continue;
+                }
+                let mut mime_type = inline_data
+                    .get("mimeType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if mime_type.is_empty() {
+                    mime_type = inline_data
+                        .get("mime_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                }
+                if mime_type.is_empty() {
+                    mime_type = "image/png".to_string();
+                }
+                let image_url = format!("data:{};base64,{}", mime_type, data);
+                if !template["choices"][0]["delta"]["images"].is_array() {
+                    template["choices"][0]["delta"]["images"] = json!([]);
+                }
+                let index = template["choices"][0]["delta"]["images"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let image_payload = json!({
+                    "type": "image_url",
+                    "image_url": { "url": image_url },
+                    "index": index
+                });
+                if let Some(arr) = template["choices"][0]["delta"]["images"].as_array_mut() {
+                    arr.push(image_payload);
+                }
+                template["choices"][0]["delta"]["role"] = json!("assistant");
+            }
+        }
+    }
+
+    if has_function_call {
+        template["choices"][0]["finish_reason"] = json!("tool_calls");
+        template["choices"][0]["native_finish_reason"] = json!("tool_calls");
+    }
+
+    vec![template.to_string()]
 }
 
 /// Convert Gemini response to OpenAI format
@@ -626,8 +983,7 @@ fn convert_gemini_response_to_openai(root: &Value) -> Value {
                             }
                         });
                         if let Some(args) = function_call.get("args") {
-                            let raw = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
-                            tool_call["function"]["arguments"] = json!(raw);
+                            tool_call["function"]["arguments"] = args.clone();
                         }
                         if let Some(arr) = choice["message"]["tool_calls"].as_array_mut() {
                             arr.push(tool_call);
