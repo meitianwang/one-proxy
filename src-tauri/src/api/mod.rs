@@ -2,7 +2,10 @@
 
 use anyhow::Result;
 use axum::{
-    http::Method,
+    body::Body,
+    http::{header, Method, Request, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
     Router,
 };
@@ -26,6 +29,42 @@ static SERVER_HANDLE: OnceCell<RwLock<Option<oneshot::Sender<()>>>> = OnceCell::
 #[derive(Clone)]
 pub struct AppState {
     pub app_handle: tauri::AppHandle,
+}
+
+/// API Key authentication middleware
+async fn auth_middleware(request: Request<Body>, next: Next) -> Response {
+    let config = crate::config::get_config().unwrap_or_default();
+
+    // If no API keys configured, allow all requests
+    if config.api_keys.is_empty() {
+        return next.run(request).await;
+    }
+
+    // Extract Authorization header
+    let auth_header = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    let is_valid = match auth_header {
+        Some(auth) => {
+            // Support both "Bearer <key>" and raw key
+            let key = auth.strip_prefix("Bearer ").unwrap_or(auth);
+            config.api_keys.contains(&key.to_string())
+        }
+        None => false,
+    };
+
+    if is_valid {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            [("Content-Type", "application/json")],
+            r#"{"error":{"message":"Invalid API key","type":"invalid_request_error","code":"invalid_api_key"}}"#,
+        )
+            .into_response()
+    }
 }
 
 /// Kill any process using the specified port
@@ -87,8 +126,8 @@ pub async fn start_server(app_handle: tauri::AppHandle) -> Result<()> {
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
         .allow_headers(Any);
 
-    let app = Router::new()
-        .route("/", get(handlers::root))
+    // Routes that require API key authentication
+    let protected_routes = Router::new()
         .route("/v1/models", get(handlers::openai_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/completions", post(handlers::completions))
@@ -97,13 +136,18 @@ pub async fn start_server(app_handle: tauri::AppHandle) -> Result<()> {
         .route("/v1beta/models", get(handlers::gemini_models))
         .route("/v1beta/models/*action", post(handlers::gemini_handler))
         .route("/v1beta/models/*action", get(handlers::gemini_get_handler))
+        .layer(middleware::from_fn(auth_middleware));
+
+    // Routes that don't require authentication
+    let public_routes = Router::new()
+        .route("/", get(handlers::root))
         // OAuth callbacks
         .route("/oauth2callback", get(handlers::google_callback))
         .route("/google/callback", get(handlers::google_callback))
         .route("/anthropic/callback", get(handlers::anthropic_callback))
         .route("/codex/callback", get(handlers::codex_callback))
         .route("/antigravity/callback", get(handlers::antigravity_callback))
-        // Management API
+        // Management API (internal use)
         .route("/management/auth-files", get(management::list_auth_files))
         .route("/management/auth-files", delete(management::delete_auth_file))
         .route("/management/auth-files/status", patch(management::patch_auth_status))
@@ -111,7 +155,11 @@ pub async fn start_server(app_handle: tauri::AppHandle) -> Result<()> {
         .route("/management/accounts", get(management::list_accounts))
         .route("/management/config", get(management::get_config))
         .route("/management/config", put(management::update_config))
-        .route("/management/status", get(management::get_server_status))
+        .route("/management/status", get(management::get_server_status));
+
+    let app = Router::new()
+        .merge(protected_routes)
+        .merge(public_routes)
         .layer(cors)
         .with_state(state);
 
