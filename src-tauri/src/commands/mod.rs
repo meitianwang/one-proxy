@@ -100,7 +100,10 @@ pub enum OAuthProvider {
 }
 
 #[tauri::command]
-pub async fn start_oauth_login(provider: String) -> Result<String, String> {
+pub async fn start_oauth_login(
+    provider: String,
+    project_id: Option<String>,
+) -> Result<String, String> {
     let provider = match provider.to_lowercase().as_str() {
         "google" | "gemini" => OAuthProvider::Google,
         "anthropic" | "claude" => OAuthProvider::Anthropic,
@@ -111,7 +114,7 @@ pub async fn start_oauth_login(provider: String) -> Result<String, String> {
         _ => return Err(format!("Unknown provider: {}", provider)),
     };
 
-    crate::auth::start_oauth(provider)
+    crate::auth::start_oauth(provider, project_id)
         .await
         .map_err(|e| e.to_string())
 }
@@ -119,4 +122,9 @@ pub async fn start_oauth_login(provider: String) -> Result<String, String> {
 #[tauri::command]
 pub async fn delete_account(account_id: String) -> Result<(), String> {
     crate::auth::delete_account(&account_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_gemini_project_id(account_id: String, project_id: String) -> Result<(), String> {
+    crate::auth::set_gemini_project_id(&account_id, &project_id).map_err(|e| e.to_string())
 }

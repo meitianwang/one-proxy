@@ -14,6 +14,12 @@ use super::gemini::{
 use super::AppState;
 use crate::auth::{self, providers::{google, anthropic, antigravity, openai}, AuthFile, TokenInfo};
 
+#[derive(Debug, Clone)]
+struct GeminiAuth {
+    access_token: String,
+    project_id: Option<String>,
+}
+
 // Root endpoint
 pub async fn root() -> Json<Value> {
     Json(json!({
@@ -307,7 +313,8 @@ pub struct ChatMessage {
 }
 
 /// Get a valid Gemini access token from stored credentials
-async fn get_gemini_token() -> Option<String> {
+/// Supports CLIProxyAPI format (gemini-*.json)
+async fn get_gemini_auth() -> Option<GeminiAuth> {
     let auth_dir = crate::config::resolve_auth_dir();
     if !auth_dir.exists() {
         return None;
@@ -318,38 +325,92 @@ async fn get_gemini_token() -> Option<String> {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("gemini_") && name.ends_with(".json") {
+                // Match gemini-*.json (CLIProxyAPI format)
+                let is_gemini_file = name.starts_with("gemini-") && name.ends_with(".json");
+
+                if is_gemini_file {
                     if let Ok(content) = std::fs::read_to_string(&path) {
-                        if let Ok(auth_file) = serde_json::from_str::<AuthFile>(&content) {
-                            if auth_file.enabled {
-                                // Check if token is expired
-                                if let Some(expires_at) = auth_file.token.expires_at {
-                                    if expires_at > chrono::Utc::now() {
-                                        return Some(auth_file.token.access_token);
-                                    }
-                                    // Token expired, try to refresh
-                                    if let Some(refresh_token) = auth_file.token.refresh_token {
-                                        if let Ok(new_tokens) = google::refresh_token(&refresh_token).await {
-                                            // Update the auth file with new tokens
-                                            let new_expires_at = new_tokens.expires_in.map(|secs| {
-                                                chrono::Utc::now() + chrono::Duration::seconds(secs as i64)
-                                            });
-                                            let updated_auth = AuthFile {
-                                                token: TokenInfo {
-                                                    access_token: new_tokens.access_token.clone(),
-                                                    refresh_token: new_tokens.refresh_token.or(Some(refresh_token)),
-                                                    expires_at: new_expires_at,
-                                                    token_type: new_tokens.token_type,
-                                                },
-                                                ..auth_file
-                                            };
-                                            let _ = auth::save_auth_file(&updated_auth, &path);
-                                            return Some(new_tokens.access_token);
+                        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) {
+                            // Check if enabled (default true)
+                            let enabled = json.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+                            if !enabled {
+                                continue;
+                            }
+
+                            // Extract token info from token object
+                            if let Some(token_obj) = json.get("token") {
+                                let access_token = token_obj.get("access_token").and_then(|v| v.as_str()).unwrap_or("");
+                                let refresh_token = token_obj.get("refresh_token").and_then(|v| v.as_str());
+                                let expiry = token_obj.get("expiry").and_then(|v| v.as_str());
+                                let project_id = json
+                                    .get("project_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|v| v.trim().to_string())
+                                    .and_then(|v| {
+                                        if v.is_empty() {
+                                            return None;
                                         }
+                                        if v.eq_ignore_ascii_case("all") {
+                                            return None;
+                                        }
+                                        if let Some(first) = v.split(',').map(|s| s.trim()).find(|s| !s.is_empty()) {
+                                            return Some(first.to_string());
+                                        }
+                                        None
+                                    });
+
+                                if access_token.is_empty() {
+                                    continue;
+                                }
+
+                                // Check if token is expired
+                                let is_expired = if let Some(expiry_str) = expiry {
+                                    if let Ok(expiry_time) = chrono::DateTime::parse_from_rfc3339(expiry_str) {
+                                        expiry_time < chrono::Utc::now()
+                                    } else {
+                                        false // Can't parse, assume not expired
                                     }
                                 } else {
-                                    // No expiry set, assume valid
-                                    return Some(auth_file.token.access_token);
+                                    false // No expiry, assume not expired
+                                };
+
+                                if !is_expired {
+                                    return Some(GeminiAuth {
+                                        access_token: access_token.to_string(),
+                                        project_id,
+                                    });
+                                }
+
+                                // Token expired, try to refresh
+                                if let Some(refresh_tok) = refresh_token {
+                                    if let Ok(new_tokens) = google::refresh_token(refresh_tok).await {
+                                        // Update the token in the JSON
+                                        let new_expiry = new_tokens.expires_in.map(|secs| {
+                                            (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
+                                        });
+
+                                        if let Some(token_obj) = json.get_mut("token") {
+                                            if let Some(obj) = token_obj.as_object_mut() {
+                                                obj.insert("access_token".to_string(), serde_json::json!(new_tokens.access_token));
+                                                if let Some(new_refresh) = &new_tokens.refresh_token {
+                                                    obj.insert("refresh_token".to_string(), serde_json::json!(new_refresh));
+                                                }
+                                                if let Some(exp) = new_expiry {
+                                                    obj.insert("expiry".to_string(), serde_json::json!(exp));
+                                                }
+                                            }
+                                        }
+
+                                        // Save updated file
+                                        if let Ok(updated_content) = serde_json::to_string_pretty(&json) {
+                                            let _ = std::fs::write(&path, updated_content);
+                                        }
+
+                                        return Some(GeminiAuth {
+                                            access_token: new_tokens.access_token,
+                                            project_id,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -425,8 +486,8 @@ pub async fn chat_completions(
     // Check if this is a Gemini model
     if request.model.starts_with("gemini") {
         // Get Gemini token
-        let token = match get_gemini_token().await {
-            Some(t) => t,
+        let auth = match get_gemini_auth().await {
+            Some(a) => a,
             None => {
                 return Json(json!({
                     "error": {
@@ -438,7 +499,7 @@ pub async fn chat_completions(
             }
         };
 
-        let client = GeminiClient::new(token);
+        let client = GeminiClient::new(auth.access_token);
 
         // Convert messages to Gemini format
         let contents = gemini::openai_to_gemini_messages(&request.messages);
@@ -451,6 +512,8 @@ pub async fn chat_completions(
                 top_p: None,
                 top_k: None,
             }),
+            model: None,    // Will be set by generate_content
+            project: auth.project_id,
         };
 
         match client.generate_content(&request.model, gemini_request).await {
@@ -673,39 +736,60 @@ pub async fn google_callback(
         Ok(token_response) => {
             tracing::info!("Successfully exchanged code for tokens");
 
-            // Get user info
+            // Get user info using v1 API like CLIProxyAPI
             let email = match google::get_user_info(&token_response.access_token).await {
-                Ok(user_info) => user_info.email,
+                Ok(user_info) => user_info.email.unwrap_or_else(|| "default".to_string()),
                 Err(e) => {
                     tracing::warn!("Failed to get user info: {}", e);
-                    None
+                    "default".to_string()
                 }
             };
 
-            // Calculate expiry time
-            let expires_at = token_response.expires_in.map(|secs| {
-                chrono::Utc::now() + chrono::Duration::seconds(secs as i64)
+            // Save in CLIProxyAPI-compatible format (GeminiAuthFile)
+            let token = serde_json::json!({
+                "access_token": token_response.access_token,
+                "refresh_token": token_response.refresh_token,
+                "token_type": token_response.token_type,
+                "expires_in": token_response.expires_in,
+                "expiry": token_response.expires_in.map(|secs| {
+                    (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
+                }),
+                "client_id": google::GOOGLE_CLIENT_ID,
+                "client_secret": google::GOOGLE_CLIENT_SECRET,
+                "scopes": google::SCOPES,
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "universe_domain": "googleapis.com"
             });
 
-            // Create auth file
-            let auth_file = AuthFile {
-                provider: "gemini".to_string(),
+            let gemini_auth = auth::GeminiAuthFile {
+                token,
+                project_id: "".to_string(),
                 email: email.clone(),
-                token: TokenInfo {
-                    access_token: token_response.access_token,
-                    refresh_token: token_response.refresh_token,
-                    expires_at,
-                    token_type: token_response.token_type,
-                },
-                enabled: true,
-                prefix: None,
+                auto: true,
+                checked: false,
+                auth_type: "gemini".to_string(),
             };
 
-            // Save auth file
-            let identifier = email.as_deref().unwrap_or("default");
-            let path = auth::get_auth_file_path("gemini", identifier);
+            // Save with CLIProxyAPI naming convention: gemini-email-all.json
+            let auth_dir = crate::config::resolve_auth_dir();
+            let path = auth_dir.join(format!("gemini-{}-all.json", email));
 
-            if let Err(e) = auth::save_auth_file(&auth_file, &path) {
+            let content = match serde_json::to_string_pretty(&gemini_auth) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to serialize auth file: {}", e);
+                    return Html(OAUTH_ERROR_HTML.replace("{{ERROR}}", &format!("Failed to save credentials: {}", e)));
+                }
+            };
+
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::error!("Failed to create auth dir: {}", e);
+                    return Html(OAUTH_ERROR_HTML.replace("{{ERROR}}", &format!("Failed to save credentials: {}", e)));
+                }
+            }
+
+            if let Err(e) = std::fs::write(&path, content) {
                 tracing::error!("Failed to save auth file: {}", e);
                 return Html(OAUTH_ERROR_HTML.replace("{{ERROR}}", &format!("Failed to save credentials: {}", e)));
             }

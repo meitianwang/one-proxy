@@ -3,6 +3,7 @@
 use crate::commands::{AuthAccount, OAuthProvider};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::PathBuf;
 
 pub mod providers;
@@ -26,8 +27,22 @@ pub struct AuthFile {
     pub prefix: Option<String>,
 }
 
+/// CLIProxyAPI-compatible Gemini auth file format
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiAuthFile {
+    pub token: Value,
+    pub project_id: String,
+    pub email: String,
+    #[serde(default)]
+    pub auto: bool,
+    #[serde(default)]
+    pub checked: bool,
+    #[serde(rename = "type")]
+    pub auth_type: String,
+}
+
 fn parse_auth_file(content: &str, filename: &str) -> Option<AuthAccount> {
-    // Try new format first
+    // Try new format first (AuthFile with provider field)
     if let Ok(auth_file) = serde_json::from_str::<AuthFile>(content) {
         return Some(AuthAccount {
             id: filename.to_string(),
@@ -38,12 +53,32 @@ fn parse_auth_file(content: &str, filename: &str) -> Option<AuthAccount> {
         });
     }
 
+    // Try CLIProxyAPI Gemini format (GeminiAuthFile with nested token object)
+    if let Ok(gemini_auth) = serde_json::from_str::<GeminiAuthFile>(content) {
+        // Check if token has access_token
+        if gemini_auth.token.get("access_token").is_some() {
+            return Some(AuthAccount {
+                id: filename.to_string(),
+                provider: "gemini".to_string(),
+                email: Some(gemini_auth.email),
+                enabled: true, // GeminiAuthFile doesn't have enabled field, default to true
+                prefix: None,
+            });
+        }
+    }
+
     // Try parsing as generic JSON for legacy formats
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
         let obj = json.as_object()?;
 
-        // Must have access_token to be valid
-        if !obj.contains_key("access_token") {
+        // Check for access_token at root level or in nested token object
+        let has_access_token = obj.contains_key("access_token") ||
+            obj.get("token")
+                .and_then(|t| t.as_object())
+                .map(|t| t.contains_key("access_token"))
+                .unwrap_or(false);
+
+        if !has_access_token {
             return None;
         }
 
@@ -126,33 +161,47 @@ pub async fn list_accounts() -> Result<Vec<AuthAccount>> {
     Ok(accounts)
 }
 
-pub async fn start_oauth(provider: OAuthProvider) -> Result<String> {
+pub async fn start_oauth(provider: OAuthProvider, project_id: Option<String>) -> Result<String> {
     match provider {
         OAuthProvider::Google => {
             // Google uses a dedicated callback server on port 8085
             match providers::google::start_oauth_with_callback().await {
                 Ok(result) => {
-                    // Save the auth file
-                    let expires_at = result.token_response.expires_in.map(|secs| {
-                        chrono::Utc::now() + chrono::Duration::seconds(secs as i64)
+                    let email = result.email.clone().unwrap_or_else(|| "default".to_string());
+                    let project_id = project_id.unwrap_or_default().trim().to_string();
+
+                    let token = serde_json::json!({
+                        "access_token": result.token_response.access_token,
+                        "refresh_token": result.token_response.refresh_token,
+                        "token_type": result.token_response.token_type,
+                        "expires_in": result.token_response.expires_in,
+                        "expiry": result.token_response.expires_in.map(|secs| {
+                            (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
+                        }),
+                        "client_id": providers::google::GOOGLE_CLIENT_ID,
+                        "client_secret": providers::google::GOOGLE_CLIENT_SECRET,
+                        "scopes": providers::google::SCOPES,
+                        "token_uri": "https://oauth2.googleapis.com/token",
+                        "universe_domain": "googleapis.com"
                     });
 
-                    let auth_file = AuthFile {
-                        provider: "gemini".to_string(),
-                        email: result.email.clone(),
-                        token: TokenInfo {
-                            access_token: result.token_response.access_token,
-                            refresh_token: result.token_response.refresh_token,
-                            expires_at,
-                            token_type: result.token_response.token_type,
-                        },
-                        enabled: true,
-                        prefix: None,
+                    let gemini_auth = GeminiAuthFile {
+                        token,
+                        project_id,
+                        email: email.clone(),
+                        auto: true,
+                        checked: false,
+                        auth_type: "gemini".to_string(),
                     };
 
-                    let identifier = result.email.as_deref().unwrap_or("default");
-                    let path = get_auth_file_path("gemini", identifier);
-                    save_auth_file(&auth_file, &path)?;
+                    let auth_dir = crate::config::resolve_auth_dir();
+                    let path = auth_dir.join(format!("gemini-{}-all.json", email));
+
+                    let content = serde_json::to_string_pretty(&gemini_auth)?;
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&path, content)?;
 
                     tracing::info!("Saved Gemini auth file to {:?}", path);
                     Ok("OAuth completed successfully".to_string())
@@ -197,6 +246,37 @@ pub async fn start_oauth(provider: OAuthProvider) -> Result<String> {
         OAuthProvider::IFlow => providers::iflow::start_oauth().await,
         OAuthProvider::Antigravity => providers::antigravity::start_oauth().await,
     }
+}
+
+pub fn set_gemini_project_id(account_id: &str, project_id: &str) -> Result<()> {
+    let account_id = account_id.trim();
+    let project_id = project_id.trim();
+    if account_id.is_empty() {
+        return Err(anyhow::anyhow!("account_id is required"));
+    }
+    if project_id.is_empty() {
+        return Err(anyhow::anyhow!("project_id is required"));
+    }
+    if !account_id.starts_with("gemini-") {
+        return Err(anyhow::anyhow!("not a gemini auth file"));
+    }
+
+    let auth_dir = crate::config::resolve_auth_dir();
+    let path = auth_dir.join(format!("{}.json", account_id));
+    if !path.exists() {
+        return Err(anyhow::anyhow!("auth file not found: {:?}", path));
+    }
+
+    let content = std::fs::read_to_string(&path)?;
+    let mut json: serde_json::Value = serde_json::from_str(&content)?;
+    if !json.is_object() {
+        return Err(anyhow::anyhow!("invalid auth file format"));
+    }
+    json["project_id"] = serde_json::Value::String(project_id.to_string());
+
+    let updated = serde_json::to_string_pretty(&json)?;
+    std::fs::write(&path, updated)?;
+    Ok(())
 }
 
 pub fn get_auth_file_path(provider: &str, identifier: &str) -> PathBuf {

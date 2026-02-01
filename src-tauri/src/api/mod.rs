@@ -24,6 +24,48 @@ pub struct AppState {
     pub app_handle: tauri::AppHandle,
 }
 
+/// Kill any process using the specified port
+fn kill_process_on_port(port: u16) {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("lsof")
+            .args(["-ti", &format!(":{}", port)])
+            .output()
+        {
+            let pids = String::from_utf8_lossy(&output.stdout);
+            for pid in pids.lines() {
+                if let Ok(pid_num) = pid.trim().parse::<i32>() {
+                    tracing::info!("Killing process {} on port {}", pid_num, port);
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", &pid_num.to_string()])
+                        .output();
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(output) = std::process::Command::new("fuser")
+            .args(["-k", &format!("{}/tcp", port)])
+            .output()
+        {
+            tracing::info!("Killed processes on port {}: {:?}", port, output);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = std::process::Command::new("cmd")
+            .args(["/c", &format!("for /f \"tokens=5\" %a in ('netstat -aon ^| findstr :{} ^| findstr LISTENING') do taskkill /F /PID %a", port)])
+            .output()
+        {
+            tracing::info!("Killed processes on port {}: {:?}", port, output);
+        }
+    }
+
+    // Give the OS a moment to release the port
+    std::thread::sleep(std::time::Duration::from_millis(100));
+}
+
 pub async fn start_server(app_handle: tauri::AppHandle) -> Result<()> {
     let config = crate::config::get_config().unwrap_or_default();
 
@@ -67,7 +109,17 @@ pub async fn start_server(app_handle: tauri::AppHandle) -> Result<()> {
         .layer(cors)
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // Try to bind, if port is in use, kill the process and retry
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            tracing::warn!("Port {} is in use, killing existing process...", config.port);
+            kill_process_on_port(config.port);
+            tokio::net::TcpListener::bind(&addr).await?
+        }
+        Err(e) => return Err(e.into()),
+    };
+
     tracing::info!("API server listening on {}", addr);
 
     let (tx, rx) = oneshot::channel::<()>();

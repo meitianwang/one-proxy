@@ -32,6 +32,9 @@ export function Accounts() {
   const [accounts, setAccounts] = useState<AuthAccount[]>([]);
   const [loading, setLoading] = useState(true);
   const [loginInProgress, setLoginInProgress] = useState<string | null>(null);
+  const [showProjectPrompt, setShowProjectPrompt] = useState(false);
+  const [projectIdInput, setProjectIdInput] = useState("");
+  const [pendingGeminiAccountId, setPendingGeminiAccountId] = useState<string | null>(null);
 
   useEffect(() => {
     fetchAccounts();
@@ -66,7 +69,7 @@ export function Accounts() {
     }
   }
 
-  async function handleLogin(provider: string) {
+  async function startLogin(provider: string) {
     try {
       console.log("Starting OAuth login for provider:", provider);
       setLoginInProgress(provider);
@@ -96,7 +99,24 @@ export function Accounts() {
       } else if (authUrl) {
         // OAuth completed successfully (e.g., OpenAI flow)
         console.log("OAuth completed:", authUrl);
-        await fetchAccounts();
+        const beforeIds = new Set(accounts.map((account) => account.id));
+        const latestAccounts = await invoke<AuthAccount[]>("get_auth_accounts");
+        setAccounts(latestAccounts);
+        if (provider === "google") {
+          const newGemini = latestAccounts.find(
+            (account) =>
+              account.provider === "gemini" && !beforeIds.has(account.id)
+          );
+          const fallbackGemini = latestAccounts.find(
+            (account) => account.provider === "gemini"
+          );
+          const target = newGemini ?? fallbackGemini;
+          if (target) {
+            setPendingGeminiAccountId(target.id);
+            setProjectIdInput("");
+            setShowProjectPrompt(true);
+          }
+        }
         setLoginInProgress(null);
         return;
       } else {
@@ -112,6 +132,42 @@ export function Accounts() {
       alert(`登录失败: ${error}`);
       setLoginInProgress(null);
     }
+  }
+
+  async function handleLogin(provider: string) {
+    await startLogin(provider);
+  }
+
+  async function handleProjectConfirm() {
+    const trimmed = projectIdInput.trim();
+    if (!trimmed) {
+      alert("需要填写项目 ID 才能继续登录");
+      return;
+    }
+    setShowProjectPrompt(false);
+    const accountId = pendingGeminiAccountId;
+    setPendingGeminiAccountId(null);
+    if (!accountId) {
+      alert("未找到可更新的 Gemini 账户");
+      return;
+    }
+    try {
+      await invoke("set_gemini_project_id", {
+        accountId,
+        projectId: trimmed,
+      });
+      alert("项目 ID 已保存");
+    } catch (error) {
+      console.error("Failed to save project id:", error);
+      alert(`保存失败: ${error}`);
+    }
+  }
+
+  function handleProjectCancel() {
+    setShowProjectPrompt(false);
+    setPendingGeminiAccountId(null);
+    setProjectIdInput("");
+    setLoginInProgress(null);
   }
 
   async function handleDelete(accountId: string) {
@@ -136,7 +192,8 @@ export function Accounts() {
   }
 
   return (
-    <div className="space-y-6">
+    <>
+      <div className="space-y-6">
       <h2 className="text-2xl font-bold text-gray-800 dark:text-white">账户管理</h2>
 
       {/* Add Account Section */}
@@ -222,6 +279,41 @@ export function Accounts() {
           </div>
         )}
       </div>
-    </div>
+      </div>
+      {showProjectPrompt && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div className="w-full max-w-md rounded-lg bg-white dark:bg-gray-800 shadow-lg border border-gray-200 dark:border-gray-700 p-6">
+            <h4 className="text-lg font-semibold text-gray-800 dark:text-white">
+              输入 GCP 项目 ID
+            </h4>
+            <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
+              Gemini CLI 需要项目 ID 才能请求 Cloud Code Assist。
+            </p>
+            <input
+              type="text"
+              value={projectIdInput}
+              onChange={(e) => setProjectIdInput(e.target.value)}
+              placeholder="例如：my-gcp-project"
+              className="mt-4 w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-800 dark:text-white"
+              autoFocus
+            />
+            <div className="mt-6 flex justify-end gap-2">
+              <button
+                onClick={handleProjectCancel}
+                className="px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleProjectConfirm}
+                className="px-4 py-2 rounded-lg bg-blue-500 hover:bg-blue-600 text-white"
+              >
+                继续登录
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }

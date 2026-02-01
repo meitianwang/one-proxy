@@ -61,15 +61,37 @@ pub fn gemini_stream_to_openai_chunk(
     request_id: &str,
     is_first: bool,
 ) -> Value {
-    let content = gemini_data
+    let mut content_parts: Vec<String> = Vec::new();
+    let mut thought_parts: Vec<String> = Vec::new();
+    if let Some(parts) = gemini_data
         .get("candidates")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("content"))
         .and_then(|c| c.get("parts"))
-        .and_then(|p| p.get(0))
-        .and_then(|p| p.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
+        .and_then(|p| p.as_array())
+    {
+        for part in parts {
+            let text = part.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            if text.is_empty() {
+                continue;
+            }
+            let is_thought = part
+                .get("thought")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if is_thought {
+                thought_parts.push(text.to_string());
+            } else {
+                content_parts.push(text.to_string());
+            }
+        }
+    }
+
+    let content = if !content_parts.is_empty() {
+        content_parts.join("")
+    } else {
+        thought_parts.join("")
+    };
 
     let finish_reason = gemini_data
         .get("candidates")

@@ -1,41 +1,31 @@
-// Google/Gemini OAuth implementation with PKCE
+// Google/Gemini OAuth implementation - CLIProxyAPI compatible
+// This implementation matches CLIProxyAPI exactly for compatibility
 
 use anyhow::Result;
 use axum::{extract::Query, response::{Html, IntoResponse}, Router, routing::get};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use once_cell::sync::Lazy;
-use parking_lot::{Mutex, RwLock};
-use rand::Rng;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
-const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+// Google OAuth endpoints - same as golang.org/x/oauth2/google
+const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
+// Use v1 API like CLIProxyAPI
+const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json";
+
+// OAuth configuration constants - same as CLIProxyAPI
+pub const GOOGLE_CLIENT_ID: &str = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
+pub const GOOGLE_CLIENT_SECRET: &str = "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";
 const OAUTH_CALLBACK_PORT: u16 = 8085;
 const REDIRECT_URI: &str = "http://localhost:8085/oauth2callback";
 
-fn get_google_client_id() -> String {
-    std::env::var("GOOGLE_CLIENT_ID").unwrap_or_else(|_| "YOUR_GOOGLE_CLIENT_ID".to_string())
-}
-
-fn get_google_client_secret() -> String {
-    std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_else(|_| "YOUR_GOOGLE_CLIENT_SECRET".to_string())
-}
-
-// Store pending OAuth sessions
-static PENDING_SESSIONS: Lazy<Mutex<HashMap<String, OAuthSession>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
-#[derive(Debug, Clone)]
-pub struct OAuthSession {
-    pub state: String,
-    pub code_verifier: String,
-    pub created_at: std::time::Instant,
-}
+// OAuth scopes - same as CLIProxyAPI
+pub const SCOPES: &[&str] = &[
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenResponse {
@@ -67,6 +57,12 @@ pub struct OAuthCallbackParams {
 pub struct OAuthResult {
     pub token_response: TokenResponse,
     pub email: Option<String>,
+}
+
+pub struct OAuthFlowHandle {
+    pub auth_url: String,
+    pub result_rx: oneshot::Receiver<Result<OAuthResult>>,
+    pub shutdown_tx: oneshot::Sender<()>,
 }
 
 // Shared state for the callback server
@@ -118,35 +114,6 @@ const ERROR_HTML: &str = r#"
 </html>
 "#;
 
-/// Generate a random string for state/verifier
-fn generate_random_string(length: usize) -> String {
-    let mut rng = rand::rng();
-    let chars: Vec<char> = (0..length)
-        .map(|_| {
-            let idx = rng.random_range(0..62);
-            match idx {
-                0..=25 => (b'a' + idx) as char,
-                26..=51 => (b'A' + idx - 26) as char,
-                _ => (b'0' + idx - 52) as char,
-            }
-        })
-        .collect();
-    chars.into_iter().collect()
-}
-
-/// Generate PKCE code verifier (43-128 characters)
-fn generate_code_verifier() -> String {
-    generate_random_string(64)
-}
-
-/// Generate PKCE code challenge from verifier (S256 method)
-fn generate_code_challenge(verifier: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(verifier.as_bytes());
-    let hash = hasher.finalize();
-    URL_SAFE_NO_PAD.encode(hash)
-}
-
 /// Kill any process using the OAuth callback port
 fn kill_process_on_port(port: u16) {
     #[cfg(target_os = "macos")]
@@ -189,77 +156,25 @@ fn kill_process_on_port(port: u16) {
     std::thread::sleep(std::time::Duration::from_millis(100));
 }
 
-/// Start OAuth flow and return the authorization URL (legacy, for use with external callback handler)
-pub async fn start_oauth() -> Result<String> {
-    let state = generate_random_string(32);
-    let code_verifier = generate_code_verifier();
-    let code_challenge = generate_code_challenge(&code_verifier);
-
-    // Store session for later verification
-    let session = OAuthSession {
-        state: state.clone(),
-        code_verifier,
-        created_at: std::time::Instant::now(),
-    };
-
-    PENDING_SESSIONS.lock().insert(state.clone(), session);
-
-    // Clean up old sessions (older than 10 minutes)
-    cleanup_old_sessions();
-
-    let scopes = [
-        "https://www.googleapis.com/auth/cloud-platform",
-        "https://www.googleapis.com/auth/userinfo.email",
-        "https://www.googleapis.com/auth/userinfo.profile",
-    ]
-    .join(" ");
-
-    let auth_url = format!(
-        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}&code_challenge={}&code_challenge_method=S256",
-        GOOGLE_AUTH_URL,
-        get_google_client_id(),
-        urlencoding::encode(REDIRECT_URI),
-        urlencoding::encode(&scopes),
-        state,
-        code_challenge
-    );
-
-    tracing::info!("Generated Google OAuth URL with state: {}", state);
-    Ok(auth_url)
-}
-
-/// Start OAuth flow with dedicated callback server
+/// Start OAuth flow with dedicated callback server - CLIProxyAPI compatible
+/// This matches the getTokenFromWeb function in CLIProxyAPI
 pub async fn start_oauth_with_callback() -> Result<OAuthResult> {
-    let state = generate_random_string(32);
-    let code_verifier = generate_code_verifier();
-    let code_challenge = generate_code_challenge(&code_verifier);
+    // CLIProxyAPI uses fixed "state-token" string
+    let state = "state-token".to_string();
 
-    // Store session for later verification
-    let session = OAuthSession {
-        state: state.clone(),
-        code_verifier,
-        created_at: std::time::Instant::now(),
-    };
+    tracing::info!("Starting Google OAuth flow (CLIProxyAPI compatible)");
 
-    PENDING_SESSIONS.lock().insert(state.clone(), session);
+    let scopes = SCOPES.join(" ");
 
-    tracing::info!("Starting Google OAuth flow with state: {}", state);
-
-    let scopes = [
-        "https://www.googleapis.com/auth/cloud-platform",
-        "https://www.googleapis.com/auth/userinfo.email",
-        "https://www.googleapis.com/auth/userinfo.profile",
-    ]
-    .join(" ");
-
+    // Build auth URL exactly like CLIProxyAPI:
+    // config.AuthCodeURL("state-token", oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("prompt", "consent"))
     let auth_url = format!(
-        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}&code_challenge={}&code_challenge_method=S256",
+        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}",
         GOOGLE_AUTH_URL,
-        get_google_client_id(),
+        GOOGLE_CLIENT_ID,
         urlencoding::encode(REDIRECT_URI),
         urlencoding::encode(&scopes),
-        state,
-        code_challenge
+        state
     );
 
     // Create channel for result
@@ -332,7 +247,7 @@ pub async fn start_oauth_with_callback() -> Result<OAuthResult> {
             .ok();
     });
 
-    // Wait for result with timeout (5 minutes)
+    // Wait for result with timeout (5 minutes) - same as CLIProxyAPI
     let result = tokio::time::timeout(std::time::Duration::from_secs(300), result_rx).await;
 
     // Shutdown server
@@ -345,17 +260,91 @@ pub async fn start_oauth_with_callback() -> Result<OAuthResult> {
     }
 }
 
+/// Start OAuth flow and return the auth URL plus a handle to await the result.
+/// The caller is responsible for opening the auth URL and handling the result.
+pub async fn start_oauth_with_callback_url() -> Result<OAuthFlowHandle> {
+    // CLIProxyAPI uses fixed "state-token" string
+    let state = "state-token".to_string();
+
+    tracing::info!("Starting Google OAuth flow (CLIProxyAPI compatible)");
+
+    let scopes = SCOPES.join(" ");
+
+    let auth_url = format!(
+        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}",
+        GOOGLE_AUTH_URL,
+        GOOGLE_CLIENT_ID,
+        urlencoding::encode(REDIRECT_URI),
+        urlencoding::encode(&scopes),
+        state
+    );
+
+    // Create channel for result
+    let (result_tx, result_rx) = oneshot::channel();
+
+    // Create shared state
+    let callback_state = Arc::new(RwLock::new(CallbackState {
+        result_tx: Some(result_tx),
+    }));
+
+    // Create callback handler
+    let state_clone = callback_state.clone();
+    let callback_handler = move |Query(params): Query<OAuthCallbackParams>| {
+        let state = state_clone.clone();
+        async move { handle_callback(params, state).await }
+    };
+
+    // Build router
+    let app = Router::new().route("/oauth2callback", get(callback_handler));
+
+    // Kill any existing process on the port
+    kill_process_on_port(OAUTH_CALLBACK_PORT);
+
+    // Try to bind to the port
+    let addr = format!("127.0.0.1:{}", OAUTH_CALLBACK_PORT);
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "Failed to start OAuth callback server on port {}: {}",
+                OAUTH_CALLBACK_PORT,
+                e
+            ));
+        }
+    };
+
+    tracing::info!("Google OAuth callback server listening on {}", addr);
+
+    // Spawn server with graceful shutdown
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                shutdown_rx.await.ok();
+            })
+            .await
+            .ok();
+    });
+
+    Ok(OAuthFlowHandle {
+        auth_url,
+        result_rx,
+        shutdown_tx,
+    })
+}
+
 async fn handle_callback(
     params: OAuthCallbackParams,
     state: Arc<RwLock<CallbackState>>,
 ) -> impl IntoResponse {
-    // Check for errors
+    // Check for errors - same as CLIProxyAPI
     if let Some(error) = params.error {
         let error_msg = params.error_description.unwrap_or(error);
         tracing::error!("Google OAuth error: {}", error_msg);
 
         if let Some(tx) = state.write().result_tx.take() {
-            let _ = tx.send(Err(anyhow::anyhow!("OAuth error: {}", error_msg)));
+            let _ = tx.send(Err(anyhow::anyhow!("Authentication failed: {}", error_msg)));
         }
 
         return Html(ERROR_HTML.replace("{{ERROR}}", &error_msg));
@@ -365,26 +354,24 @@ async fn handle_callback(
         Some(c) => c,
         None => {
             if let Some(tx) = state.write().result_tx.take() {
-                let _ = tx.send(Err(anyhow::anyhow!("No authorization code received")));
+                let _ = tx.send(Err(anyhow::anyhow!("Authentication failed: code not found")));
             }
-            return Html(ERROR_HTML.replace("{{ERROR}}", "No authorization code received"));
+            return Html(ERROR_HTML.replace("{{ERROR}}", "Authentication failed: code not found"));
         }
     };
 
-    let oauth_state = match params.state {
-        Some(s) => s,
-        None => {
-            if let Some(tx) = state.write().result_tx.take() {
-                let _ = tx.send(Err(anyhow::anyhow!("No state parameter received")));
-            }
-            return Html(ERROR_HTML.replace("{{ERROR}}", "No state parameter received"));
+    // Verify state - CLIProxyAPI uses fixed "state-token"
+    if params.state.as_deref() != Some("state-token") {
+        if let Some(tx) = state.write().result_tx.take() {
+            let _ = tx.send(Err(anyhow::anyhow!("Invalid state parameter")));
         }
-    };
+        return Html(ERROR_HTML.replace("{{ERROR}}", "Invalid state parameter"));
+    }
 
-    // Get session and exchange code
-    match exchange_code(&code, &oauth_state).await {
+    // Exchange code for tokens - same as CLIProxyAPI config.Exchange()
+    match exchange_code_internal(&code).await {
         Ok(token_response) => {
-            // Get user info
+            // Get user info using v1 API like CLIProxyAPI
             let email = match get_user_info(&token_response.access_token).await {
                 Ok(user_info) => user_info.email,
                 Err(e) => {
@@ -416,22 +403,16 @@ async fn handle_callback(
     }
 }
 
-/// Exchange authorization code for tokens
-pub async fn exchange_code(code: &str, state: &str) -> Result<TokenResponse> {
-    let session = PENDING_SESSIONS
-        .lock()
-        .remove(state)
-        .ok_or_else(|| anyhow::anyhow!("Invalid or expired OAuth state"))?;
-
+/// Exchange authorization code for tokens - matches CLIProxyAPI config.Exchange()
+async fn exchange_code_internal(code: &str) -> Result<TokenResponse> {
     let client = reqwest::Client::new();
 
     let params = [
-        ("client_id", get_google_client_id()),
-        ("client_secret", get_google_client_secret()),
-        ("code", code.to_string()),
-        ("code_verifier", session.code_verifier),
-        ("grant_type", "authorization_code".to_string()),
-        ("redirect_uri", REDIRECT_URI.to_string()),
+        ("client_id", GOOGLE_CLIENT_ID),
+        ("client_secret", GOOGLE_CLIENT_SECRET),
+        ("code", code),
+        ("grant_type", "authorization_code"),
+        ("redirect_uri", REDIRECT_URI),
     ];
 
     let response = client
@@ -451,13 +432,14 @@ pub async fn exchange_code(code: &str, state: &str) -> Result<TokenResponse> {
     Ok(token_response)
 }
 
-/// Get user info using access token
+/// Get user info using access token - uses v1 API like CLIProxyAPI
 pub async fn get_user_info(access_token: &str) -> Result<UserInfo> {
     let client = reqwest::Client::new();
 
     let response = client
         .get(GOOGLE_USERINFO_URL)
-        .bearer_auth(access_token)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await?;
 
@@ -475,10 +457,10 @@ pub async fn refresh_token(refresh_token: &str) -> Result<TokenResponse> {
     let client = reqwest::Client::new();
 
     let params = [
-        ("client_id", get_google_client_id()),
-        ("client_secret", get_google_client_secret()),
-        ("refresh_token", refresh_token.to_string()),
-        ("grant_type", "refresh_token".to_string()),
+        ("client_id", GOOGLE_CLIENT_ID),
+        ("client_secret", GOOGLE_CLIENT_SECRET),
+        ("refresh_token", refresh_token),
+        ("grant_type", "refresh_token"),
     ];
 
     let response = client
@@ -496,14 +478,12 @@ pub async fn refresh_token(refresh_token: &str) -> Result<TokenResponse> {
     Ok(token_response)
 }
 
-/// Clean up OAuth sessions older than 10 minutes
-fn cleanup_old_sessions() {
-    let mut sessions = PENDING_SESSIONS.lock();
-    let now = std::time::Instant::now();
-    sessions.retain(|_, session| now.duration_since(session.created_at).as_secs() < 600);
-}
-
-/// Get pending session by state (for verification)
-pub fn get_pending_session(state: &str) -> Option<OAuthSession> {
-    PENDING_SESSIONS.lock().get(state).cloned()
+/// Exchange authorization code for tokens - public API for external callback handlers
+/// CLIProxyAPI uses fixed "state-token" so we just verify that
+pub async fn exchange_code(code: &str, state: &str) -> Result<TokenResponse> {
+    // Verify state matches CLIProxyAPI's fixed value
+    if state != "state-token" {
+        return Err(anyhow::anyhow!("Invalid state parameter"));
+    }
+    exchange_code_internal(code).await
 }
