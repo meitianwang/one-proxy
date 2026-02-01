@@ -83,28 +83,67 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
 
     // Add Gemini models if available
     if has_gemini {
-        models.extend(get_gemini_models());
+        let base = get_gemini_models();
+        models.extend(base.iter().map(|m| ModelInfo {
+            id: m.id.clone(),
+            object: m.object.clone(),
+            created: m.created,
+            owned_by: m.owned_by.clone(),
+        }));
+        models.extend(build_prefixed_models("gemini", &base));
     }
 
     // Add Codex/OpenAI models if available
     if has_codex {
-        models.extend(get_codex_models());
+        let base = get_codex_models();
+        models.extend(base.iter().map(|m| ModelInfo {
+            id: m.id.clone(),
+            object: m.object.clone(),
+            created: m.created,
+            owned_by: m.owned_by.clone(),
+        }));
+        models.extend(build_prefixed_models("codex", &base));
     }
 
     // Add Antigravity models if available
     if has_antigravity {
-        models.extend(get_antigravity_models());
+        let base = get_antigravity_models();
+        models.extend(base.iter().map(|m| ModelInfo {
+            id: m.id.clone(),
+            object: m.object.clone(),
+            created: m.created,
+            owned_by: m.owned_by.clone(),
+        }));
+        models.extend(build_prefixed_models("antigravity", &base));
     }
 
     // Add Claude models if available
     if has_claude {
-        models.extend(get_claude_models());
+        let base = get_claude_models();
+        models.extend(base.iter().map(|m| ModelInfo {
+            id: m.id.clone(),
+            object: m.object.clone(),
+            created: m.created,
+            owned_by: m.owned_by.clone(),
+        }));
+        models.extend(build_prefixed_models("claude", &base));
     }
 
     Json(ModelsResponse {
         object: "list".to_string(),
         data: models,
     })
+}
+
+fn build_prefixed_models(prefix: &str, base: &[ModelInfo]) -> Vec<ModelInfo> {
+    base.iter()
+        .map(|m| ModelInfo {
+            id: format!("{}/{}", prefix, m.id),
+            object: m.object.clone(),
+            created: m.created,
+            owned_by: m.owned_by.clone(),
+        })
+        .collect()
 }
 
 /// Get static Gemini model definitions
@@ -202,6 +241,32 @@ fn is_codex_model(model: &str) -> bool {
         return false;
     }
     get_codex_models().iter().any(|m| m.id == model)
+}
+
+fn parse_provider_prefix(model: &str) -> (Option<String>, String) {
+    let trimmed = model.trim();
+    if let Some((prefix, rest)) = trimmed.split_once('/') {
+        if let Some(normalized) = normalize_provider_prefix(prefix) {
+            return (Some(normalized), rest.to_string());
+        }
+    }
+    if let Some((prefix, rest)) = trimmed.split_once(':') {
+        if let Some(normalized) = normalize_provider_prefix(prefix) {
+            return (Some(normalized), rest.to_string());
+        }
+    }
+    (None, trimmed.to_string())
+}
+
+fn normalize_provider_prefix(prefix: &str) -> Option<String> {
+    match prefix.trim().to_lowercase().as_str() {
+        "gemini" => Some("gemini".to_string()),
+        "codex" => Some("codex".to_string()),
+        "openai" => Some("codex".to_string()),
+        "claude" => Some("claude".to_string()),
+        "antigravity" => Some("antigravity".to_string()),
+        _ => None,
+    }
 }
 
 /// Get static Antigravity model definitions
@@ -539,11 +604,11 @@ pub async fn chat_completions(
     Json(raw): Json<Value>,
 ) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
-    let model = raw.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let raw_model = raw.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let is_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let (provider_override, model) = parse_provider_prefix(&raw_model);
 
-    // Check if this is a Gemini model
-    if model.starts_with("gemini") {
+    if provider_override.as_deref() == Some("gemini") || model.starts_with("gemini") {
         // Get Gemini token
         let auth = match get_gemini_auth().await {
             Some(a) => a,
@@ -606,7 +671,7 @@ pub async fn chat_completions(
         }
     }
 
-    if is_codex_model(&model) {
+    if provider_override.as_deref() == Some("codex") || is_codex_model(&model) {
         let token = match get_codex_token().await {
             Some(t) => t,
             None => {
@@ -673,6 +738,17 @@ pub async fn chat_completions(
         }
     }
 
+    if provider_override.as_deref() == Some("antigravity") {
+        return Json(json!({
+            "error": {
+                "message": "Provider 'antigravity' is not supported yet.",
+                "type": "invalid_request_error",
+                "code": 400
+            }
+        }))
+        .into_response();
+    }
+
     // Check if this is a Claude model
     let request: ChatCompletionRequest = match serde_json::from_value(raw.clone()) {
         Ok(r) => r,
@@ -688,7 +764,7 @@ pub async fn chat_completions(
         }
     };
 
-    if request.model.starts_with("claude") {
+    if provider_override.as_deref() == Some("claude") || request.model.starts_with("claude") {
         // Get Claude token
         let token = match get_claude_token().await {
             Some(t) => t,
