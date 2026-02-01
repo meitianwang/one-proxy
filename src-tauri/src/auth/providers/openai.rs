@@ -171,6 +171,38 @@ pub async fn exchange_code(code: &str, code_verifier: &str) -> Result<TokenRespo
     Ok(token_response)
 }
 
+/// Refresh access token using refresh_token
+pub async fn refresh_token(refresh_token: &str) -> Result<TokenResponse> {
+    let client = reqwest::Client::new();
+
+    let params = [
+        ("grant_type", "refresh_token"),
+        ("client_id", CLIENT_ID),
+        ("refresh_token", refresh_token),
+    ];
+
+    let response = client
+        .post(OPENAI_TOKEN_URL)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .form(&params)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "Token refresh failed with status {}: {}",
+            status,
+            body
+        ));
+    }
+
+    let token_response: TokenResponse = response.json().await?;
+    Ok(token_response)
+}
+
 /// Extract email from token response
 pub fn extract_email(token_response: &TokenResponse) -> Option<String> {
     if let Some(id_token) = &token_response.id_token {

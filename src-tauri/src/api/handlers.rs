@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::claude::{self, ClaudeClient, ClaudeRequest};
+use super::codex::{self, CodexClient};
 use super::gemini::{self, GeminiClient};
 use super::AppState;
 use crate::auth::{self, providers::{google, anthropic, antigravity, openai}, AuthFile, TokenInfo};
@@ -194,6 +195,13 @@ fn get_codex_models() -> Vec<ModelInfo> {
             owned_by: "openai".to_string(),
         },
     ]
+}
+
+fn is_codex_model(model: &str) -> bool {
+    if model.is_empty() {
+        return false;
+    }
+    get_codex_models().iter().any(|m| m.id == model)
 }
 
 /// Get static Antigravity model definitions
@@ -475,6 +483,57 @@ async fn get_claude_token() -> Option<String> {
     None
 }
 
+/// Get a valid Codex access token from stored credentials
+async fn get_codex_token() -> Option<String> {
+    let auth_dir = crate::config::resolve_auth_dir();
+    if !auth_dir.exists() {
+        return None;
+    }
+
+    if let Ok(entries) = std::fs::read_dir(&auth_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(auth_file) = serde_json::from_str::<AuthFile>(&content) {
+                        if auth_file.provider != "codex" || !auth_file.enabled {
+                            continue;
+                        }
+                        if let Some(expires_at) = auth_file.token.expires_at {
+                            if expires_at > chrono::Utc::now() {
+                                return Some(auth_file.token.access_token);
+                            }
+                            if let Some(refresh_token) = auth_file.token.refresh_token.clone() {
+                                if let Ok(new_tokens) = openai::refresh_token(&refresh_token).await {
+                                    let new_expires_at = new_tokens.expires_in.map(|secs| {
+                                        chrono::Utc::now() + chrono::Duration::seconds(secs as i64)
+                                    });
+                                    let updated_auth = AuthFile {
+                                        token: TokenInfo {
+                                            access_token: new_tokens.access_token.clone(),
+                                            refresh_token: new_tokens
+                                                .refresh_token
+                                                .or(Some(refresh_token)),
+                                            expires_at: new_expires_at,
+                                            token_type: new_tokens.token_type,
+                                        },
+                                        ..auth_file
+                                    };
+                                    let _ = auth::save_auth_file(&updated_auth, &path);
+                                    return Some(new_tokens.access_token);
+                                }
+                            }
+                        } else {
+                            return Some(auth_file.token.access_token);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 pub async fn chat_completions(
     State(_state): State<AppState>,
     Json(raw): Json<Value>,
@@ -538,6 +597,73 @@ pub async fn chat_completions(
                 return Json(json!({
                     "error": {
                         "message": format!("Gemini API error: {}", e),
+                        "type": "api_error",
+                        "code": 500
+                    }
+                }))
+                .into_response();
+            }
+        }
+    }
+
+    if is_codex_model(&model) {
+        let token = match get_codex_token().await {
+            Some(t) => t,
+            None => {
+                return Json(json!({
+                    "error": {
+                        "message": "No valid Codex credentials found. Please login with Codex first.",
+                        "type": "authentication_error",
+                        "code": 401
+                    }
+                }))
+                .into_response();
+            }
+        };
+
+        let client = CodexClient::new(token);
+        let codex_request = codex::openai_to_codex_request(&raw, &model, true);
+
+        if is_stream {
+            match client.stream_responses(&codex_request, true).await {
+                Ok(response) => {
+                    let stream = codex::codex_stream_to_openai_events(response, raw.clone());
+                    return Sse::new(stream).into_response();
+                }
+                Err(e) => {
+                    tracing::error!("Codex API error: {}", e);
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Codex API error: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            }
+        }
+
+        match client.stream_responses(&codex_request, true).await {
+            Ok(response) => match codex::collect_non_stream_response(response, &raw).await {
+                Ok(openai_response) => return Json(openai_response).into_response(),
+                Err(e) => {
+                    tracing::error!("Codex API error: {}", e);
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Codex API error: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            },
+            Err(e) => {
+                tracing::error!("Codex API error: {}", e);
+                return Json(json!({
+                    "error": {
+                        "message": format!("Codex API error: {}", e),
                         "type": "api_error",
                         "code": 500
                     }
