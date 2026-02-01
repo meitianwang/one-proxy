@@ -419,12 +419,21 @@ fn maybe_decompress_gzip(bytes: &[u8]) -> Vec<u8> {
 }
 
 #[derive(Default)]
+struct ToolCallAccumulator {
+    id: String,
+    name: String,
+    arguments: String,
+    started: bool,
+}
+
+#[derive(Default)]
 struct ClaudeStreamState {
     message_id: String,
     model: String,
     message_started: bool,
-    content_started: bool,
+    text_started: bool,
     finish_reason: Option<String>,
+    tool_calls: HashMap<i32, ToolCallAccumulator>,
 }
 
 fn map_openai_finish_reason(reason: Option<&str>) -> Option<&'static str> {
@@ -500,7 +509,7 @@ fn openai_chunk_to_claude_events(chunk: &str, state: &mut ClaudeStreamState) -> 
         if let Some(delta) = choice.get("delta") {
             if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
                 if !content.is_empty() {
-                    if !state.content_started {
+                    if !state.text_started {
                         let payload = json!({
                             "type": "content_block_start",
                             "index": 0,
@@ -510,7 +519,7 @@ fn openai_chunk_to_claude_events(chunk: &str, state: &mut ClaudeStreamState) -> 
                             }
                         });
                         events.push(build_claude_event("content_block_start", payload));
-                        state.content_started = true;
+                        state.text_started = true;
                     }
                     let payload = json!({
                         "type": "content_block_delta",
@@ -523,6 +532,60 @@ fn openai_chunk_to_claude_events(chunk: &str, state: &mut ClaudeStreamState) -> 
                     events.push(build_claude_event("content_block_delta", payload));
                 }
             }
+
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                for tool_call in tool_calls {
+                    let index = tool_call
+                        .get("index")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0) as i32;
+                    let entry = state.tool_calls.entry(index).or_default();
+
+                    if let Some(id) = tool_call.get("id").and_then(|v| v.as_str()) {
+                        if !id.is_empty() {
+                            entry.id = id.to_string();
+                        }
+                    }
+
+                    if let Some(function) = tool_call.get("function") {
+                        if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
+                            if !name.is_empty() {
+                                entry.name = name.to_string();
+                            }
+                        }
+
+                        if let Some(args) = function.get("arguments").and_then(|v| v.as_str()) {
+                            if !args.is_empty() {
+                                entry.arguments.push_str(args);
+                            }
+                        }
+                    }
+
+                    if !entry.started && !entry.name.is_empty() {
+                        if state.text_started {
+                            let stop_payload = json!({
+                                "type": "content_block_stop",
+                                "index": 0
+                            });
+                            events.push(build_claude_event("content_block_stop", stop_payload));
+                            state.text_started = false;
+                        }
+
+                        let payload = json!({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": entry.id,
+                                "name": entry.name,
+                                "input": {}
+                            }
+                        });
+                        events.push(build_claude_event("content_block_start", payload));
+                        entry.started = true;
+                    }
+                }
+            }
         }
     }
 
@@ -531,7 +594,7 @@ fn openai_chunk_to_claude_events(chunk: &str, state: &mut ClaudeStreamState) -> 
 
 fn finalize_claude_stream(state: &mut ClaudeStreamState) -> Vec<Event> {
     let mut events = Vec::new();
-    if state.content_started {
+    if state.text_started {
         events.push(build_claude_event(
             "content_block_stop",
             json!({
@@ -540,6 +603,33 @@ fn finalize_claude_stream(state: &mut ClaudeStreamState) -> Vec<Event> {
             }),
         ));
     }
+
+    let mut tool_indexes: Vec<i32> = state.tool_calls.keys().copied().collect();
+    tool_indexes.sort_unstable();
+    for index in tool_indexes {
+        if let Some(tool_call) = state.tool_calls.get(&index) {
+            let args = if tool_call.arguments.trim().is_empty() {
+                "{}".to_string()
+            } else {
+                tool_call.arguments.clone()
+            };
+            let input_delta = json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": args
+                }
+            });
+            events.push(build_claude_event("content_block_delta", input_delta));
+            let stop_payload = json!({
+                "type": "content_block_stop",
+                "index": index
+            });
+            events.push(build_claude_event("content_block_stop", stop_payload));
+        }
+    }
+
     let stop_reason = map_openai_finish_reason(state.finish_reason.as_deref());
     events.push(build_claude_event(
         "message_delta",

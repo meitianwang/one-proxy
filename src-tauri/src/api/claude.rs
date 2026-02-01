@@ -185,33 +185,187 @@ pub fn claude_to_openai_response(
     })
 }
 
-fn extract_claude_text(value: &Value) -> String {
-    match value {
+fn extract_claude_thinking_text(value: &Value) -> String {
+    value
+        .get("thinking")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("text").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string()
+}
+
+fn convert_claude_content_part(part: &Value) -> Option<Value> {
+    let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match part_type {
+        "text" => {
+            let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(json!({ "type": "text", "text": text }))
+            }
+        }
+        "image" => {
+            let mut image_url = String::new();
+            if let Some(source) = part.get("source") {
+                let source_type = source.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match source_type {
+                    "base64" => {
+                        let media_type = source
+                            .get("media_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("application/octet-stream");
+                        let data = source.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                        if !data.is_empty() {
+                            image_url = format!("data:{};base64,{}", media_type, data);
+                        }
+                    }
+                    "url" => {
+                        if let Some(url) = source.get("url").and_then(|v| v.as_str()) {
+                            image_url = url.to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if image_url.is_empty() {
+                if let Some(url) = part.get("url").and_then(|v| v.as_str()) {
+                    image_url = url.to_string();
+                }
+            }
+            if image_url.is_empty() {
+                None
+            } else {
+                Some(json!({ "type": "image_url", "image_url": { "url": image_url } }))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn convert_claude_tool_result_content_to_string(content: &Value) -> String {
+    match content {
+        Value::Null => String::new(),
         Value::String(s) => s.clone(),
         Value::Array(items) => {
             let mut parts = Vec::new();
             for item in items {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    if !text.is_empty() {
-                        parts.push(text.to_string());
+                match item {
+                    Value::String(s) => parts.push(s.clone()),
+                    Value::Object(obj) => {
+                        if let Some(Value::String(text)) = obj.get("text") {
+                            parts.push(text.clone());
+                        } else {
+                            parts.push(item.to_string());
+                        }
                     }
+                    _ => parts.push(item.to_string()),
                 }
             }
-            parts.join("\n")
+            let joined = parts.join("\n\n");
+            if joined.trim().is_empty() {
+                content.to_string()
+            } else {
+                joined
+            }
         }
-        _ => String::new(),
+        Value::Object(obj) => {
+            if let Some(Value::String(text)) = obj.get("text") {
+                text.clone()
+            } else {
+                content.to_string()
+            }
+        }
+        _ => content.to_string(),
+    }
+}
+
+fn convert_budget_to_level(budget: i64) -> Option<&'static str> {
+    match budget {
+        -1 => Some("auto"),
+        0 => Some("none"),
+        1..=512 => Some("minimal"),
+        513..=1024 => Some("low"),
+        1025..=8192 => Some("medium"),
+        8193..=24576 => Some("high"),
+        24577..=i64::MAX => Some("xhigh"),
+        _ => None,
     }
 }
 
 pub fn claude_request_to_openai_chat(raw: &Value, model: &str) -> Value {
-    let mut messages = Vec::new();
+    let mut out = json!({
+        "model": model,
+        "messages": []
+    });
+
+    if let Some(max_tokens) = raw.get("max_tokens") {
+        out["max_tokens"] = max_tokens.clone();
+    }
+    if let Some(temp) = raw.get("temperature") {
+        out["temperature"] = temp.clone();
+    } else if let Some(top_p) = raw.get("top_p") {
+        out["top_p"] = top_p.clone();
+    }
+    if let Some(stop_sequences) = raw.get("stop_sequences") {
+        if let Some(arr) = stop_sequences.as_array() {
+            let stops: Vec<Value> = arr.iter().cloned().collect();
+            if stops.len() == 1 {
+                out["stop"] = stops[0].clone();
+            } else if !stops.is_empty() {
+                out["stop"] = Value::Array(stops);
+            }
+        }
+    }
+    if let Some(stream) = raw.get("stream") {
+        out["stream"] = stream.clone();
+    }
+
+    if let Some(thinking) = raw.get("thinking").and_then(|v| v.as_object()) {
+        if let Some(Value::String(tt)) = thinking.get("type") {
+            match tt.as_str() {
+                "enabled" => {
+                    if let Some(budget) = thinking.get("budget_tokens").and_then(|v| v.as_i64()) {
+                        if let Some(level) = convert_budget_to_level(budget) {
+                            out["reasoning_effort"] = json!(level);
+                        }
+                    } else if let Some(level) = convert_budget_to_level(-1) {
+                        out["reasoning_effort"] = json!(level);
+                    }
+                }
+                "disabled" => {
+                    if let Some(level) = convert_budget_to_level(0) {
+                        out["reasoning_effort"] = json!(level);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut messages: Vec<Value> = Vec::new();
 
     if let Some(system) = raw.get("system") {
-        let system_text = extract_claude_text(system);
-        if !system_text.is_empty() {
+        let mut system_items = Vec::new();
+        match system {
+            Value::String(s) => {
+                if !s.trim().is_empty() {
+                    system_items.push(json!({ "type": "text", "text": s }));
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(part) = convert_claude_content_part(item) {
+                        system_items.push(part);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !system_items.is_empty() {
             messages.push(json!({
                 "role": "system",
-                "content": system_text
+                "content": system_items
             }));
         }
     }
@@ -220,39 +374,155 @@ pub fn claude_request_to_openai_chat(raw: &Value, model: &str) -> Value {
         for msg in msgs {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             let content = msg.get("content").unwrap_or(&Value::Null);
-            let text = extract_claude_text(content);
-            messages.push(json!({
-                "role": role,
-                "content": text
-            }));
+
+            if let Some(parts) = content.as_array() {
+                let mut content_items: Vec<Value> = Vec::new();
+                let mut reasoning_parts: Vec<String> = Vec::new();
+                let mut tool_calls: Vec<Value> = Vec::new();
+                let mut tool_results: Vec<Value> = Vec::new();
+
+                for part in parts {
+                    let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match part_type {
+                        "thinking" => {
+                            if role == "assistant" {
+                                let thinking_text = extract_claude_thinking_text(part);
+                                if !thinking_text.trim().is_empty() {
+                                    reasoning_parts.push(thinking_text);
+                                }
+                            }
+                        }
+                        "text" | "image" => {
+                            if let Some(item) = convert_claude_content_part(part) {
+                                content_items.push(item);
+                            }
+                        }
+                        "tool_use" => {
+                            if role == "assistant" {
+                                let id = part.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                let name = part.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                let input = part.get("input").cloned().unwrap_or_else(|| json!({}));
+                                let args = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                                tool_calls.push(json!({
+                                    "id": id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": args
+                                    }
+                                }));
+                            }
+                        }
+                        "tool_result" => {
+                            let tool_call_id = part.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
+                            let tool_content = part.get("content").unwrap_or(&Value::Null);
+                            let content_str = convert_claude_tool_result_content_to_string(tool_content);
+                            tool_results.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": content_str
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+
+                for tool_msg in tool_results {
+                    messages.push(tool_msg);
+                }
+
+                let has_content = !content_items.is_empty();
+                let has_reasoning = !reasoning_parts.is_empty();
+                let has_tool_calls = !tool_calls.is_empty();
+
+                if role == "assistant" {
+                    if has_content || has_reasoning || has_tool_calls {
+                        let mut msg_obj = serde_json::Map::new();
+                        msg_obj.insert("role".to_string(), json!("assistant"));
+                        if has_content {
+                            msg_obj.insert("content".to_string(), Value::Array(content_items));
+                        } else {
+                            msg_obj.insert("content".to_string(), json!(""));
+                        }
+                        if has_reasoning {
+                            msg_obj.insert(
+                                "reasoning_content".to_string(),
+                                json!(reasoning_parts.join("\n\n")),
+                            );
+                        }
+                        if has_tool_calls {
+                            msg_obj.insert("tool_calls".to_string(), Value::Array(tool_calls));
+                        }
+                        messages.push(Value::Object(msg_obj));
+                    }
+                } else if has_content {
+                    messages.push(json!({
+                        "role": role,
+                        "content": content_items
+                    }));
+                }
+            } else if let Some(text) = content.as_str() {
+                messages.push(json!({
+                    "role": role,
+                    "content": text
+                }));
+            }
         }
     }
 
-    let mut out = json!({
-        "model": model,
-        "messages": messages
-    });
+    if !messages.is_empty() {
+        out["messages"] = Value::Array(messages);
+    }
 
-    if let Some(v) = raw.get("stream") {
-        out["stream"] = v.clone();
+    if let Some(tools) = raw.get("tools").and_then(|v| v.as_array()) {
+        let mut tool_defs = Vec::new();
+        for tool in tools {
+            let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let description = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let mut tool_def = json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description
+                }
+            });
+            if let Some(input_schema) = tool.get("input_schema") {
+                tool_def["function"]["parameters"] = input_schema.clone();
+            }
+            tool_defs.push(tool_def);
+        }
+        if !tool_defs.is_empty() {
+            out["tools"] = Value::Array(tool_defs);
+        }
     }
-    if let Some(v) = raw.get("temperature") {
-        out["temperature"] = v.clone();
+
+    if let Some(tool_choice) = raw.get("tool_choice") {
+        match tool_choice.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "auto" => {
+                out["tool_choice"] = json!("auto");
+            }
+            "any" => {
+                out["tool_choice"] = json!("required");
+            }
+            "tool" => {
+                if let Some(name) = tool_choice.get("name").and_then(|v| v.as_str()) {
+                    out["tool_choice"] = json!({
+                        "type": "function",
+                        "function": { "name": name }
+                    });
+                }
+            }
+            _ => {
+                out["tool_choice"] = json!("auto");
+            }
+        }
     }
-    if let Some(v) = raw.get("max_tokens") {
-        out["max_tokens"] = v.clone();
-    }
-    if let Some(v) = raw.get("top_p") {
-        out["top_p"] = v.clone();
-    }
-    if let Some(v) = raw.get("top_k") {
-        out["top_k"] = v.clone();
-    }
-    if let Some(v) = raw.get("reasoning_effort") {
-        out["reasoning_effort"] = v.clone();
-    }
-    if let Some(v) = raw.get("stop") {
-        out["stop"] = v.clone();
+
+    if let Some(user) = raw.get("user") {
+        out["user"] = user.clone();
     }
 
     out
@@ -287,25 +557,75 @@ pub fn openai_to_claude_response(
         .unwrap_or_else(|| json!({}));
 
     let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
-    let content_text = message
-        .get("content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let mut content_blocks: Vec<Value> = Vec::new();
+    let mut has_tool_call = false;
 
-    let mut content_blocks = Vec::new();
-    if !content_text.is_empty() {
-        content_blocks.push(json!({
-            "type": "text",
-            "text": content_text
-        }));
+    if let Some(content) = message.get("content") {
+        match content {
+            Value::String(text) => {
+                if !text.is_empty() {
+                    content_blocks.push(json!({
+                        "type": "text",
+                        "text": text
+                    }));
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match item_type {
+                        "text" => {
+                            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                                if !text.is_empty() {
+                                    content_blocks.push(json!({ "type": "text", "text": text }));
+                                }
+                            }
+                        }
+                        "reasoning" => {
+                            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                                if !text.is_empty() {
+                                    content_blocks.push(json!({ "type": "thinking", "thinking": text }));
+                                }
+                            }
+                        }
+                        "tool_calls" => {
+                            if let Some(tool_calls) = item.get("tool_calls").and_then(|v| v.as_array()) {
+                                for tool_call in tool_calls {
+                                    if let Some(tool_use) = convert_openai_tool_call(tool_call) {
+                                        has_tool_call = true;
+                                        content_blocks.push(tool_use);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
-    let stop_reason = map_openai_finish_reason(
-        choice
-            .get("finish_reason")
-            .and_then(|v| v.as_str()),
-    );
+    if let Some(reasoning) = message.get("reasoning_content").and_then(|v| v.as_str()) {
+        if !reasoning.is_empty() {
+            content_blocks.push(json!({ "type": "thinking", "thinking": reasoning }));
+        }
+    }
+
+    if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
+        for tool_call in tool_calls {
+            if let Some(tool_use) = convert_openai_tool_call(tool_call) {
+                has_tool_call = true;
+                content_blocks.push(tool_use);
+            }
+        }
+    }
+
+    let finish_reason = choice.get("finish_reason").and_then(|v| v.as_str());
+    let mut stop_reason = map_openai_finish_reason(finish_reason);
+    if stop_reason.is_none() {
+        stop_reason = if has_tool_call { Some("tool_use") } else { Some("end_turn") };
+    }
 
     let (input_tokens, output_tokens) = openai_response
         .get("usage")
@@ -336,4 +656,35 @@ pub fn openai_to_claude_response(
             "output_tokens": output_tokens
         }
     })
+}
+
+fn convert_openai_tool_call(tool_call: &Value) -> Option<Value> {
+    let id = tool_call.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let name = tool_call
+        .get("function")
+        .and_then(|v| v.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let args = tool_call
+        .get("function")
+        .and_then(|v| v.get("arguments"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if id.is_empty() && name.is_empty() {
+        return None;
+    }
+
+    let input = if !args.is_empty() {
+        serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+
+    Some(json!({
+        "type": "tool_use",
+        "id": id,
+        "name": name,
+        "input": input
+    }))
 }
