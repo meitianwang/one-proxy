@@ -65,6 +65,10 @@ pub fn run() {
             commands::fetch_codex_quota,
             commands::fetch_gemini_quota,
             commands::fetch_kiro_quota,
+            commands::export_all_accounts,
+            commands::import_accounts,
+            commands::export_accounts_to_file,
+            commands::import_accounts_from_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

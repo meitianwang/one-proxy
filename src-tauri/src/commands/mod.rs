@@ -155,3 +155,23 @@ pub async fn fetch_gemini_quota(account_id: String) -> Result<crate::auth::provi
 pub async fn fetch_kiro_quota(account_id: String) -> Result<crate::auth::providers::kiro::KiroQuotaData, String> {
     crate::auth::fetch_kiro_quota(&account_id).await.map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub async fn export_all_accounts() -> Result<String, String> {
+    crate::auth::export_all_accounts().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn import_accounts(json_content: String) -> Result<i32, String> {
+    crate::auth::import_accounts(&json_content).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn export_accounts_to_file(file_path: String) -> Result<(), String> {
+    crate::auth::export_accounts_to_file(&file_path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn import_accounts_from_file(file_path: String) -> Result<i32, String> {
+    crate::auth::import_accounts_from_file(&file_path).map_err(|e| e.to_string())
+}

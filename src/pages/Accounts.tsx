@@ -214,6 +214,43 @@ export function Accounts() {
     refreshAllQuotas();
   }
 
+  async function handleExport() {
+    try {
+      // Use Tauri dialog to get save path
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const filePath = await save({
+        defaultPath: "accounts-export.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (filePath) {
+        // Call backend to export directly to file
+        await invoke("export_accounts_to_file", { filePath });
+        console.log("Exported accounts to:", filePath);
+      }
+    } catch (error) {
+      console.error("Failed to export accounts:", error);
+    }
+  }
+
+  async function handleImport() {
+    try {
+      const { open: openDialog } = await import("@tauri-apps/plugin-dialog");
+      const filePath = await openDialog({
+        filters: [{ name: "JSON", extensions: ["json"] }],
+        multiple: false,
+      });
+      if (filePath) {
+        // Call backend to import from file
+        const result = await invoke<number>("import_accounts_from_file", { filePath: filePath as string });
+        console.log("Imported accounts:", result);
+        await fetchAccounts();
+        refreshAllQuotas();
+      }
+    } catch (error) {
+      console.error("Failed to import accounts:", error);
+    }
+  }
+
   async function startLogin(provider: string) {
     try {
       console.log("Starting OAuth login for provider:", provider);
@@ -584,6 +621,28 @@ export function Accounts() {
             >
               <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+            </button>
+
+            {/* Export */}
+            <button
+              onClick={handleExport}
+              className="p-2 rounded-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
+              title="导出所有账号"
+            >
+              <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+              </svg>
+            </button>
+
+            {/* Import */}
+            <button
+              onClick={handleImport}
+              className="p-2 rounded-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
+              title="导入账号"
+            >
+              <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
               </svg>
             </button>
 

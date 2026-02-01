@@ -537,3 +537,95 @@ pub async fn fetch_gemini_quota(account_id: &str) -> Result<providers::google::G
 pub async fn fetch_kiro_quota(account_id: &str) -> Result<providers::kiro::KiroQuotaData> {
     providers::kiro::fetch_quota(account_id).await
 }
+
+/// Export all accounts to a single JSON string
+pub fn export_all_accounts() -> Result<String> {
+    let auth_dir = crate::config::resolve_auth_dir();
+
+    if !auth_dir.exists() {
+        return Ok("[]".to_string());
+    }
+
+    let mut accounts: Vec<serde_json::Value> = Vec::new();
+
+    for entry in std::fs::read_dir(&auth_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.extension().map_or(false, |ext| ext == "json") {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    match serde_json::from_str::<serde_json::Value>(&content) {
+                        Ok(json) => {
+                            accounts.push(json);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse {:?}: {}", path, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to read {:?}: {}", path, e);
+                }
+            }
+        }
+    }
+
+    serde_json::to_string_pretty(&accounts).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+}
+
+/// Import accounts from a JSON string containing an array of account objects
+pub fn import_accounts(json_content: &str) -> Result<i32> {
+    let accounts: Vec<serde_json::Value> = serde_json::from_str(json_content)
+        .map_err(|e| anyhow::anyhow!("Failed to parse JSON: {}", e))?;
+
+    let auth_dir = crate::config::resolve_auth_dir();
+    std::fs::create_dir_all(&auth_dir)?;
+
+    let mut imported = 0;
+
+    for account in accounts {
+        // Determine filename based on provider and email/id
+        let provider = account.get("provider")
+            .or_else(|| account.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        let email = account.get("email")
+            .and_then(|v| v.as_str())
+            .map(|s| s.replace(['@', '.'], "_"));
+
+        let filename = if let Some(email) = email {
+            format!("{}_{}.json", provider, email)
+        } else {
+            // Generate a unique filename
+            let id = uuid::Uuid::new_v4().to_string().replace("-", "")[..8].to_string();
+            format!("{}_{}.json", provider, id)
+        };
+
+        let path = auth_dir.join(&filename);
+
+        // Write the account file
+        let content = serde_json::to_string_pretty(&account)?;
+        std::fs::write(&path, content)?;
+
+        tracing::info!("Imported account to {:?}", path);
+        imported += 1;
+    }
+
+    Ok(imported)
+}
+
+/// Export all accounts directly to a file
+pub fn export_accounts_to_file(file_path: &str) -> Result<()> {
+    let content = export_all_accounts()?;
+    std::fs::write(file_path, content)?;
+    tracing::info!("Exported accounts to {}", file_path);
+    Ok(())
+}
+
+/// Import accounts from a file
+pub fn import_accounts_from_file(file_path: &str) -> Result<i32> {
+    let content = std::fs::read_to_string(file_path)?;
+    import_accounts(&content)
+}
