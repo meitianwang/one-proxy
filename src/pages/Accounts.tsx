@@ -11,6 +11,20 @@ interface AuthAccount {
   prefix: string | null;
 }
 
+interface ModelQuota {
+  name: string;
+  percentage: number;
+  reset_time: string;
+}
+
+interface QuotaData {
+  models: ModelQuota[];
+  last_updated: number;
+  is_forbidden: boolean;
+  subscription_tier: string | null;
+  project_id: string | null;
+}
+
 const PROVIDERS = [
   { id: "google", name: "Gemini CLI", label: "Gemini", color: "bg-blue-100 text-blue-700" },
   { id: "openai", name: "Codex", label: "Codex", color: "bg-green-100 text-green-700" },
@@ -38,6 +52,8 @@ export function Accounts() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [showAddMenu, setShowAddMenu] = useState(false);
   const [viewMode, setViewMode] = useState<"list" | "card">("list");
+  const [quotaData, setQuotaData] = useState<Record<string, QuotaData>>({});
+  const [quotaLoading, setQuotaLoading] = useState<Record<string, boolean>>({});
   const addMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -67,6 +83,16 @@ export function Accounts() {
     };
   }, [loginInProgress]);
 
+  // Auto-fetch quota for Antigravity accounts when accounts change
+  useEffect(() => {
+    const antigravityAccounts = accounts.filter(a => a.provider === "antigravity");
+    for (const account of antigravityAccounts) {
+      if (!quotaData[account.id] && !quotaLoading[account.id]) {
+        fetchQuota(account.id);
+      }
+    }
+  }, [accounts]);
+
   async function fetchAccounts() {
     try {
       setLoading(true);
@@ -85,6 +111,18 @@ export function Accounts() {
     } finally {
       setLoading(false);
     }
+  }
+
+  async function refreshAllQuotas() {
+    const antigravityAccounts = accounts.filter(a => a.provider === "antigravity");
+    for (const account of antigravityAccounts) {
+      fetchQuota(account.id);
+    }
+  }
+
+  async function handleRefresh() {
+    await fetchAccounts();
+    refreshAllQuotas();
   }
 
   async function startLogin(provider: string) {
@@ -219,6 +257,69 @@ export function Accounts() {
     }
   }
 
+  async function fetchQuota(accountId: string) {
+    if (quotaLoading[accountId]) return;
+    setQuotaLoading((prev) => ({ ...prev, [accountId]: true }));
+    try {
+      const result = await invoke<QuotaData>("fetch_antigravity_quota", { accountId });
+      setQuotaData((prev) => ({ ...prev, [accountId]: result }));
+    } catch (error) {
+      console.error("Failed to fetch quota:", error);
+    } finally {
+      setQuotaLoading((prev) => ({ ...prev, [accountId]: false }));
+    }
+  }
+
+  function getQuotaColor(percentage: number): string {
+    if (percentage >= 50) return "bg-emerald-500";
+    if (percentage >= 20) return "bg-amber-500";
+    return "bg-red-500";
+  }
+
+  function getQuotaTextColor(percentage: number): string {
+    if (percentage >= 50) return "text-emerald-600 dark:text-emerald-400";
+    if (percentage >= 20) return "text-amber-600 dark:text-amber-400";
+    return "text-red-600 dark:text-red-400";
+  }
+
+  function formatResetTime(resetTime: string): string {
+    if (!resetTime) return "";
+    try {
+      const date = new Date(resetTime);
+      const now = new Date();
+      const diffMs = date.getTime() - now.getTime();
+      if (diffMs <= 0) return "已重置";
+      const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+      const diffMins = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+      if (diffHours > 0) return `${diffHours}h ${diffMins}m`;
+      return `${diffMins}m`;
+    } catch {
+      return "";
+    }
+  }
+
+  function getModelDisplayName(name: string): string {
+    if (name === "gemini-3-pro-high") return "G3 Pro";
+    if (name === "gemini-3-flash") return "G3 Flash";
+    if (name === "gemini-3-pro-image") return "G3 Image";
+    if (name === "claude-sonnet-4-5-thinking") return "Claude";
+    return name.split("/").pop() || name;
+  }
+
+  // Get the 4 key models for display
+  function getKeyModels(models: ModelQuota[]): ModelQuota[] {
+    const keyModelNames = [
+      "gemini-3-pro-high",
+      "gemini-3-flash",
+      "gemini-3-pro-image",
+      "claude-sonnet-4-5-thinking"
+    ];
+
+    return keyModelNames
+      .map(name => models.find(m => m.name === name))
+      .filter((m): m is ModelQuota => m !== undefined);
+  }
+
   async function handleBatchEnable() {
     if (selectedIds.size === 0) return;
     try {
@@ -320,8 +421,9 @@ export function Accounts() {
 
             {/* Refresh */}
             <button
-              onClick={fetchAccounts}
+              onClick={handleRefresh}
               className="p-2 rounded-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
+              title="刷新账号和额度"
             >
               <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
@@ -490,6 +592,9 @@ export function Accounts() {
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {filteredAccounts.map((account) => {
                   const providerInfo = getProviderInfo(account.provider);
+                  const isAntigravity = account.provider === "antigravity";
+                  const quota = quotaData[account.id];
+                  const isLoadingQuota = quotaLoading[account.id];
                   return (
                     <div
                       key={account.id}
@@ -513,9 +618,22 @@ export function Accounts() {
                             </span>
                           </div>
                         </div>
-                        <span className={`inline-block px-2 py-1 text-xs rounded border ${providerInfo.color}`}>
-                          {providerInfo.label}
-                        </span>
+                        <div className="flex items-center gap-2">
+                          {isAntigravity && quota?.subscription_tier && (
+                            <span className={`inline-block px-2 py-1 text-xs rounded font-medium ${
+                              quota.subscription_tier.toLowerCase().includes("pro")
+                                ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400"
+                                : quota.subscription_tier.toLowerCase().includes("ultra")
+                                ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
+                                : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
+                            }`}>
+                              {quota.subscription_tier.toUpperCase()}
+                            </span>
+                          )}
+                          <span className={`inline-block px-2 py-1 text-xs rounded border ${providerInfo.color}`}>
+                            {providerInfo.label}
+                          </span>
+                        </div>
                       </div>
                       <div className="mt-3 ml-7">
                         <p className="text-sm font-medium text-gray-800 dark:text-white truncate">
@@ -525,6 +643,57 @@ export function Accounts() {
                           {account.provider} 账号
                         </p>
                       </div>
+
+                      {/* Quota Display for Antigravity */}
+                      {isAntigravity && (
+                        <div className="mt-3 ml-7">
+                          {isLoadingQuota && (
+                            <p className="text-xs text-gray-500 dark:text-gray-400">加载额度中...</p>
+                          )}
+                          {quota && !isLoadingQuota && (
+                            <div className="space-y-2">
+                              {quota.is_forbidden ? (
+                                <p className="text-xs text-red-500">账号已被禁用 (403)</p>
+                              ) : (
+                                <div className="grid grid-cols-2 gap-2">
+                                  {getKeyModels(quota.models).map((model) => (
+                                    <div key={model.name} className="bg-gray-50 dark:bg-gray-700/50 rounded p-2">
+                                      <div className="flex items-center justify-between mb-1">
+                                        <span className="text-xs font-medium text-gray-700 dark:text-gray-300 truncate">
+                                          {getModelDisplayName(model.name)}
+                                        </span>
+                                        <span className={`text-xs font-bold ${getQuotaTextColor(model.percentage)}`}>
+                                          {model.percentage}%
+                                        </span>
+                                      </div>
+                                      <div className="w-full h-1.5 bg-gray-200 dark:bg-gray-600 rounded-full overflow-hidden">
+                                        <div
+                                          className={`h-full ${getQuotaColor(model.percentage)} transition-all`}
+                                          style={{ width: `${model.percentage}%` }}
+                                        />
+                                      </div>
+                                      {model.reset_time && (
+                                        <div className="flex items-center gap-1 mt-1">
+                                          <svg className="w-3 h-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                          </svg>
+                                          <span className="text-xs text-gray-500 dark:text-gray-400">
+                                            {formatResetTime(model.reset_time)}
+                                          </span>
+                                        </div>
+                                      )}
+                                    </div>
+                                  ))}
+                                  {getKeyModels(quota.models).length === 0 && (
+                                    <p className="col-span-2 text-xs text-gray-500 dark:text-gray-400">无可用模型</p>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
                       <div className="mt-4 ml-7 flex items-center justify-between">
                         <span className={`inline-block px-2 py-1 text-xs rounded ${
                           account.enabled
@@ -534,6 +703,18 @@ export function Accounts() {
                           {account.enabled ? "正常" : "禁用"}
                         </span>
                         <div className="flex items-center gap-2">
+                          {isAntigravity && (
+                            <button
+                              onClick={() => fetchQuota(account.id)}
+                              disabled={isLoadingQuota}
+                              className={`p-1 rounded ${isLoadingQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                              title="刷新额度"
+                            >
+                              <svg className={`w-4 h-4 ${isLoadingQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                              </svg>
+                            </button>
+                          )}
                           <button
                             onClick={() => handleToggleEnabled(account.id, !account.enabled)}
                             className={`text-sm ${

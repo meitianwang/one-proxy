@@ -328,3 +328,73 @@ pub fn set_account_enabled(account_id: &str, enabled: bool) -> Result<()> {
     tracing::info!("Set account {} enabled={}", account_id, enabled);
     Ok(())
 }
+
+/// Fetch quota for an Antigravity account
+pub async fn fetch_antigravity_quota(account_id: &str) -> Result<providers::antigravity::QuotaData> {
+    let auth_dir = crate::config::resolve_auth_dir();
+    let path = auth_dir.join(format!("{}.json", account_id));
+
+    if !path.exists() {
+        return Err(anyhow::anyhow!("Account file not found: {}", account_id));
+    }
+
+    let content = std::fs::read_to_string(&path)?;
+    let json: serde_json::Value = serde_json::from_str(&content)?;
+
+    // Check if it's an antigravity account
+    let provider = json.get("type")
+        .or_else(|| json.get("provider"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if provider != "antigravity" {
+        return Err(anyhow::anyhow!("Not an antigravity account"));
+    }
+
+    // Get access token - try to refresh if needed
+    // Check both root level and nested in token object
+    let refresh_token = json.get("refresh_token")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            json.get("token")
+                .and_then(|t| t.get("refresh_token"))
+                .and_then(|v| v.as_str())
+        })
+        .ok_or_else(|| anyhow::anyhow!("No refresh token found"))?;
+
+    // Refresh the token to get a fresh access token
+    let token_resp = providers::antigravity::refresh_token(refresh_token).await?;
+    let access_token = token_resp.access_token;
+
+    // Get cached project_id if available
+    let cached_project_id = json.get("project_id")
+        .and_then(|v| v.as_str());
+
+    // Fetch quota
+    let quota = providers::antigravity::fetch_quota(&access_token, cached_project_id).await?;
+
+    // Update the auth file with new token and quota info
+    let mut updated_json = json.clone();
+    updated_json["access_token"] = serde_json::json!(access_token);
+    if let Some(new_refresh) = token_resp.refresh_token {
+        updated_json["refresh_token"] = serde_json::json!(new_refresh);
+    }
+    if let Some(expires_in) = token_resp.expires_in {
+        updated_json["expires_in"] = serde_json::json!(expires_in);
+        let expired = chrono::Utc::now() + chrono::Duration::seconds(expires_in as i64);
+        updated_json["expired"] = serde_json::json!(expired.to_rfc3339());
+    }
+    if let Some(ref pid) = quota.project_id {
+        updated_json["project_id"] = serde_json::json!(pid);
+    }
+    if let Some(ref tier) = quota.subscription_tier {
+        updated_json["subscription_tier"] = serde_json::json!(tier);
+    }
+    updated_json["quota_last_updated"] = serde_json::json!(quota.last_updated);
+    updated_json["quota_is_forbidden"] = serde_json::json!(quota.is_forbidden);
+
+    let updated_content = serde_json::to_string_pretty(&updated_json)?;
+    std::fs::write(&path, updated_content)?;
+
+    Ok(quota)
+}

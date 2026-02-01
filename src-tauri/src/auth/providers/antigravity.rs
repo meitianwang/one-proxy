@@ -349,3 +349,175 @@ fn cleanup_old_sessions() {
 pub fn get_pending_session(state: &str) -> Option<OAuthSession> {
     PENDING_SESSIONS.lock().get(state).cloned()
 }
+
+// Quota API
+const QUOTA_API_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels";
+const LOAD_CODE_ASSIST_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist";
+const QUOTA_USER_AGENT: &str = "antigravity/1.0.0 macos/aarch64";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelQuota {
+    pub name: String,
+    pub percentage: i32,
+    pub reset_time: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaData {
+    pub models: Vec<ModelQuota>,
+    pub last_updated: i64,
+    #[serde(default)]
+    pub is_forbidden: bool,
+    #[serde(default)]
+    pub subscription_tier: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuotaResponse {
+    models: Option<HashMap<String, QuotaModelInfo>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuotaModelInfo {
+    #[serde(rename = "quotaInfo")]
+    quota_info: Option<QuotaInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuotaInfo {
+    #[serde(rename = "remainingFraction")]
+    remaining_fraction: Option<f64>,
+    #[serde(rename = "resetTime")]
+    reset_time: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoadCodeAssistResponse {
+    #[serde(rename = "cloudaicompanionProject")]
+    project_id: Option<String>,
+    #[serde(rename = "currentTier")]
+    current_tier: Option<TierInfo>,
+    #[serde(rename = "paidTier")]
+    paid_tier: Option<TierInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TierInfo {
+    id: Option<String>,
+}
+
+/// Fetch project ID and subscription tier
+pub async fn fetch_project_and_tier(access_token: &str) -> Result<(Option<String>, Option<String>)> {
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "metadata": {
+            "ideType": "ANTIGRAVITY"
+        }
+    });
+
+    let response = client
+        .post(LOAD_CODE_ASSIST_URL)
+        .bearer_auth(access_token)
+        .header("Content-Type", "application/json")
+        .header("User-Agent", QUOTA_USER_AGENT)
+        .json(&body)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        tracing::warn!("loadCodeAssist failed: {} {}", status, text);
+        return Ok((None, None));
+    }
+
+    let load_resp: LoadCodeAssistResponse = response.json().await?;
+
+    let project_id = load_resp.project_id;
+
+    // Priority: paid_tier > current_tier
+    let subscription_tier = load_resp.paid_tier
+        .and_then(|t| t.id)
+        .or_else(|| load_resp.current_tier.and_then(|t| t.id));
+
+    Ok((project_id, subscription_tier))
+}
+
+/// Fetch quota for an Antigravity account
+pub async fn fetch_quota(access_token: &str, cached_project_id: Option<&str>) -> Result<QuotaData> {
+    let (project_id, subscription_tier) = if let Some(pid) = cached_project_id {
+        (Some(pid.to_string()), None)
+    } else {
+        fetch_project_and_tier(access_token).await?
+    };
+
+    let final_project_id = project_id.clone().unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
+
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "project": final_project_id
+    });
+
+    let response = client
+        .post(QUOTA_API_URL)
+        .bearer_auth(access_token)
+        .header("Content-Type", "application/json")
+        .header("User-Agent", QUOTA_USER_AGENT)
+        .json(&body)
+        .send()
+        .await?;
+
+    // Handle 403 Forbidden
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        tracing::warn!("Antigravity account forbidden (403)");
+        return Ok(QuotaData {
+            models: vec![],
+            last_updated: chrono::Utc::now().timestamp(),
+            is_forbidden: true,
+            subscription_tier,
+            project_id,
+        });
+    }
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("fetchQuota failed: {} {}", status, text));
+    }
+
+    let quota_resp: QuotaResponse = response.json().await?;
+
+    let mut models = Vec::new();
+    if let Some(model_map) = quota_resp.models {
+        for (name, info) in model_map {
+            // Only keep gemini and claude models
+            if !name.contains("gemini") && !name.contains("claude") {
+                continue;
+            }
+
+            if let Some(quota_info) = info.quota_info {
+                let percentage = quota_info.remaining_fraction
+                    .map(|f| (f * 100.0) as i32)
+                    .unwrap_or(0);
+
+                let reset_time = quota_info.reset_time.unwrap_or_default();
+
+                models.push(ModelQuota {
+                    name,
+                    percentage,
+                    reset_time,
+                });
+            }
+        }
+    }
+
+    Ok(QuotaData {
+        models,
+        last_updated: chrono::Utc::now().timestamp(),
+        is_forbidden: false,
+        subscription_tier,
+        project_id,
+    })
+}
