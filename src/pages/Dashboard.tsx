@@ -132,35 +132,6 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
         </div>
       </div>
 
-      {/* Provider Stats */}
-      {authSummary && Object.keys(authSummary.by_provider).length > 0 && (
-        <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-6">
-          <h3 className="text-lg font-semibold text-gray-800 dark:text-white mb-4">
-            账户分布
-          </h3>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            {Object.entries(authSummary.by_provider).map(([provider, count]) => (
-              <div key={provider} className="text-center p-3 bg-gray-50 dark:bg-gray-700 rounded-lg">
-                <p className="text-2xl font-bold text-gray-800 dark:text-white">{count}</p>
-                <p className="text-sm text-gray-500 dark:text-gray-400 capitalize">{provider}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Usage Instructions */}
-      <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-6">
-        <h3 className="text-lg font-semibold text-gray-800 dark:text-white mb-4">
-          快速开始
-        </h3>
-        <div className="space-y-3 text-sm text-gray-600 dark:text-gray-300">
-          <p>1. 在「账户管理」页面添加 OAuth 账户（Google/Claude/Codex）</p>
-          <p>2. 点击「启动服务」按钮启动代理服务器</p>
-          <p>3. 在你的 AI 工具中配置 API 端点为上述地址</p>
-          <p>4. 开始使用！</p>
-        </div>
-      </div>
     </div>
   );
 }
