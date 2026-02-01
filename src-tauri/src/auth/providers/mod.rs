@@ -6,3 +6,4 @@ pub mod openai;
 pub mod qwen;
 pub mod iflow;
 pub mod antigravity;
+pub mod kiro;

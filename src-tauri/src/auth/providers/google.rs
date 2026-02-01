@@ -487,3 +487,86 @@ pub async fn exchange_code(code: &str, state: &str) -> Result<TokenResponse> {
     }
     exchange_code_internal(code).await
 }
+
+// Gemini Quota API
+const GEMINI_QUOTA_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiQuotaData {
+    pub models: Vec<GeminiModelQuota>,
+    pub last_updated: i64,
+    #[serde(default)]
+    pub is_error: bool,
+    #[serde(default)]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiModelQuota {
+    pub model_id: String,
+    pub remaining_fraction: f64,
+    pub reset_time: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiQuotaResponse {
+    buckets: Option<Vec<BucketInfo>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BucketInfo {
+    remaining_fraction: Option<f64>,
+    reset_time: Option<String>,
+    model_id: Option<String>,
+    token_type: Option<String>,
+}
+
+/// Fetch Gemini quota data
+pub async fn fetch_gemini_quota(access_token: &str, project_id: Option<&str>) -> Result<GeminiQuotaData> {
+    let client = reqwest::Client::new();
+
+    let body = serde_json::json!({
+        "project": project_id.unwrap_or("")
+    });
+
+    let response = client
+        .post(GEMINI_QUOTA_URL)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        tracing::warn!("Gemini quota fetch failed: {} {}", status, text);
+        return Ok(GeminiQuotaData {
+            models: vec![],
+            last_updated: chrono::Utc::now().timestamp(),
+            is_error: true,
+            error_message: Some(format!("API Error: {} {}", status, text)),
+        });
+    }
+
+    let data: GeminiQuotaResponse = response.json().await?;
+
+    let models = data.buckets
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|b| b.token_type.as_deref() == Some("REQUESTS"))
+        .map(|b| GeminiModelQuota {
+            model_id: b.model_id.unwrap_or_default(),
+            remaining_fraction: b.remaining_fraction.unwrap_or(0.0),
+            reset_time: b.reset_time,
+        })
+        .collect();
+
+    Ok(GeminiQuotaData {
+        models,
+        last_updated: chrono::Utc::now().timestamp(),
+        is_error: false,
+        error_message: None,
+    })
+}

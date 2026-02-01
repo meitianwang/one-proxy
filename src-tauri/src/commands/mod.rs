@@ -97,6 +97,7 @@ pub enum OAuthProvider {
     Qwen,
     IFlow,
     Antigravity,
+    Kiro,
 }
 
 #[tauri::command]
@@ -111,6 +112,7 @@ pub async fn start_oauth_login(
         "qwen" => OAuthProvider::Qwen,
         "iflow" => OAuthProvider::IFlow,
         "antigravity" => OAuthProvider::Antigravity,
+        "kiro" => OAuthProvider::Kiro,
         _ => return Err(format!("Unknown provider: {}", provider)),
     };
 
@@ -142,4 +144,9 @@ pub async fn fetch_antigravity_quota(account_id: String) -> Result<crate::auth::
 #[tauri::command]
 pub async fn fetch_codex_quota(account_id: String) -> Result<crate::auth::providers::openai::CodexQuotaData, String> {
     crate::auth::fetch_codex_quota(&account_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn fetch_gemini_quota(account_id: String) -> Result<crate::auth::providers::google::GeminiQuotaData, String> {
+    crate::auth::fetch_gemini_quota(&account_id).await.map_err(|e| e.to_string())
 }

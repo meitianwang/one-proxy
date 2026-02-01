@@ -39,10 +39,24 @@ interface CodexQuotaData {
   error_message: string | null;
 }
 
+interface GeminiModelQuota {
+  model_id: string;
+  remaining_fraction: number;
+  reset_time: string | null;
+}
+
+interface GeminiQuotaData {
+  models: GeminiModelQuota[];
+  last_updated: number;
+  is_error: boolean;
+  error_message: string | null;
+}
+
 const PROVIDERS = [
   { id: "google", name: "Gemini CLI", label: "Gemini", color: "bg-blue-100 text-blue-700" },
   { id: "openai", name: "Codex", label: "Codex", color: "bg-green-100 text-green-700" },
   { id: "antigravity", name: "Antigravity", label: "Antigravity", color: "bg-gray-100 text-gray-700" },
+  { id: "kiro", name: "Kiro", label: "Kiro", color: "bg-orange-100 text-orange-700" },
 ];
 
 // Map provider names from auth files to display info
@@ -70,6 +84,8 @@ export function Accounts() {
   const [quotaLoading, setQuotaLoading] = useState<Record<string, boolean>>({});
   const [codexQuotaData, setCodexQuotaData] = useState<Record<string, CodexQuotaData>>({});
   const [codexQuotaLoading, setCodexQuotaLoading] = useState<Record<string, boolean>>({});
+  const [geminiQuotaData, setGeminiQuotaData] = useState<Record<string, GeminiQuotaData>>({});
+  const [geminiQuotaLoading, setGeminiQuotaLoading] = useState<Record<string, boolean>>({});
   const addMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -119,6 +135,16 @@ export function Accounts() {
     }
   }, [accounts]);
 
+  // Auto-fetch quota for Gemini accounts when accounts change
+  useEffect(() => {
+    const geminiAccounts = accounts.filter(a => a.provider === "gemini" || a.provider === "google");
+    for (const account of geminiAccounts) {
+      if (!geminiQuotaData[account.id] && !geminiQuotaLoading[account.id]) {
+        fetchGeminiQuota(account.id);
+      }
+    }
+  }, [accounts]);
+
   async function fetchAccounts() {
     try {
       setLoading(true);
@@ -144,9 +170,13 @@ export function Accounts() {
     for (const account of antigravityAccounts) {
       fetchQuota(account.id);
     }
-    const codexAccounts = accounts.filter(a => a.provider === "openai");
+    const codexAccounts = accounts.filter(a => a.provider === "openai" || a.provider === "codex");
     for (const account of codexAccounts) {
       fetchCodexQuota(account.id);
+    }
+    const geminiAccounts = accounts.filter(a => a.provider === "gemini" || a.provider === "google");
+    for (const account of geminiAccounts) {
+      fetchGeminiQuota(account.id);
     }
   }
 
@@ -313,6 +343,19 @@ export function Accounts() {
     }
   }
 
+  async function fetchGeminiQuota(accountId: string) {
+    if (geminiQuotaLoading[accountId]) return;
+    setGeminiQuotaLoading((prev) => ({ ...prev, [accountId]: true }));
+    try {
+      const result = await invoke<GeminiQuotaData>("fetch_gemini_quota", { accountId });
+      setGeminiQuotaData((prev) => ({ ...prev, [accountId]: result }));
+    } catch (error) {
+      console.error("Failed to fetch gemini quota:", error);
+    } finally {
+      setGeminiQuotaLoading((prev) => ({ ...prev, [accountId]: false }));
+    }
+  }
+
   function getQuotaColor(percentage: number): string {
     if (percentage >= 50) return "bg-emerald-500";
     if (percentage >= 20) return "bg-amber-500";
@@ -354,7 +397,28 @@ export function Accounts() {
     if (name === "gemini-3-flash") return "G3 Flash";
     if (name === "gemini-3-pro-image") return "G3 Image";
     if (name === "claude-sonnet-4-5-thinking") return "Claude";
+    // Gemini CLI models
+    if (name === "gemini-2.5-pro") return "2.5 Pro";
+    if (name === "gemini-2.5-flash") return "2.5 Flash";
+    if (name === "gemini-2.5-flash-lite") return "2.5 Lite";
+    if (name === "gemini-3-pro-preview") return "3 Pro";
+    if (name === "gemini-3-flash-preview") return "3 Flash";
+    if (name === "gemini-2.0-flash") return "2.0 Flash";
     return name.split("/").pop() || name;
+  }
+
+  // Get key Gemini models for display
+  function getKeyGeminiModels(models: GeminiModelQuota[]): GeminiModelQuota[] {
+    const keyModelNames = [
+      "gemini-2.5-pro",
+      "gemini-2.5-flash",
+      "gemini-3-pro-preview",
+      "gemini-3-flash-preview"
+    ];
+
+    return keyModelNames
+      .map(name => models.find(m => m.model_id === name))
+      .filter((m): m is GeminiModelQuota => m !== undefined);
   }
 
   // Get the 4 key models for display
@@ -570,10 +634,13 @@ export function Accounts() {
                     const providerInfo = getProviderInfo(account.provider);
                     const isAntigravity = account.provider === "antigravity";
                     const isCodex = account.provider === "openai" || account.provider === "codex";
+                    const isGemini = account.provider === "gemini" || account.provider === "google";
                     const quota = quotaData[account.id];
                     const isLoadingQuota = quotaLoading[account.id];
                     const codexQuota = codexQuotaData[account.id];
                     const isLoadingCodexQuota = codexQuotaLoading[account.id];
+                    const geminiQuota = geminiQuotaData[account.id];
+                    const isLoadingGeminiQuota = geminiQuotaLoading[account.id];
                     return (
                       <tr key={account.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                         <td className="px-3 py-3">
@@ -682,6 +749,33 @@ export function Accounts() {
                             ) : (
                               <span className="text-xs text-gray-400">-</span>
                             )
+                          ) : isGemini ? (
+                            isLoadingGeminiQuota ? (
+                              <span className="text-xs text-gray-400">加载中...</span>
+                            ) : geminiQuota?.is_error ? (
+                              <span className="text-xs text-red-500">{geminiQuota.error_message || "错误"}</span>
+                            ) : geminiQuota ? (
+                              <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                                {getKeyGeminiModels(geminiQuota.models).map((model) => (
+                                  <div key={model.model_id} className="flex items-center gap-1 text-xs whitespace-nowrap">
+                                    <span className="text-gray-600 dark:text-gray-400 font-medium w-16">{getModelDisplayName(model.model_id)}</span>
+                                    {model.reset_time && (
+                                      <span className="text-gray-400 flex items-center gap-0.5">
+                                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                        </svg>
+                                        {formatResetTime(model.reset_time)}
+                                      </span>
+                                    )}
+                                    <span className={`font-bold ${getQuotaTextColor(Math.round(model.remaining_fraction * 100))}`}>
+                                      {Math.round(model.remaining_fraction * 100)}%
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <span className="text-xs text-gray-400">-</span>
+                            )
                           ) : (
                             <span className="text-xs text-gray-400">-</span>
                           )}
@@ -717,6 +811,18 @@ export function Accounts() {
                                 title="刷新额度"
                               >
                                 <svg className={`w-4 h-4 ${isLoadingCodexQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                </svg>
+                              </button>
+                            )}
+                            {isGemini && (
+                              <button
+                                onClick={() => fetchGeminiQuota(account.id)}
+                                disabled={isLoadingGeminiQuota}
+                                className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingGeminiQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                                title="刷新额度"
+                              >
+                                <svg className={`w-4 h-4 ${isLoadingGeminiQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                                 </svg>
                               </button>
@@ -774,11 +880,14 @@ export function Accounts() {
                 {filteredAccounts.map((account) => {
                   const providerInfo = getProviderInfo(account.provider);
                   const isAntigravity = account.provider === "antigravity";
-                  const isCodex = account.provider === "openai";
+                  const isCodex = account.provider === "openai" || account.provider === "codex";
+                  const isGemini = account.provider === "gemini" || account.provider === "google";
                   const quota = quotaData[account.id];
                   const isLoadingQuota = quotaLoading[account.id];
                   const codexQuota = codexQuotaData[account.id];
                   const isLoadingCodexQuota = codexQuotaLoading[account.id];
+                  const geminiQuota = geminiQuotaData[account.id];
+                  const isLoadingGeminiQuota = geminiQuotaLoading[account.id];
                   return (
                     <div
                       key={account.id}
@@ -947,6 +1056,53 @@ export function Accounts() {
                         </div>
                       )}
 
+                      {/* Quota Display for Gemini */}
+                      {isGemini && (
+                        <div className="mt-3 min-h-[80px]">
+                          {isLoadingGeminiQuota && (
+                            <p className="text-xs text-gray-500 dark:text-gray-400">加载额度中...</p>
+                          )}
+                          {geminiQuota && !isLoadingGeminiQuota && (
+                            <div className="space-y-2">
+                              {geminiQuota.is_error ? (
+                                <p className="text-xs text-red-500">{geminiQuota.error_message || "获取额度失败"}</p>
+                              ) : (
+                                <div className="grid grid-cols-2 gap-2">
+                                  {getKeyGeminiModels(geminiQuota.models).map((model) => (
+                                    <div key={model.model_id} className="bg-gray-50 dark:bg-gray-700/50 rounded p-2">
+                                      <div className="flex items-center justify-between mb-1">
+                                        <span className="text-xs font-medium text-gray-700 dark:text-gray-300 truncate">
+                                          {getModelDisplayName(model.model_id)}
+                                        </span>
+                                        <span className={`text-xs font-bold ${getQuotaTextColor(Math.round(model.remaining_fraction * 100))}`}>
+                                          {Math.round(model.remaining_fraction * 100)}%
+                                        </span>
+                                      </div>
+                                      <div className="w-full h-1.5 bg-gray-200 dark:bg-gray-600 rounded-full overflow-hidden">
+                                        <div
+                                          className={`h-full ${getQuotaColor(Math.round(model.remaining_fraction * 100))} transition-all`}
+                                          style={{ width: `${model.remaining_fraction * 100}%` }}
+                                        />
+                                      </div>
+                                      {model.reset_time && (
+                                        <div className="flex items-center gap-1 mt-1">
+                                          <svg className="w-3 h-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                          </svg>
+                                          <span className="text-xs text-gray-500 dark:text-gray-400">
+                                            {formatResetTime(model.reset_time)}
+                                          </span>
+                                        </div>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
                       <div className="mt-4 flex items-center justify-between">
                         <span className={`inline-block px-2 py-1 text-xs rounded ${
                           account.enabled
@@ -976,6 +1132,18 @@ export function Accounts() {
                               title="刷新额度"
                             >
                               <svg className={`w-4 h-4 ${isLoadingCodexQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                              </svg>
+                            </button>
+                          )}
+                          {isGemini && (
+                            <button
+                              onClick={() => fetchGeminiQuota(account.id)}
+                              disabled={isLoadingGeminiQuota}
+                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingGeminiQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                              title="刷新额度"
+                            >
+                              <svg className={`w-4 h-4 ${isLoadingGeminiQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                               </svg>
                             </button>

@@ -248,6 +248,7 @@ pub async fn start_oauth(provider: OAuthProvider, project_id: Option<String>) ->
         OAuthProvider::Qwen => providers::qwen::start_oauth().await,
         OAuthProvider::IFlow => providers::iflow::start_oauth().await,
         OAuthProvider::Antigravity => providers::antigravity::start_oauth().await,
+        OAuthProvider::Kiro => providers::kiro::start_oauth().await,
     }
 }
 
@@ -457,6 +458,75 @@ pub async fn fetch_codex_quota(account_id: &str) -> Result<providers::openai::Co
     }
     updated_json["codex_quota_last_updated"] = serde_json::json!(quota.last_updated);
     updated_json["codex_plan_type"] = serde_json::json!(&quota.plan_type);
+
+    let updated_content = serde_json::to_string_pretty(&updated_json)?;
+    std::fs::write(&path, updated_content)?;
+
+    Ok(quota)
+}
+
+/// Fetch quota for a Gemini account
+pub async fn fetch_gemini_quota(account_id: &str) -> Result<providers::google::GeminiQuotaData> {
+    let auth_dir = crate::config::resolve_auth_dir();
+    let path = auth_dir.join(format!("{}.json", account_id));
+
+    if !path.exists() {
+        return Err(anyhow::anyhow!("Account file not found: {}", account_id));
+    }
+
+    let content = std::fs::read_to_string(&path)?;
+    let json: serde_json::Value = serde_json::from_str(&content)?;
+
+    // Check if it's a gemini/google account
+    let provider = json.get("type")
+        .or_else(|| json.get("provider"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if provider != "gemini" && provider != "google" {
+        return Err(anyhow::anyhow!("Not a Gemini account"));
+    }
+
+    // Get refresh token - check both root level and nested in token object
+    let refresh_token = json.get("refresh_token")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            json.get("token")
+                .and_then(|t| t.get("refresh_token"))
+                .and_then(|v| v.as_str())
+        })
+        .ok_or_else(|| anyhow::anyhow!("No refresh token found"))?;
+
+    // Refresh the token to get a fresh access token
+    let token_resp = providers::google::refresh_token(refresh_token).await?;
+    let access_token = token_resp.access_token;
+
+    // Get project_id if available
+    let project_id = json.get("project_id")
+        .and_then(|v| v.as_str());
+
+    // Fetch quota
+    let quota = providers::google::fetch_gemini_quota(&access_token, project_id).await?;
+
+    // Update the auth file with new token
+    let mut updated_json = json.clone();
+    // Update token in nested object if it exists
+    if updated_json.get("token").is_some() {
+        updated_json["token"]["access_token"] = serde_json::json!(access_token);
+        if let Some(expires_in) = token_resp.expires_in {
+            updated_json["token"]["expires_in"] = serde_json::json!(expires_in);
+            let expiry = chrono::Utc::now() + chrono::Duration::seconds(expires_in as i64);
+            updated_json["token"]["expiry"] = serde_json::json!(expiry.to_rfc3339());
+        }
+    } else {
+        updated_json["access_token"] = serde_json::json!(access_token);
+        if let Some(expires_in) = token_resp.expires_in {
+            updated_json["expires_in"] = serde_json::json!(expires_in);
+            let expired = chrono::Utc::now() + chrono::Duration::seconds(expires_in as i64);
+            updated_json["expired"] = serde_json::json!(expired.to_rfc3339());
+        }
+    }
+    updated_json["gemini_quota_last_updated"] = serde_json::json!(quota.last_updated);
 
     let updated_content = serde_json::to_string_pretty(&updated_json)?;
     std::fs::write(&path, updated_content)?;
