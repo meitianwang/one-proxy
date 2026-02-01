@@ -2,10 +2,9 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Dashboard } from "./pages/Dashboard";
 import { Accounts } from "./pages/Accounts";
-import { Settings } from "./pages/Settings";
 import { Sidebar } from "./components/Sidebar";
 
-export type Page = "dashboard" | "accounts" | "settings";
+export type Page = "dashboard" | "accounts";
 
 export interface ServerStatus {
   running: boolean;
@@ -54,8 +53,6 @@ function App() {
         return <Dashboard serverStatus={serverStatus} onStatusChange={fetchServerStatus} />;
       case "accounts":
         return <Accounts />;
-      case "settings":
-        return <Settings />;
       default:
         return <Dashboard serverStatus={serverStatus} onStatusChange={fetchServerStatus} />;
     }

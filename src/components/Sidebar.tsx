@@ -10,7 +10,6 @@ export function Sidebar({ currentPage, onPageChange, serverStatus }: SidebarProp
   const navItems: { id: Page; label: string; icon: string }[] = [
     { id: "dashboard", label: "仪表盘", icon: "📊" },
     { id: "accounts", label: "账户管理", icon: "👤" },
-    { id: "settings", label: "设置", icon: "⚙️" },
   ];
 
   return (
