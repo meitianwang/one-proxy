@@ -366,12 +366,14 @@ pub async fn fetch_antigravity_quota(account_id: &str) -> Result<providers::anti
     let token_resp = providers::antigravity::refresh_token(refresh_token).await?;
     let access_token = token_resp.access_token;
 
-    // Get cached project_id if available
+    // Get cached project_id and subscription_tier if available
     let cached_project_id = json.get("project_id")
+        .and_then(|v| v.as_str());
+    let cached_subscription_tier = json.get("subscription_tier")
         .and_then(|v| v.as_str());
 
     // Fetch quota
-    let quota = providers::antigravity::fetch_quota(&access_token, cached_project_id).await?;
+    let quota = providers::antigravity::fetch_quota(&access_token, cached_project_id, cached_subscription_tier).await?;
 
     // Update the auth file with new token and quota info
     let mut updated_json = json.clone();

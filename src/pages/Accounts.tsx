@@ -495,8 +495,8 @@ export function Accounts() {
               <thead className="bg-emerald-50 dark:bg-emerald-900/20">
                 <tr>
                   <th className="w-10 px-3 py-3"></th>
-                  <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">邮箱</th>
-                  <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">账号类型</th>
+                  <th className="w-56 px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">邮箱</th>
+                  <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">模型配额</th>
                   <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">状态</th>
                   <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">操作</th>
                 </tr>
@@ -517,6 +517,9 @@ export function Accounts() {
                 ) : (
                   filteredAccounts.map((account) => {
                     const providerInfo = getProviderInfo(account.provider);
+                    const isAntigravity = account.provider === "antigravity";
+                    const quota = quotaData[account.id];
+                    const isLoadingQuota = quotaLoading[account.id];
                     return (
                       <tr key={account.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                         <td className="px-3 py-3">
@@ -527,18 +530,59 @@ export function Accounts() {
                             className="w-4 h-4 rounded border-gray-300 text-emerald-500 focus:ring-emerald-500"
                           />
                         </td>
-                        <td className="px-3 py-3">
-                          <div>
-                            <p className="text-sm font-medium text-gray-800 dark:text-white">
+                        <td className="px-3 py-3 w-56 max-w-56">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium text-gray-800 dark:text-white truncate max-w-[120px]" title={account.email || account.id}>
                               {account.email || account.id}
-                            </p>
-                            <p className="text-xs text-emerald-500">{account.provider} 账号</p>
+                            </span>
+                            <span className={`inline-block px-2 py-0.5 text-xs rounded border flex-shrink-0 ${providerInfo.color}`}>
+                              {providerInfo.label}
+                            </span>
+                            {isAntigravity && quota?.subscription_tier && (
+                              <span className={`inline-block px-1.5 py-0.5 text-[10px] rounded font-medium flex-shrink-0 ${
+                                quota.subscription_tier.toLowerCase().includes("pro")
+                                  ? "bg-blue-500 text-white"
+                                  : quota.subscription_tier.toLowerCase().includes("ultra")
+                                  ? "bg-purple-500 text-white"
+                                  : "bg-gray-400 text-white"
+                              }`}>
+                                {quota.subscription_tier.toLowerCase().includes("pro") ? "PRO" :
+                                 quota.subscription_tier.toLowerCase().includes("ultra") ? "ULTRA" : "FREE"}
+                              </span>
+                            )}
                           </div>
                         </td>
                         <td className="px-3 py-3">
-                          <span className={`inline-block px-2 py-1 text-xs rounded border ${providerInfo.color}`}>
-                            {providerInfo.label}
-                          </span>
+                          {isAntigravity ? (
+                            isLoadingQuota ? (
+                              <span className="text-xs text-gray-400">加载中...</span>
+                            ) : quota?.is_forbidden ? (
+                              <span className="text-xs text-red-500">已禁用</span>
+                            ) : quota ? (
+                              <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                                {getKeyModels(quota.models).map((model) => (
+                                  <div key={model.name} className="flex items-center gap-1 text-xs whitespace-nowrap">
+                                    <span className="text-gray-600 dark:text-gray-400 font-medium w-16">{getModelDisplayName(model.name)}</span>
+                                    {model.reset_time && (
+                                      <span className="text-gray-400 flex items-center gap-0.5">
+                                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                        </svg>
+                                        {formatResetTime(model.reset_time)}
+                                      </span>
+                                    )}
+                                    <span className={`font-bold ${getQuotaTextColor(model.percentage)}`}>
+                                      {model.percentage}%
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <span className="text-xs text-gray-400">-</span>
+                            )
+                          ) : (
+                            <span className="text-xs text-gray-400">-</span>
+                          )}
                         </td>
                         <td className="px-3 py-3">
                           <span className={`inline-block px-2 py-1 text-xs rounded ${
@@ -550,23 +594,46 @@ export function Accounts() {
                           </span>
                         </td>
                         <td className="px-3 py-3">
-                          <div className="flex items-center gap-2">
+                          <div className="flex items-center gap-1">
+                            {isAntigravity && (
+                              <button
+                                onClick={() => fetchQuota(account.id)}
+                                disabled={isLoadingQuota}
+                                className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                                title="刷新额度"
+                              >
+                                <svg className={`w-4 h-4 ${isLoadingQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                </svg>
+                              </button>
+                            )}
                             <button
                               onClick={() => handleToggleEnabled(account.id, !account.enabled)}
-                              className={`text-sm ${
+                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${
                                 account.enabled
-                                  ? "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300"
-                                  : "text-emerald-500 hover:text-emerald-700 dark:text-emerald-400 dark:hover:text-emerald-300"
+                                  ? "text-gray-400 hover:text-orange-500"
+                                  : "text-emerald-500 hover:text-emerald-600"
                               }`}
+                              title={account.enabled ? "禁用账号" : "启用账号"}
                             >
-                              {account.enabled ? "禁用" : "启用"}
+                              {account.enabled ? (
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+                                </svg>
+                              ) : (
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                </svg>
+                              )}
                             </button>
-                            <span className="text-gray-300 dark:text-gray-600">|</span>
                             <button
                               onClick={() => handleDelete(account.id)}
-                              className="text-sm text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
+                              className="p-1.5 rounded text-gray-400 hover:text-red-500 hover:bg-gray-100 dark:hover:bg-gray-700"
+                              title="删除账号"
                             >
-                              删除
+                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                              </svg>
                             </button>
                           </div>
                         </td>
@@ -639,9 +706,6 @@ export function Accounts() {
                         <p className="text-sm font-medium text-gray-800 dark:text-white truncate">
                           {account.email || account.id}
                         </p>
-                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                          {account.provider} 账号
-                        </p>
                       </div>
 
                       {/* Quota Display for Antigravity */}
@@ -702,12 +766,12 @@ export function Accounts() {
                         }`}>
                           {account.enabled ? "正常" : "禁用"}
                         </span>
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-1">
                           {isAntigravity && (
                             <button
                               onClick={() => fetchQuota(account.id)}
                               disabled={isLoadingQuota}
-                              className={`p-1 rounded ${isLoadingQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
                               title="刷新额度"
                             >
                               <svg className={`w-4 h-4 ${isLoadingQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -717,20 +781,31 @@ export function Accounts() {
                           )}
                           <button
                             onClick={() => handleToggleEnabled(account.id, !account.enabled)}
-                            className={`text-sm ${
+                            className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${
                               account.enabled
-                                ? "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300"
-                                : "text-emerald-500 hover:text-emerald-700 dark:text-emerald-400 dark:hover:text-emerald-300"
+                                ? "text-gray-400 hover:text-orange-500"
+                                : "text-emerald-500 hover:text-emerald-600"
                             }`}
+                            title={account.enabled ? "禁用账号" : "启用账号"}
                           >
-                            {account.enabled ? "禁用" : "启用"}
+                            {account.enabled ? (
+                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+                              </svg>
+                            ) : (
+                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                              </svg>
+                            )}
                           </button>
-                          <span className="text-gray-300 dark:text-gray-600">|</span>
                           <button
                             onClick={() => handleDelete(account.id)}
-                            className="text-sm text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
+                            className="p-1.5 rounded text-gray-400 hover:text-red-500 hover:bg-gray-100 dark:hover:bg-gray-700"
+                            title="删除账号"
                           >
-                            删除
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                            </svg>
                           </button>
                         </div>
                       </div>

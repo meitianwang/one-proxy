@@ -446,9 +446,11 @@ pub async fn fetch_project_and_tier(access_token: &str) -> Result<(Option<String
 }
 
 /// Fetch quota for an Antigravity account
-pub async fn fetch_quota(access_token: &str, cached_project_id: Option<&str>) -> Result<QuotaData> {
-    let (project_id, subscription_tier) = if let Some(pid) = cached_project_id {
-        (Some(pid.to_string()), None)
+pub async fn fetch_quota(access_token: &str, cached_project_id: Option<&str>, cached_subscription_tier: Option<&str>) -> Result<QuotaData> {
+    // Only use cache if both project_id and subscription_tier are cached
+    // Otherwise fetch fresh data from API
+    let (project_id, subscription_tier) = if cached_project_id.is_some() && cached_subscription_tier.is_some() {
+        (cached_project_id.map(|s| s.to_string()), cached_subscription_tier.map(|s| s.to_string()))
     } else {
         fetch_project_and_tier(access_token).await?
     };
