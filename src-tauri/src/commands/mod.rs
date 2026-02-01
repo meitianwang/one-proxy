@@ -150,3 +150,8 @@ pub async fn fetch_codex_quota(account_id: String) -> Result<crate::auth::provid
 pub async fn fetch_gemini_quota(account_id: String) -> Result<crate::auth::providers::google::GeminiQuotaData, String> {
     crate::auth::fetch_gemini_quota(&account_id).await.map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub async fn fetch_kiro_quota(account_id: String) -> Result<crate::auth::providers::kiro::KiroQuotaData, String> {
+    crate::auth::fetch_kiro_quota(&account_id).await.map_err(|e| e.to_string())
+}

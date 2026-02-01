@@ -67,4 +67,3 @@ urlencoding = "2"
 open = "5"
 tauri-plugin-dialog = "2.6.0"
 flate2 = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }

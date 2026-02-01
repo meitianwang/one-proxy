@@ -533,3 +533,7 @@ pub async fn fetch_gemini_quota(account_id: &str) -> Result<providers::google::G
 
     Ok(quota)
 }
+
+pub async fn fetch_kiro_quota(account_id: &str) -> Result<providers::kiro::KiroQuotaData> {
+    providers::kiro::fetch_quota(account_id).await
+}

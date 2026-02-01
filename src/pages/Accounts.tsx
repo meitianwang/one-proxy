@@ -52,6 +52,19 @@ interface GeminiQuotaData {
   error_message: string | null;
 }
 
+interface KiroQuotaData {
+  subscription_title: string | null;
+  subscription_type: string | null;
+  usage_limit: number | null;
+  current_usage: number | null;
+  days_until_reset: number | null;
+  free_trial_limit: number | null;
+  free_trial_usage: number | null;
+  last_updated: number;
+  is_error: boolean;
+  error_message: string | null;
+}
+
 const PROVIDERS = [
   { id: "google", name: "Gemini CLI", label: "Gemini", color: "bg-blue-100 text-blue-700" },
   { id: "openai", name: "Codex", label: "Codex", color: "bg-green-100 text-green-700" },
@@ -86,6 +99,8 @@ export function Accounts() {
   const [codexQuotaLoading, setCodexQuotaLoading] = useState<Record<string, boolean>>({});
   const [geminiQuotaData, setGeminiQuotaData] = useState<Record<string, GeminiQuotaData>>({});
   const [geminiQuotaLoading, setGeminiQuotaLoading] = useState<Record<string, boolean>>({});
+  const [kiroQuotaData, setKiroQuotaData] = useState<Record<string, KiroQuotaData>>({});
+  const [kiroQuotaLoading, setKiroQuotaLoading] = useState<Record<string, boolean>>({});
   const addMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -145,6 +160,16 @@ export function Accounts() {
     }
   }, [accounts]);
 
+  // Auto-fetch quota for Kiro accounts when accounts change
+  useEffect(() => {
+    const kiroAccounts = accounts.filter(a => a.provider === "kiro");
+    for (const account of kiroAccounts) {
+      if (!kiroQuotaData[account.id] && !kiroQuotaLoading[account.id]) {
+        fetchKiroQuota(account.id);
+      }
+    }
+  }, [accounts]);
+
   async function fetchAccounts() {
     try {
       setLoading(true);
@@ -177,6 +202,10 @@ export function Accounts() {
     const geminiAccounts = accounts.filter(a => a.provider === "gemini" || a.provider === "google");
     for (const account of geminiAccounts) {
       fetchGeminiQuota(account.id);
+    }
+    const kiroAccounts = accounts.filter(a => a.provider === "kiro");
+    for (const account of kiroAccounts) {
+      fetchKiroQuota(account.id);
     }
   }
 
@@ -353,6 +382,19 @@ export function Accounts() {
       console.error("Failed to fetch gemini quota:", error);
     } finally {
       setGeminiQuotaLoading((prev) => ({ ...prev, [accountId]: false }));
+    }
+  }
+
+  async function fetchKiroQuota(accountId: string) {
+    if (kiroQuotaLoading[accountId]) return;
+    setKiroQuotaLoading((prev) => ({ ...prev, [accountId]: true }));
+    try {
+      const result = await invoke<KiroQuotaData>("fetch_kiro_quota", { accountId });
+      setKiroQuotaData((prev) => ({ ...prev, [accountId]: result }));
+    } catch (error) {
+      console.error("Failed to fetch kiro quota:", error);
+    } finally {
+      setKiroQuotaLoading((prev) => ({ ...prev, [accountId]: false }));
     }
   }
 
@@ -635,12 +677,15 @@ export function Accounts() {
                     const isAntigravity = account.provider === "antigravity";
                     const isCodex = account.provider === "openai" || account.provider === "codex";
                     const isGemini = account.provider === "gemini" || account.provider === "google";
+                    const isKiro = account.provider === "kiro";
                     const quota = quotaData[account.id];
                     const isLoadingQuota = quotaLoading[account.id];
                     const codexQuota = codexQuotaData[account.id];
                     const isLoadingCodexQuota = codexQuotaLoading[account.id];
                     const geminiQuota = geminiQuotaData[account.id];
                     const isLoadingGeminiQuota = geminiQuotaLoading[account.id];
+                    const kiroQuota = kiroQuotaData[account.id];
+                    const isLoadingKiroQuota = kiroQuotaLoading[account.id];
                     return (
                       <tr key={account.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                         <td className="px-3 py-3">
@@ -678,6 +723,15 @@ export function Accounts() {
                                   : "bg-gray-400 text-white"
                               }`}>
                                 {codexQuota.plan_type.toUpperCase()}
+                              </span>
+                            )}
+                            {isKiro && kiroQuota && !kiroQuota.is_error && kiroQuota.subscription_title && (
+                              <span className={`inline-block px-1.5 py-0.5 text-[10px] rounded font-medium flex-shrink-0 ${
+                                kiroQuota.subscription_title.toLowerCase().includes("pro")
+                                  ? "bg-purple-500 text-white"
+                                  : "bg-gray-400 text-white"
+                              }`}>
+                                {kiroQuota.subscription_title.replace("KIRO ", "")}
                               </span>
                             )}
                           </div>
@@ -776,6 +830,32 @@ export function Accounts() {
                             ) : (
                               <span className="text-xs text-gray-400">-</span>
                             )
+                          ) : isKiro ? (
+                            isLoadingKiroQuota ? (
+                              <span className="text-xs text-gray-400">加载中...</span>
+                            ) : kiroQuota?.is_error ? (
+                              <span className="text-xs text-red-500">{kiroQuota.error_message || "错误"}</span>
+                            ) : kiroQuota ? (
+                              (() => {
+                                const baseLimit = kiroQuota.usage_limit ?? 0;
+                                const baseUsage = kiroQuota.current_usage ?? 0;
+                                const trialLimit = kiroQuota.free_trial_limit ?? 0;
+                                const trialUsage = kiroQuota.free_trial_usage ?? 0;
+                                const totalLimit = baseLimit + trialLimit;
+                                const totalUsage = baseUsage + trialUsage;
+                                const remaining = totalLimit - totalUsage;
+                                const remainingPercent = totalLimit > 0 ? Math.round((remaining / totalLimit) * 100) : 0;
+                                return totalLimit > 0 ? (
+                                  <div className="flex items-center gap-2 text-xs">
+                                    <span className={`font-medium ${getQuotaTextColor(remainingPercent)}`}>
+                                      {totalUsage}/{totalLimit} ({remainingPercent}%)
+                                    </span>
+                                  </div>
+                                ) : null;
+                              })()
+                            ) : (
+                              <span className="text-xs text-gray-400">-</span>
+                            )
                           ) : (
                             <span className="text-xs text-gray-400">-</span>
                           )}
@@ -823,6 +903,18 @@ export function Accounts() {
                                 title="刷新额度"
                               >
                                 <svg className={`w-4 h-4 ${isLoadingGeminiQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                </svg>
+                              </button>
+                            )}
+                            {isKiro && (
+                              <button
+                                onClick={() => fetchKiroQuota(account.id)}
+                                disabled={isLoadingKiroQuota}
+                                className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingKiroQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                                title="刷新额度"
+                              >
+                                <svg className={`w-4 h-4 ${isLoadingKiroQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                                 </svg>
                               </button>
@@ -882,12 +974,15 @@ export function Accounts() {
                   const isAntigravity = account.provider === "antigravity";
                   const isCodex = account.provider === "openai" || account.provider === "codex";
                   const isGemini = account.provider === "gemini" || account.provider === "google";
+                  const isKiro = account.provider === "kiro";
                   const quota = quotaData[account.id];
                   const isLoadingQuota = quotaLoading[account.id];
                   const codexQuota = codexQuotaData[account.id];
                   const isLoadingCodexQuota = codexQuotaLoading[account.id];
                   const geminiQuota = geminiQuotaData[account.id];
                   const isLoadingGeminiQuota = geminiQuotaLoading[account.id];
+                  const kiroQuota = kiroQuotaData[account.id];
+                  const isLoadingKiroQuota = kiroQuotaLoading[account.id];
                   return (
                     <div
                       key={account.id}
@@ -926,6 +1021,15 @@ export function Accounts() {
                                 : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
                             }`}>
                               {codexQuota.plan_type.toUpperCase()}
+                            </span>
+                          )}
+                          {isKiro && kiroQuota && !kiroQuota.is_error && kiroQuota.subscription_title && (
+                            <span className={`inline-block px-2 py-1 text-xs rounded font-medium ${
+                              kiroQuota.subscription_title.toLowerCase().includes("pro")
+                                ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400"
+                                : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
+                            }`}>
+                              {kiroQuota.subscription_title.replace("KIRO ", "")}
                             </span>
                           )}
                           <span className={`inline-block px-2 py-1 text-xs rounded border ${providerInfo.color}`}>
@@ -1103,6 +1207,57 @@ export function Accounts() {
                         </div>
                       )}
 
+                      {/* Quota Display for Kiro */}
+                      {isKiro && (
+                        <div className="mt-3 min-h-[40px]">
+                          {isLoadingKiroQuota && (
+                            <p className="text-xs text-gray-500 dark:text-gray-400">加载额度中...</p>
+                          )}
+                          {kiroQuota && !isLoadingKiroQuota && (
+                            <div className="space-y-2">
+                              {kiroQuota.is_error ? (
+                                <p className="text-xs text-red-500">{kiroQuota.error_message || "获取额度失败"}</p>
+                              ) : (
+                                <div className="bg-gray-50 dark:bg-gray-700/50 rounded p-2">
+                                  {(() => {
+                                    // Combine base quota + free trial quota like kiro-account-manager
+                                    const baseLimit = kiroQuota.usage_limit ?? 0;
+                                    const baseUsage = kiroQuota.current_usage ?? 0;
+                                    const trialLimit = kiroQuota.free_trial_limit ?? 0;
+                                    const trialUsage = kiroQuota.free_trial_usage ?? 0;
+                                    const totalLimit = baseLimit + trialLimit;
+                                    const totalUsage = baseUsage + trialUsage;
+                                    const remaining = totalLimit - totalUsage;
+                                    const remainingPercent = totalLimit > 0 ? Math.round((remaining / totalLimit) * 100) : 0;
+
+                                    if (totalLimit > 0) {
+                                      return (
+                                        <>
+                                          <div className="flex items-center justify-between mb-1">
+                                            <span className="text-xs font-medium text-gray-700 dark:text-gray-300">使用量</span>
+                                            <span className={`text-xs font-bold ${getQuotaTextColor(remainingPercent)}`}>
+                                              {remainingPercent}%
+                                            </span>
+                                          </div>
+                                          <div className="w-full h-1.5 bg-gray-200 dark:bg-gray-600 rounded-full overflow-hidden">
+                                            <div
+                                              className={`h-full ${getQuotaColor(remainingPercent)} transition-all`}
+                                              style={{ width: `${remainingPercent}%` }}
+                                            />
+                                          </div>
+                                          <p className="text-xs text-gray-500 mt-1">{totalUsage} / {totalLimit}</p>
+                                        </>
+                                      );
+                                    }
+                                    return <p className="text-xs text-gray-500">无额度信息</p>;
+                                  })()}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
                       <div className="mt-4 flex items-center justify-between">
                         <span className={`inline-block px-2 py-1 text-xs rounded ${
                           account.enabled
@@ -1144,6 +1299,18 @@ export function Accounts() {
                               title="刷新额度"
                             >
                               <svg className={`w-4 h-4 ${isLoadingGeminiQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                              </svg>
+                            </button>
+                          )}
+                          {isKiro && (
+                            <button
+                              onClick={() => fetchKiroQuota(account.id)}
+                              disabled={isLoadingKiroQuota}
+                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingKiroQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                              title="刷新额度"
+                            >
+                              <svg className={`w-4 h-4 ${isLoadingKiroQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                               </svg>
                             </button>
