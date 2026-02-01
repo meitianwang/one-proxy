@@ -138,3 +138,8 @@ pub async fn set_gemini_project_id(account_id: String, project_id: String) -> Re
 pub async fn fetch_antigravity_quota(account_id: String) -> Result<crate::auth::providers::antigravity::QuotaData, String> {
     crate::auth::fetch_antigravity_quota(&account_id).await.map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub async fn fetch_codex_quota(account_id: String) -> Result<crate::auth::providers::openai::CodexQuotaData, String> {
+    crate::auth::fetch_codex_quota(&account_id).await.map_err(|e| e.to_string())
+}

@@ -62,6 +62,7 @@ pub fn run() {
             commands::set_account_enabled,
             commands::set_gemini_project_id,
             commands::fetch_antigravity_quota,
+            commands::fetch_codex_quota,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

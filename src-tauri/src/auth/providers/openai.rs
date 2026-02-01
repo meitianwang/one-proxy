@@ -199,7 +199,9 @@ pub async fn refresh_token(refresh_token: &str) -> Result<TokenResponse> {
         ));
     }
 
-    let token_response: TokenResponse = response.json().await?;
+    let text = response.text().await?;
+    let token_response: TokenResponse = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("Failed to parse token response: {} - body: {}", e, text))?;
     Ok(token_response)
 }
 
@@ -441,6 +443,205 @@ pub async fn start_oauth_with_callback() -> Result<OAuthResult> {
         Ok(Err(_)) => Err(anyhow::anyhow!("OAuth callback channel closed")),
         Err(_) => Err(anyhow::anyhow!("OAuth flow timed out after 5 minutes")),
     }
+}
+
+// Codex Quota API
+const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const CODEX_USER_AGENT: &str = "codex-cli/1.0.0";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexQuotaData {
+    pub plan_type: String,
+    pub primary_used: f64,
+    pub primary_resets_at: Option<String>,
+    pub secondary_used: f64,
+    pub secondary_resets_at: Option<String>,
+    pub has_credits: bool,
+    pub unlimited_credits: bool,
+    pub credits_balance: Option<f64>,
+    pub last_updated: i64,
+    #[serde(default)]
+    pub is_error: bool,
+    #[serde(default)]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsageResponse {
+    plan_type: Option<String>,
+    rate_limit: Option<RateLimitInfo>,
+    credits: Option<CreditsInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitInfo {
+    primary_window: Option<WindowInfo>,
+    secondary_window: Option<WindowInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WindowInfo {
+    #[serde(deserialize_with = "deserialize_f64_or_string", default)]
+    used_percent: Option<f64>,
+    reset_at: Option<i64>,
+    limit_window_seconds: Option<i64>,
+}
+
+/// Deserialize f64 from either a number or a string
+fn deserialize_f64_or_string<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+
+    struct F64OrStringVisitor;
+
+    impl<'de> Visitor<'de> for F64OrStringVisitor {
+        type Value = Option<f64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a number or a string containing a number")
+        }
+
+        fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(v))
+        }
+
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(v as f64))
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(v as f64))
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            v.parse::<f64>().map(Some).map_err(de::Error::custom)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(F64OrStringVisitor)
+}
+
+#[derive(Debug, Deserialize)]
+struct CreditsInfo {
+    has_credits: Option<bool>,
+    unlimited: Option<bool>,
+    balance: Option<f64>,
+}
+
+/// Fetch Codex usage/quota data
+pub async fn fetch_codex_quota(access_token: &str, account_id: Option<&str>) -> Result<CodexQuotaData> {
+    let client = reqwest::Client::new();
+
+    let mut request = client
+        .get(CODEX_USAGE_URL)
+        .header("User-Agent", CODEX_USER_AGENT)
+        .bearer_auth(access_token);
+
+    if let Some(aid) = account_id {
+        request = request.header("chatgpt-account-id", aid);
+    }
+
+    let response = request.send().await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        tracing::warn!("Codex quota fetch failed: {} {}", status, text);
+        return Ok(CodexQuotaData {
+            plan_type: "unknown".to_string(),
+            primary_used: 0.0,
+            primary_resets_at: None,
+            secondary_used: 0.0,
+            secondary_resets_at: None,
+            has_credits: false,
+            unlimited_credits: false,
+            credits_balance: None,
+            last_updated: chrono::Utc::now().timestamp(),
+            is_error: true,
+            error_message: Some(format!("API Error: {} {}", status, text)),
+        });
+    }
+
+    let text = response.text().await?;
+
+    // Parse as generic JSON first (like JS does), then extract values flexibly
+    let data: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("Failed to parse quota response: {} - body: {}", e, text))?;
+
+    let rate_limit = data.get("rate_limit");
+    let primary = rate_limit.and_then(|r| r.get("primary_window"));
+    let secondary = rate_limit.and_then(|r| r.get("secondary_window"));
+    let credits = data.get("credits");
+
+    // Helper to extract f64 from either number or string
+    let get_f64 = |v: Option<&serde_json::Value>| -> f64 {
+        v.and_then(|val| {
+            val.as_f64()
+                .or_else(|| val.as_i64().map(|i| i as f64))
+                .or_else(|| val.as_str().and_then(|s| s.parse().ok()))
+        }).unwrap_or(0.0)
+    };
+
+    let get_i64 = |v: Option<&serde_json::Value>| -> Option<i64> {
+        v.and_then(|val| {
+            val.as_i64()
+                .or_else(|| val.as_str().and_then(|s| s.parse().ok()))
+        })
+    };
+
+    let get_bool = |v: Option<&serde_json::Value>| -> bool {
+        v.and_then(|val| val.as_bool()).unwrap_or(false)
+    };
+
+    Ok(CodexQuotaData {
+        plan_type: data.get("plan_type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+        primary_used: get_f64(primary.and_then(|p| p.get("used_percent"))),
+        primary_resets_at: get_i64(primary.and_then(|p| p.get("reset_at"))).map(|ts| {
+            chrono::DateTime::from_timestamp(ts, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default()
+        }),
+        secondary_used: get_f64(secondary.and_then(|s| s.get("used_percent"))),
+        secondary_resets_at: get_i64(secondary.and_then(|s| s.get("reset_at"))).map(|ts| {
+            chrono::DateTime::from_timestamp(ts, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default()
+        }),
+        has_credits: get_bool(credits.and_then(|c| c.get("has_credits"))),
+        unlimited_credits: get_bool(credits.and_then(|c| c.get("unlimited"))),
+        credits_balance: credits.and_then(|c| c.get("balance")).and_then(|v| v.as_f64()),
+        last_updated: chrono::Utc::now().timestamp(),
+        is_error: false,
+        error_message: None,
+    })
 }
 
 async fn handle_callback(

@@ -25,6 +25,20 @@ interface QuotaData {
   project_id: string | null;
 }
 
+interface CodexQuotaData {
+  plan_type: string;
+  primary_used: number;
+  primary_resets_at: string | null;
+  secondary_used: number;
+  secondary_resets_at: string | null;
+  has_credits: boolean;
+  unlimited_credits: boolean;
+  credits_balance: number | null;
+  last_updated: number;
+  is_error: boolean;
+  error_message: string | null;
+}
+
 const PROVIDERS = [
   { id: "google", name: "Gemini CLI", label: "Gemini", color: "bg-blue-100 text-blue-700" },
   { id: "openai", name: "Codex", label: "Codex", color: "bg-green-100 text-green-700" },
@@ -54,6 +68,8 @@ export function Accounts() {
   const [viewMode, setViewMode] = useState<"list" | "card">("list");
   const [quotaData, setQuotaData] = useState<Record<string, QuotaData>>({});
   const [quotaLoading, setQuotaLoading] = useState<Record<string, boolean>>({});
+  const [codexQuotaData, setCodexQuotaData] = useState<Record<string, CodexQuotaData>>({});
+  const [codexQuotaLoading, setCodexQuotaLoading] = useState<Record<string, boolean>>({});
   const addMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -93,6 +109,16 @@ export function Accounts() {
     }
   }, [accounts]);
 
+  // Auto-fetch quota for Codex accounts when accounts change
+  useEffect(() => {
+    const codexAccounts = accounts.filter(a => a.provider === "openai" || a.provider === "codex");
+    for (const account of codexAccounts) {
+      if (!codexQuotaData[account.id] && !codexQuotaLoading[account.id]) {
+        fetchCodexQuota(account.id);
+      }
+    }
+  }, [accounts]);
+
   async function fetchAccounts() {
     try {
       setLoading(true);
@@ -117,6 +143,10 @@ export function Accounts() {
     const antigravityAccounts = accounts.filter(a => a.provider === "antigravity");
     for (const account of antigravityAccounts) {
       fetchQuota(account.id);
+    }
+    const codexAccounts = accounts.filter(a => a.provider === "openai");
+    for (const account of codexAccounts) {
+      fetchCodexQuota(account.id);
     }
   }
 
@@ -270,6 +300,19 @@ export function Accounts() {
     }
   }
 
+  async function fetchCodexQuota(accountId: string) {
+    if (codexQuotaLoading[accountId]) return;
+    setCodexQuotaLoading((prev) => ({ ...prev, [accountId]: true }));
+    try {
+      const result = await invoke<CodexQuotaData>("fetch_codex_quota", { accountId });
+      setCodexQuotaData((prev) => ({ ...prev, [accountId]: result }));
+    } catch (error) {
+      console.error("Failed to fetch codex quota:", error);
+    } finally {
+      setCodexQuotaLoading((prev) => ({ ...prev, [accountId]: false }));
+    }
+  }
+
   function getQuotaColor(percentage: number): string {
     if (percentage >= 50) return "bg-emerald-500";
     if (percentage >= 20) return "bg-amber-500";
@@ -279,6 +322,14 @@ export function Accounts() {
   function getQuotaTextColor(percentage: number): string {
     if (percentage >= 50) return "text-emerald-600 dark:text-emerald-400";
     if (percentage >= 20) return "text-amber-600 dark:text-amber-400";
+    return "text-red-600 dark:text-red-400";
+  }
+
+  // For Codex, the API returns "used" percentage, so lower remaining = worse
+  function getCodexUsageColor(usedPercent: number): string {
+    const remaining = 100 - usedPercent;
+    if (remaining >= 50) return "text-emerald-600 dark:text-emerald-400";
+    if (remaining >= 20) return "text-amber-600 dark:text-amber-400";
     return "text-red-600 dark:text-red-400";
   }
 
@@ -518,8 +569,11 @@ export function Accounts() {
                   filteredAccounts.map((account) => {
                     const providerInfo = getProviderInfo(account.provider);
                     const isAntigravity = account.provider === "antigravity";
+                    const isCodex = account.provider === "openai" || account.provider === "codex";
                     const quota = quotaData[account.id];
                     const isLoadingQuota = quotaLoading[account.id];
+                    const codexQuota = codexQuotaData[account.id];
+                    const isLoadingCodexQuota = codexQuotaLoading[account.id];
                     return (
                       <tr key={account.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                         <td className="px-3 py-3">
@@ -548,6 +602,15 @@ export function Accounts() {
                               }`}>
                                 {quota.subscription_tier.toLowerCase().includes("pro") ? "PRO" :
                                  quota.subscription_tier.toLowerCase().includes("ultra") ? "ULTRA" : "FREE"}
+                              </span>
+                            )}
+                            {isCodex && codexQuota && !codexQuota.is_error && (
+                              <span className={`inline-block px-1.5 py-0.5 text-[10px] rounded font-medium flex-shrink-0 ${
+                                codexQuota.plan_type.toLowerCase().includes("plus")
+                                  ? "bg-green-500 text-white"
+                                  : "bg-gray-400 text-white"
+                              }`}>
+                                {codexQuota.plan_type.toUpperCase()}
                               </span>
                             )}
                           </div>
@@ -580,6 +643,45 @@ export function Accounts() {
                             ) : (
                               <span className="text-xs text-gray-400">-</span>
                             )
+                          ) : isCodex ? (
+                            isLoadingCodexQuota ? (
+                              <span className="text-xs text-gray-400">加载中...</span>
+                            ) : codexQuota?.is_error ? (
+                              <span className="text-xs text-red-500">{codexQuota.error_message || "错误"}</span>
+                            ) : codexQuota ? (
+                              <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                                <div className="flex items-center gap-1 text-xs whitespace-nowrap">
+                                  <span className="text-gray-600 dark:text-gray-400 font-medium w-16">5小时</span>
+                                  {codexQuota.primary_resets_at && (
+                                    <span className="text-gray-400 flex items-center gap-0.5">
+                                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                      </svg>
+                                      {formatResetTime(codexQuota.primary_resets_at)}
+                                    </span>
+                                  )}
+                                  <span className={`font-bold ${getCodexUsageColor(codexQuota.primary_used)}`}>
+                                    {(100 - codexQuota.primary_used).toFixed(0)}%
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-1 text-xs whitespace-nowrap">
+                                  <span className="text-gray-600 dark:text-gray-400 font-medium w-16">周限制</span>
+                                  {codexQuota.secondary_resets_at && (
+                                    <span className="text-gray-400 flex items-center gap-0.5">
+                                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                      </svg>
+                                      {formatResetTime(codexQuota.secondary_resets_at)}
+                                    </span>
+                                  )}
+                                  <span className={`font-bold ${getCodexUsageColor(codexQuota.secondary_used)}`}>
+                                    {(100 - codexQuota.secondary_used).toFixed(0)}%
+                                  </span>
+                                </div>
+                              </div>
+                            ) : (
+                              <span className="text-xs text-gray-400">-</span>
+                            )
                           ) : (
                             <span className="text-xs text-gray-400">-</span>
                           )}
@@ -603,6 +705,18 @@ export function Accounts() {
                                 title="刷新额度"
                               >
                                 <svg className={`w-4 h-4 ${isLoadingQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                </svg>
+                              </button>
+                            )}
+                            {isCodex && (
+                              <button
+                                onClick={() => fetchCodexQuota(account.id)}
+                                disabled={isLoadingCodexQuota}
+                                className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingCodexQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                                title="刷新额度"
+                              >
+                                <svg className={`w-4 h-4 ${isLoadingCodexQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                                 </svg>
                               </button>
@@ -660,8 +774,11 @@ export function Accounts() {
                 {filteredAccounts.map((account) => {
                   const providerInfo = getProviderInfo(account.provider);
                   const isAntigravity = account.provider === "antigravity";
+                  const isCodex = account.provider === "openai";
                   const quota = quotaData[account.id];
                   const isLoadingQuota = quotaLoading[account.id];
+                  const codexQuota = codexQuotaData[account.id];
+                  const isLoadingCodexQuota = codexQuotaLoading[account.id];
                   return (
                     <div
                       key={account.id}
@@ -691,6 +808,15 @@ export function Accounts() {
                             }`}>
                               {quota.subscription_tier.toLowerCase().includes("pro") ? "PRO" :
                                quota.subscription_tier.toLowerCase().includes("ultra") ? "ULTRA" : "FREE"}
+                            </span>
+                          )}
+                          {isCodex && codexQuota && !codexQuota.is_error && (
+                            <span className={`inline-block px-2 py-1 text-xs rounded font-medium ${
+                              codexQuota.plan_type.toLowerCase().includes("plus")
+                                ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
+                                : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
+                            }`}>
+                              {codexQuota.plan_type.toUpperCase()}
                             </span>
                           )}
                           <span className={`inline-block px-2 py-1 text-xs rounded border ${providerInfo.color}`}>
@@ -754,6 +880,73 @@ export function Accounts() {
                         </div>
                       )}
 
+                      {/* Quota Display for Codex */}
+                      {isCodex && (
+                        <div className="mt-3 min-h-[80px]">
+                          {isLoadingCodexQuota && (
+                            <p className="text-xs text-gray-500 dark:text-gray-400">加载额度中...</p>
+                          )}
+                          {codexQuota && !isLoadingCodexQuota && (
+                            <div className="space-y-2">
+                              {codexQuota.is_error ? (
+                                <p className="text-xs text-red-500">{codexQuota.error_message || "获取额度失败"}</p>
+                              ) : (
+                                <div className="grid grid-cols-2 gap-2">
+                                  <div className="bg-gray-50 dark:bg-gray-700/50 rounded p-2">
+                                    <div className="flex items-center justify-between mb-1">
+                                      <span className="text-xs font-medium text-gray-700 dark:text-gray-300">5小时</span>
+                                      <span className={`text-xs font-bold ${getCodexUsageColor(codexQuota.primary_used)}`}>
+                                        {(100 - codexQuota.primary_used).toFixed(0)}%
+                                      </span>
+                                    </div>
+                                    <div className="w-full h-1.5 bg-gray-200 dark:bg-gray-600 rounded-full overflow-hidden">
+                                      <div
+                                        className={`h-full ${getQuotaColor(100 - codexQuota.primary_used)} transition-all`}
+                                        style={{ width: `${100 - codexQuota.primary_used}%` }}
+                                      />
+                                    </div>
+                                    {codexQuota.primary_resets_at && (
+                                      <div className="flex items-center gap-1 mt-1">
+                                        <svg className="w-3 h-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                        </svg>
+                                        <span className="text-xs text-gray-500 dark:text-gray-400">
+                                          {formatResetTime(codexQuota.primary_resets_at)}
+                                        </span>
+                                      </div>
+                                    )}
+                                  </div>
+                                  <div className="bg-gray-50 dark:bg-gray-700/50 rounded p-2">
+                                    <div className="flex items-center justify-between mb-1">
+                                      <span className="text-xs font-medium text-gray-700 dark:text-gray-300">周限制</span>
+                                      <span className={`text-xs font-bold ${getCodexUsageColor(codexQuota.secondary_used)}`}>
+                                        {(100 - codexQuota.secondary_used).toFixed(0)}%
+                                      </span>
+                                    </div>
+                                    <div className="w-full h-1.5 bg-gray-200 dark:bg-gray-600 rounded-full overflow-hidden">
+                                      <div
+                                        className={`h-full ${getQuotaColor(100 - codexQuota.secondary_used)} transition-all`}
+                                        style={{ width: `${100 - codexQuota.secondary_used}%` }}
+                                      />
+                                    </div>
+                                    {codexQuota.secondary_resets_at && (
+                                      <div className="flex items-center gap-1 mt-1">
+                                        <svg className="w-3 h-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                        </svg>
+                                        <span className="text-xs text-gray-500 dark:text-gray-400">
+                                          {formatResetTime(codexQuota.secondary_resets_at)}
+                                        </span>
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
                       <div className="mt-4 flex items-center justify-between">
                         <span className={`inline-block px-2 py-1 text-xs rounded ${
                           account.enabled
@@ -771,6 +964,18 @@ export function Accounts() {
                               title="刷新额度"
                             >
                               <svg className={`w-4 h-4 ${isLoadingQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                              </svg>
+                            </button>
+                          )}
+                          {isCodex && (
+                            <button
+                              onClick={() => fetchCodexQuota(account.id)}
+                              disabled={isLoadingCodexQuota}
+                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingCodexQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                              title="刷新额度"
+                            >
+                              <svg className={`w-4 h-4 ${isLoadingCodexQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                               </svg>
                             </button>

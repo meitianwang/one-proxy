@@ -400,3 +400,66 @@ pub async fn fetch_antigravity_quota(account_id: &str) -> Result<providers::anti
 
     Ok(quota)
 }
+
+/// Fetch quota for a Codex (OpenAI) account
+pub async fn fetch_codex_quota(account_id: &str) -> Result<providers::openai::CodexQuotaData> {
+    let auth_dir = crate::config::resolve_auth_dir();
+    let path = auth_dir.join(format!("{}.json", account_id));
+
+    if !path.exists() {
+        return Err(anyhow::anyhow!("Account file not found: {}", account_id));
+    }
+
+    let content = std::fs::read_to_string(&path)?;
+    let json: serde_json::Value = serde_json::from_str(&content)?;
+
+    // Check if it's an openai/codex account
+    let provider = json.get("type")
+        .or_else(|| json.get("provider"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if provider != "openai" && provider != "codex" {
+        return Err(anyhow::anyhow!("Not an OpenAI/Codex account"));
+    }
+
+    // Get refresh token - check both root level and nested in token object
+    let refresh_token = json.get("refresh_token")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            json.get("token")
+                .and_then(|t| t.get("refresh_token"))
+                .and_then(|v| v.as_str())
+        })
+        .ok_or_else(|| anyhow::anyhow!("No refresh token found"))?;
+
+    // Refresh the token to get a fresh access token
+    let token_resp = providers::openai::refresh_token(refresh_token).await?;
+    let access_token = token_resp.access_token;
+
+    // Get account_id for the API call (different from our internal account_id)
+    let openai_account_id = json.get("account_id")
+        .and_then(|v| v.as_str());
+
+    // Fetch quota
+    let quota = providers::openai::fetch_codex_quota(&access_token, openai_account_id).await?;
+
+    // Update the auth file with new token
+    let mut updated_json = json.clone();
+    updated_json["access_token"] = serde_json::json!(access_token);
+    if let Some(new_refresh) = token_resp.refresh_token {
+        updated_json["refresh_token"] = serde_json::json!(new_refresh);
+    }
+    if let Some(expires_in) = token_resp.expires_in {
+        updated_json["expires_in"] = serde_json::json!(expires_in);
+        let expired = chrono::Utc::now() + chrono::Duration::seconds(expires_in as i64);
+        updated_json["expired"] = serde_json::json!(expired.to_rfc3339());
+    }
+    updated_json["codex_quota_last_updated"] = serde_json::json!(quota.last_updated);
+    updated_json["codex_plan_type"] = serde_json::json!(&quota.plan_type);
+
+    let updated_content = serde_json::to_string_pretty(&updated_json)?;
+    std::fs::write(&path, updated_content)?;
+
+    Ok(quota)
+}
