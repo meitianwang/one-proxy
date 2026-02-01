@@ -23,10 +23,75 @@ interface DashboardProps {
 export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [loading, setLoading] = useState(true);
+  const [selectedProtocol, setSelectedProtocol] = useState<"openai" | "anthropic" | "gemini">("openai");
+  const [selectedModel, setSelectedModel] = useState("gemini-2.5-flash");
+  const [models, setModels] = useState<{ id: string; name: string; desc: string }[]>([]);
+  const [copied, setCopied] = useState(false);
+
+  const baseUrl = `http://127.0.0.1:${config?.port ?? 8417}`;
+  const apiKey = config?.["api-keys"]?.[0] ?? "your-api-key";
+
+  const curlCommands = {
+    openai: `curl -X POST ${baseUrl}/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer ${apiKey}" \\
+  -d '{
+    "model": "${selectedModel}",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'`,
+    anthropic: `curl -X POST ${baseUrl}/v1/messages \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer ${apiKey}" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -d '{
+    "model": "${selectedModel}",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'`,
+    gemini: `curl -X POST "${baseUrl}/v1beta/models/${selectedModel}:generateContent" \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer ${apiKey}" \\
+  -d '{
+    "contents": [{"parts": [{"text": "Hello"}]}]
+  }'`,
+  };
 
   useEffect(() => {
     fetchConfig();
   }, []);
+
+  useEffect(() => {
+    if (serverStatus.running && config) {
+      fetchModels();
+    }
+  }, [serverStatus.running, config]);
+
+  async function fetchModels() {
+    try {
+      const url = `http://127.0.0.1:${config?.port ?? 8417}/v1/models`;
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (config?.["api-keys"]?.[0]) {
+        headers["Authorization"] = `Bearer ${config["api-keys"][0]}`;
+      }
+      const response = await fetch(url, { headers });
+      if (response.ok) {
+        const data = await response.json();
+        if (data.data && Array.isArray(data.data)) {
+          const modelList = data.data.map((m: { id: string; owned_by?: string }) => ({
+            id: m.id,
+            name: m.id,
+            desc: m.owned_by || "",
+          }));
+          setModels(modelList);
+          if (modelList.length > 0 && !modelList.find((m: { id: string }) => m.id === selectedModel)) {
+            setSelectedModel(modelList[0].id);
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Failed to fetch models:", error);
+    }
+  }
 
   async function fetchConfig() {
     try {
@@ -229,25 +294,128 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
         </div>
       </div>
 
-      {/* API Endpoints */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-6">
-          <h4 className="text-sm font-medium text-gray-500 dark:text-gray-400">
-            OpenAI 兼容
-          </h4>
-          <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
-            /v1/chat/completions
-          </p>
-          <p className="text-sm text-gray-600 dark:text-gray-300">/v1/models</p>
+      {/* Multi-Protocol Support */}
+      <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-6">
+        <div className="flex items-center gap-3 mb-4">
+          <div className="w-10 h-10 rounded-lg bg-blue-100 dark:bg-blue-900 flex items-center justify-center">
+            <svg className="w-5 h-5 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+            </svg>
+          </div>
+          <div>
+            <h3 className="text-lg font-semibold text-gray-800 dark:text-white">多协议支持</h3>
+            <p className="text-sm text-gray-500 dark:text-gray-400">支持 OpenAI、Anthropic 和 Gemini 协议</p>
+          </div>
         </div>
 
-        <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-6">
-          <h4 className="text-sm font-medium text-gray-500 dark:text-gray-400">
-            Claude 兼容
-          </h4>
-          <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
-            /v1/messages
-          </p>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Protocol Selection */}
+          <div>
+            <div className="grid grid-cols-3 gap-3 mb-4">
+              <button
+                onClick={() => setSelectedProtocol("openai")}
+                className={`p-3 rounded-lg border text-left transition-colors ${
+                  selectedProtocol === "openai"
+                    ? "border-blue-500 bg-blue-50 dark:bg-blue-900/30"
+                    : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
+                }`}
+              >
+                <p className={`text-sm font-medium ${selectedProtocol === "openai" ? "text-blue-600 dark:text-blue-400" : "text-gray-800 dark:text-white"}`}>
+                  OpenAI 协议
+                </p>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">/v1/chat/completions</p>
+              </button>
+              <button
+                onClick={() => setSelectedProtocol("anthropic")}
+                className={`p-3 rounded-lg border text-left transition-colors ${
+                  selectedProtocol === "anthropic"
+                    ? "border-blue-500 bg-blue-50 dark:bg-blue-900/30"
+                    : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
+                }`}
+              >
+                <p className={`text-sm font-medium ${selectedProtocol === "anthropic" ? "text-blue-600 dark:text-blue-400" : "text-gray-800 dark:text-white"}`}>
+                  Anthropic 协议
+                </p>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">/v1/messages</p>
+              </button>
+              <button
+                onClick={() => setSelectedProtocol("gemini")}
+                className={`p-3 rounded-lg border text-left transition-colors ${
+                  selectedProtocol === "gemini"
+                    ? "border-blue-500 bg-blue-50 dark:bg-blue-900/30"
+                    : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
+                }`}
+              >
+                <p className={`text-sm font-medium ${selectedProtocol === "gemini" ? "text-blue-600 dark:text-blue-400" : "text-gray-800 dark:text-white"}`}>
+                  Gemini 协议
+                </p>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">/v1beta/models/...</p>
+              </button>
+            </div>
+
+            {/* Model Selection */}
+            <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
+              <p className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">选择模型</p>
+              <div className="space-y-2 max-h-40 overflow-y-auto">
+                {models.length === 0 ? (
+                  <p className="text-sm text-gray-500 dark:text-gray-400 py-2">
+                    {serverStatus.running ? "暂无可用模型，请先添加账号" : "请先启动服务"}
+                  </p>
+                ) : (
+                  models.map((model) => (
+                    <button
+                      key={model.id}
+                      onClick={() => setSelectedModel(model.id)}
+                      className={`w-full p-2 rounded-lg border text-left text-sm transition-colors ${
+                        selectedModel === model.id
+                          ? "border-blue-500 bg-blue-50 dark:bg-blue-900/30"
+                          : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
+                      }`}
+                    >
+                      <span className={`font-medium ${selectedModel === model.id ? "text-blue-600 dark:text-blue-400" : "text-gray-800 dark:text-white"}`}>
+                        {model.name}
+                      </span>
+                      {model.desc && <span className="text-xs text-gray-500 dark:text-gray-400 ml-2">{model.desc}</span>}
+                    </button>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Curl Command */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-sm font-medium text-gray-700 dark:text-gray-300">测试命令 (curl)</span>
+              <button
+                onClick={() => {
+                  navigator.clipboard.writeText(curlCommands[selectedProtocol]);
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 2000);
+                }}
+                className="text-xs text-blue-500 hover:text-blue-600 flex items-center gap-1"
+              >
+                {copied ? (
+                  <>
+                    <svg className="w-4 h-4 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                    </svg>
+                    <span className="text-green-500">已复制</span>
+                  </>
+                ) : (
+                  <>
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                    </svg>
+                    复制
+                  </>
+                )}
+              </button>
+            </div>
+            <pre className="bg-gray-900 text-gray-100 p-4 rounded-lg text-xs overflow-x-auto whitespace-pre-wrap font-mono">
+              {curlCommands[selectedProtocol]}
+            </pre>
+          </div>
         </div>
       </div>
     </div>
