@@ -679,11 +679,6 @@ export function Accounts() {
                             onChange={() => toggleSelect(account.id)}
                             className="w-4 h-4 rounded border-gray-300 text-emerald-500 focus:ring-emerald-500"
                           />
-                          <div className="w-10 h-10 rounded-full bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center">
-                            <span className="text-emerald-600 dark:text-emerald-400 font-medium">
-                              {(account.email || account.id).charAt(0).toUpperCase()}
-                            </span>
-                          </div>
                         </div>
                         <div className="flex items-center gap-2">
                           {isAntigravity && quota?.subscription_tier && (
@@ -694,7 +689,8 @@ export function Accounts() {
                                 ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
                                 : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
                             }`}>
-                              {quota.subscription_tier.toUpperCase()}
+                              {quota.subscription_tier.toLowerCase().includes("pro") ? "PRO" :
+                               quota.subscription_tier.toLowerCase().includes("ultra") ? "ULTRA" : "FREE"}
                             </span>
                           )}
                           <span className={`inline-block px-2 py-1 text-xs rounded border ${providerInfo.color}`}>
@@ -702,7 +698,7 @@ export function Accounts() {
                           </span>
                         </div>
                       </div>
-                      <div className="mt-3 ml-7">
+                      <div className="mt-3">
                         <p className="text-sm font-medium text-gray-800 dark:text-white truncate">
                           {account.email || account.id}
                         </p>
@@ -710,7 +706,7 @@ export function Accounts() {
 
                       {/* Quota Display for Antigravity */}
                       {isAntigravity && (
-                        <div className="mt-3 ml-7">
+                        <div className="mt-3 min-h-[140px]">
                           {isLoadingQuota && (
                             <p className="text-xs text-gray-500 dark:text-gray-400">加载额度中...</p>
                           )}
@@ -758,7 +754,7 @@ export function Accounts() {
                         </div>
                       )}
 
-                      <div className="mt-4 ml-7 flex items-center justify-between">
+                      <div className="mt-4 flex items-center justify-between">
                         <span className={`inline-block px-2 py-1 text-xs rounded ${
                           account.enabled
                             ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300"
