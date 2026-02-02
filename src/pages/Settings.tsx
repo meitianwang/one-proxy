@@ -103,6 +103,7 @@ export function Settings() {
       setTimeout(() => setSaved(false), 2000);
     } catch (error) {
       console.error("Failed to save settings:", error);
+      alert(`保存失败: ${error}`);
     } finally {
       setSaving(false);
     }

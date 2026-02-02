@@ -372,6 +372,60 @@ pub async fn get_custom_providers() -> Result<CustomProvidersData, String> {
 
 #[tauri::command]
 pub async fn save_custom_providers(data: CustomProvidersData) -> Result<(), String> {
+    // Reserved provider names that cannot be used
+    const RESERVED_NAMES: &[&str] = &[
+        "gemini", "codex", "openai", "claude", "antigravity", "kimi", "glm", "kiro"
+    ];
+
+    // Collect all prefixes for duplicate checking
+    let mut all_prefixes: Vec<String> = Vec::new();
+
+    // Validate OpenAI compatibility providers
+    for entry in &data.openai_compatibility {
+        let prefix = entry.prefix.as_ref().unwrap_or(&entry.name).to_lowercase();
+
+        // Check reserved names
+        if RESERVED_NAMES.contains(&prefix.as_str()) {
+            return Err(format!(
+                "供应商前缀 '{}' 是保留名称，不能使用。保留名称包括: {}",
+                prefix,
+                RESERVED_NAMES.join(", ")
+            ));
+        }
+
+        // Check duplicates
+        if all_prefixes.contains(&prefix) {
+            return Err(format!(
+                "供应商前缀 '{}' 已存在，不能重复添加",
+                prefix
+            ));
+        }
+        all_prefixes.push(prefix);
+    }
+
+    // Validate Claude Code compatibility providers
+    for entry in &data.claude_code_compatibility {
+        let prefix = entry.prefix.as_ref().unwrap_or(&entry.name).to_lowercase();
+
+        // Check reserved names
+        if RESERVED_NAMES.contains(&prefix.as_str()) {
+            return Err(format!(
+                "供应商前缀 '{}' 是保留名称，不能使用。保留名称包括: {}",
+                prefix,
+                RESERVED_NAMES.join(", ")
+            ));
+        }
+
+        // Check duplicates
+        if all_prefixes.contains(&prefix) {
+            return Err(format!(
+                "供应商前缀 '{}' 已存在，不能重复添加",
+                prefix
+            ));
+        }
+        all_prefixes.push(prefix);
+    }
+
     let mut config = config::get_config().ok_or_else(|| "Config not initialized".to_string())?;
 
     config.openai_compatibility = data.openai_compatibility.iter().map(|e| {
