@@ -175,3 +175,28 @@ pub async fn export_accounts_to_file(file_path: String) -> Result<(), String> {
 pub async fn import_accounts_from_file(file_path: String) -> Result<i32, String> {
     crate::auth::import_accounts_from_file(&file_path).map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub async fn get_cached_quotas() -> Result<HashMap<String, crate::db::CachedQuota>, String> {
+    crate::db::get_all_quota_cache().map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingsData {
+    pub quota_refresh_interval: u32,
+}
+
+#[tauri::command]
+pub async fn get_settings() -> Result<SettingsData, String> {
+    let config = config::get_config().ok_or_else(|| "Config not initialized".to_string())?;
+    Ok(SettingsData {
+        quota_refresh_interval: config.quota_refresh_interval,
+    })
+}
+
+#[tauri::command]
+pub async fn save_settings(settings: SettingsData) -> Result<(), String> {
+    let mut config = config::get_config().ok_or_else(|| "Config not initialized".to_string())?;
+    config.quota_refresh_interval = settings.quota_refresh_interval;
+    config::update_config(config).map_err(|e| e.to_string())
+}

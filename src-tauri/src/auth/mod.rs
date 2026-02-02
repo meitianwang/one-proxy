@@ -399,6 +399,11 @@ pub async fn fetch_antigravity_quota(account_id: &str) -> Result<providers::anti
     let updated_content = serde_json::to_string_pretty(&updated_json)?;
     std::fs::write(&path, updated_content)?;
 
+    // Cache quota to SQLite
+    if let Ok(quota_json) = serde_json::to_string(&quota) {
+        let _ = crate::db::save_quota_cache(account_id, "antigravity", &quota_json);
+    }
+
     Ok(quota)
 }
 
@@ -461,6 +466,11 @@ pub async fn fetch_codex_quota(account_id: &str) -> Result<providers::openai::Co
 
     let updated_content = serde_json::to_string_pretty(&updated_json)?;
     std::fs::write(&path, updated_content)?;
+
+    // Cache quota to SQLite
+    if let Ok(quota_json) = serde_json::to_string(&quota) {
+        let _ = crate::db::save_quota_cache(account_id, "codex", &quota_json);
+    }
 
     Ok(quota)
 }
@@ -531,11 +541,23 @@ pub async fn fetch_gemini_quota(account_id: &str) -> Result<providers::google::G
     let updated_content = serde_json::to_string_pretty(&updated_json)?;
     std::fs::write(&path, updated_content)?;
 
+    // Cache quota to SQLite
+    if let Ok(quota_json) = serde_json::to_string(&quota) {
+        let _ = crate::db::save_quota_cache(account_id, "gemini", &quota_json);
+    }
+
     Ok(quota)
 }
 
 pub async fn fetch_kiro_quota(account_id: &str) -> Result<providers::kiro::KiroQuotaData> {
-    providers::kiro::fetch_quota(account_id).await
+    let quota = providers::kiro::fetch_quota(account_id).await?;
+
+    // Cache quota to SQLite
+    if let Ok(quota_json) = serde_json::to_string(&quota) {
+        let _ = crate::db::save_quota_cache(account_id, "kiro", &quota_json);
+    }
+
+    Ok(quota)
 }
 
 /// Export all accounts to a single JSON string

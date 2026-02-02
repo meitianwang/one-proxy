@@ -4,6 +4,7 @@ pub mod api;
 pub mod auth;
 pub mod commands;
 pub mod config;
+pub mod db;
 pub mod proxy;
 
 use tauri::{
@@ -35,6 +36,13 @@ pub fn run() {
                 // First init config
                 if let Err(e) = config::init_config(&config_handle).await {
                     tracing::error!("Failed to initialize config: {}", e);
+                }
+
+                // Initialize SQLite database
+                if let Ok(data_dir) = config_handle.path().app_data_dir() {
+                    if let Err(e) = db::init_db(data_dir) {
+                        tracing::error!("Failed to initialize database: {}", e);
+                    }
                 }
 
                 // Then start the API server
@@ -69,6 +77,9 @@ pub fn run() {
             commands::import_accounts,
             commands::export_accounts_to_file,
             commands::import_accounts_from_file,
+            commands::get_cached_quotas,
+            commands::get_settings,
+            commands::save_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

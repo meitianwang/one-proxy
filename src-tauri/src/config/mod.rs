@@ -60,6 +60,9 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub openai_compatibility: Vec<OpenAICompatEntry>,
+
+    #[serde(default = "default_quota_refresh_interval")]
+    pub quota_refresh_interval: u32,
 }
 
 fn default_port() -> u16 {
@@ -76,6 +79,10 @@ fn default_request_retry() -> u32 {
 
 fn default_max_retry_interval() -> u32 {
     30
+}
+
+fn default_quota_refresh_interval() -> u32 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

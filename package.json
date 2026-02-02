@@ -1,7 +1,8 @@
 {
-  "name": "tauri-cliproxy",
+  "name": "oneproxy",
   "private": true,
   "version": "0.1.0",
+  "author": "Nick",
   "type": "module",
   "scripts": {
     "dev": "vite",

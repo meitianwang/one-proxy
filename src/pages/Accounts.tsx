@@ -65,6 +65,13 @@ interface KiroQuotaData {
   error_message: string | null;
 }
 
+interface CachedQuota {
+  account_id: string;
+  provider: string;
+  quota_data: string;
+  last_updated: number;
+}
+
 const PROVIDERS = [
   { id: "google", name: "Gemini CLI", label: "Gemini", color: "bg-blue-100 text-blue-700" },
   { id: "openai", name: "Codex", label: "Codex", color: "bg-green-100 text-green-700" },
@@ -92,7 +99,7 @@ export function Accounts() {
   const [pendingGeminiAccountId, setPendingGeminiAccountId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [showAddMenu, setShowAddMenu] = useState(false);
-  const [viewMode, setViewMode] = useState<"list" | "card">("list");
+  const [viewMode, setViewMode] = useState<"list" | "card">("card");
   const [quotaData, setQuotaData] = useState<Record<string, QuotaData>>({});
   const [quotaLoading, setQuotaLoading] = useState<Record<string, boolean>>({});
   const [codexQuotaData, setCodexQuotaData] = useState<Record<string, CodexQuotaData>>({});
@@ -119,6 +126,7 @@ export function Accounts() {
 
   useEffect(() => {
     fetchAccounts();
+    loadCachedQuotas();
 
     // Poll for account changes when login is in progress
     let interval: ReturnType<typeof setInterval> | null = null;
@@ -130,45 +138,62 @@ export function Accounts() {
     };
   }, [loginInProgress]);
 
-  // Auto-fetch quota for Antigravity accounts when accounts change
+  // Auto-refresh quotas based on settings
   useEffect(() => {
-    const antigravityAccounts = accounts.filter(a => a.provider === "antigravity");
-    for (const account of antigravityAccounts) {
-      if (!quotaData[account.id] && !quotaLoading[account.id]) {
-        fetchQuota(account.id);
-      }
-    }
-  }, [accounts]);
+    let quotaInterval: ReturnType<typeof setInterval> | null = null;
 
-  // Auto-fetch quota for Codex accounts when accounts change
-  useEffect(() => {
-    const codexAccounts = accounts.filter(a => a.provider === "openai" || a.provider === "codex");
-    for (const account of codexAccounts) {
-      if (!codexQuotaData[account.id] && !codexQuotaLoading[account.id]) {
-        fetchCodexQuota(account.id);
-      }
-    }
-  }, [accounts]);
+    async function setupAutoRefresh() {
+      try {
+        const settings = await invoke<{ quota_refresh_interval: number; token_refresh_interval: number }>("get_settings");
+        const intervalMs = settings.quota_refresh_interval * 60 * 1000;
 
-  // Auto-fetch quota for Gemini accounts when accounts change
-  useEffect(() => {
-    const geminiAccounts = accounts.filter(a => a.provider === "gemini" || a.provider === "google");
-    for (const account of geminiAccounts) {
-      if (!geminiQuotaData[account.id] && !geminiQuotaLoading[account.id]) {
-        fetchGeminiQuota(account.id);
-      }
-    }
-  }, [accounts]);
+        // Set up interval for auto-refresh
+        quotaInterval = setInterval(() => {
+          if (accounts.length > 0) {
+            console.log("Auto-refreshing quotas...");
+            refreshAllQuotas();
+          }
+        }, intervalMs);
 
-  // Auto-fetch quota for Kiro accounts when accounts change
-  useEffect(() => {
-    const kiroAccounts = accounts.filter(a => a.provider === "kiro");
-    for (const account of kiroAccounts) {
-      if (!kiroQuotaData[account.id] && !kiroQuotaLoading[account.id]) {
-        fetchKiroQuota(account.id);
+        console.log(`Auto-refresh set to ${settings.quota_refresh_interval} minutes`);
+      } catch (error) {
+        console.error("Failed to get settings for auto-refresh:", error);
       }
     }
-  }, [accounts]);
+
+    if (accounts.length > 0) {
+      setupAutoRefresh();
+    }
+
+    return () => {
+      if (quotaInterval) clearInterval(quotaInterval);
+    };
+  }, [accounts.length]);
+
+  // Load cached quotas from SQLite on startup
+  async function loadCachedQuotas() {
+    try {
+      const cached = await invoke<Record<string, CachedQuota>>("get_cached_quotas");
+      for (const [accountId, cache] of Object.entries(cached)) {
+        try {
+          const data = JSON.parse(cache.quota_data);
+          if (cache.provider === "antigravity") {
+            setQuotaData(prev => ({ ...prev, [accountId]: data }));
+          } else if (cache.provider === "codex") {
+            setCodexQuotaData(prev => ({ ...prev, [accountId]: data }));
+          } else if (cache.provider === "gemini") {
+            setGeminiQuotaData(prev => ({ ...prev, [accountId]: data }));
+          } else if (cache.provider === "kiro") {
+            setKiroQuotaData(prev => ({ ...prev, [accountId]: data }));
+          }
+        } catch (e) {
+          console.error("Failed to parse cached quota for", accountId, e);
+        }
+      }
+    } catch (error) {
+      console.error("Failed to load cached quotas:", error);
+    }
+  }
 
   async function fetchAccounts() {
     try {
@@ -436,13 +461,13 @@ export function Accounts() {
   }
 
   function getQuotaColor(percentage: number): string {
-    if (percentage >= 50) return "bg-emerald-500";
+    if (percentage >= 50) return "bg-blue-500";
     if (percentage >= 20) return "bg-amber-500";
     return "bg-red-500";
   }
 
   function getQuotaTextColor(percentage: number): string {
-    if (percentage >= 50) return "text-emerald-600 dark:text-emerald-400";
+    if (percentage >= 50) return "text-blue-600 dark:text-blue-400";
     if (percentage >= 20) return "text-amber-600 dark:text-amber-400";
     return "text-red-600 dark:text-red-400";
   }
@@ -450,7 +475,7 @@ export function Accounts() {
   // For Codex, the API returns "used" percentage, so lower remaining = worse
   function getCodexUsageColor(usedPercent: number): string {
     const remaining = 100 - usedPercent;
-    if (remaining >= 50) return "text-emerald-600 dark:text-emerald-400";
+    if (remaining >= 50) return "text-blue-600 dark:text-blue-400";
     if (remaining >= 20) return "text-amber-600 dark:text-amber-400";
     return "text-red-600 dark:text-red-400";
   }
@@ -570,8 +595,8 @@ export function Accounts() {
         {/* Header */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-lg bg-emerald-100 flex items-center justify-center">
-              <svg className="w-5 h-5 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <div className="w-10 h-10 rounded-lg bg-blue-100 flex items-center justify-center">
+              <svg className="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m13.5-9a2.5 2.5 0 11-5 0 2.5 2.5 0 015 0z" />
               </svg>
             </div>
@@ -588,7 +613,7 @@ export function Accounts() {
               <button
                 onClick={() => setShowAddMenu(!showAddMenu)}
                 disabled={loginInProgress !== null}
-                className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-medium flex items-center gap-2 disabled:opacity-50"
+                className="px-4 py-2 rounded-lg bg-blue-500 hover:bg-blue-600 text-white text-sm font-medium flex items-center gap-2 disabled:opacity-50"
               >
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
@@ -650,7 +675,7 @@ export function Accounts() {
             <div className="flex border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
               <button
                 onClick={() => setViewMode("list")}
-                className={`p-2 ${viewMode === "list" ? "bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600" : "hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-500"}`}
+                className={`p-2 ${viewMode === "list" ? "bg-blue-100 dark:bg-blue-900/30 text-blue-600" : "hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-500"}`}
                 title="列表视图"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -659,7 +684,7 @@ export function Accounts() {
               </button>
               <button
                 onClick={() => setViewMode("card")}
-                className={`p-2 ${viewMode === "card" ? "bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600" : "hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-500"}`}
+                className={`p-2 ${viewMode === "card" ? "bg-blue-100 dark:bg-blue-900/30 text-blue-600" : "hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-500"}`}
                 title="卡片视图"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -678,15 +703,15 @@ export function Accounts() {
                 type="checkbox"
                 checked={allSelected}
                 onChange={toggleSelectAll}
-                className="w-4 h-4 rounded border-gray-300 text-emerald-500 focus:ring-emerald-500"
+                className="w-4 h-4 rounded border-gray-300 text-blue-500 focus:ring-blue-500"
               />
-              <span className="text-sm text-emerald-600 dark:text-emerald-400">全选</span>
+              <span className="text-sm text-blue-600 dark:text-blue-400">全选</span>
             </label>
             {selectedIds.size > 0 && (
               <div className="flex items-center gap-2">
                 <button
                   onClick={handleBatchEnable}
-                  className="px-3 py-1 text-xs rounded-lg bg-emerald-100 text-emerald-700 hover:bg-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/50"
+                  className="px-3 py-1 text-xs rounded-lg bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/30 dark:text-blue-400 dark:hover:bg-blue-900/50"
                 >
                   批量启用 ({selectedIds.size})
                 </button>
@@ -699,7 +724,7 @@ export function Accounts() {
               </div>
             )}
           </div>
-          <span className="text-sm text-emerald-600 dark:text-emerald-400">
+          <span className="text-sm text-blue-600 dark:text-blue-400">
             共 {filteredAccounts.length} 个账号
           </span>
         </div>
@@ -708,13 +733,13 @@ export function Accounts() {
         {viewMode === "list" && (
           <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-x-auto">
             <table className="w-full min-w-[600px]">
-              <thead className="bg-emerald-50 dark:bg-emerald-900/20">
+              <thead className="bg-blue-50 dark:bg-blue-900/20">
                 <tr>
                   <th className="w-10 px-3 py-3"></th>
                   <th className="w-56 px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">邮箱</th>
-                  <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">模型配额</th>
-                  <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">状态</th>
-                  <th className="px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">操作</th>
+                  <th className="w-[500px] px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">模型配额</th>
+                  <th className="w-20 px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">状态</th>
+                  <th className="w-32 px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">操作</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100 dark:divide-gray-700">
@@ -752,7 +777,7 @@ export function Accounts() {
                             type="checkbox"
                             checked={selectedIds.has(account.id)}
                             onChange={() => toggleSelect(account.id)}
-                            className="w-4 h-4 rounded border-gray-300 text-emerald-500 focus:ring-emerald-500"
+                            className="w-4 h-4 rounded border-gray-300 text-blue-500 focus:ring-blue-500"
                           />
                         </td>
                         <td className="px-3 py-3 w-56 max-w-56">
@@ -795,14 +820,14 @@ export function Accounts() {
                             )}
                           </div>
                         </td>
-                        <td className="px-3 py-3">
+                        <td className="px-3 py-3 w-[500px]">
                           {isAntigravity ? (
                             isLoadingQuota ? (
-                              <span className="text-xs text-gray-400">加载中...</span>
+                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">加载中...</span></div>
                             ) : quota?.is_forbidden ? (
-                              <span className="text-xs text-red-500">已禁用</span>
+                              <div className="h-10 flex items-center"><span className="text-xs text-red-500">已禁用</span></div>
                             ) : quota ? (
-                              <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                              <div className="grid grid-cols-2 gap-x-4 gap-y-1 min-h-10">
                                 {getKeyModels(quota.models).map((model) => (
                                   <div key={model.name} className="flex items-center gap-1 text-xs whitespace-nowrap">
                                     <span className="text-gray-600 dark:text-gray-400 font-medium w-16">{getModelDisplayName(model.name)}</span>
@@ -821,15 +846,15 @@ export function Accounts() {
                                 ))}
                               </div>
                             ) : (
-                              <span className="text-xs text-gray-400">-</span>
+                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">-</span></div>
                             )
                           ) : isCodex ? (
                             isLoadingCodexQuota ? (
-                              <span className="text-xs text-gray-400">加载中...</span>
+                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">加载中...</span></div>
                             ) : codexQuota?.is_error ? (
-                              <span className="text-xs text-red-500">{codexQuota.error_message || "错误"}</span>
+                              <div className="h-10 flex items-center"><span className="text-xs text-red-500">{codexQuota.error_message || "错误"}</span></div>
                             ) : codexQuota ? (
-                              <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                              <div className="grid grid-cols-2 gap-x-4 gap-y-1 min-h-10">
                                 <div className="flex items-center gap-1 text-xs whitespace-nowrap">
                                   <span className="text-gray-600 dark:text-gray-400 font-medium w-16">5小时</span>
                                   {codexQuota.primary_resets_at && (
@@ -860,15 +885,15 @@ export function Accounts() {
                                 </div>
                               </div>
                             ) : (
-                              <span className="text-xs text-gray-400">-</span>
+                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">-</span></div>
                             )
                           ) : isGemini ? (
                             isLoadingGeminiQuota ? (
-                              <span className="text-xs text-gray-400">加载中...</span>
+                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">加载中...</span></div>
                             ) : geminiQuota?.is_error ? (
-                              <span className="text-xs text-red-500">{geminiQuota.error_message || "错误"}</span>
+                              <div className="h-10 flex items-center"><span className="text-xs text-red-500">{geminiQuota.error_message || "错误"}</span></div>
                             ) : geminiQuota ? (
-                              <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                              <div className="grid grid-cols-2 gap-x-4 gap-y-1 min-h-10">
                                 {getKeyGeminiModels(geminiQuota.models).map((model) => (
                                   <div key={model.model_id} className="flex items-center gap-1 text-xs whitespace-nowrap">
                                     <span className="text-gray-600 dark:text-gray-400 font-medium w-16">{getModelDisplayName(model.model_id)}</span>
@@ -887,13 +912,13 @@ export function Accounts() {
                                 ))}
                               </div>
                             ) : (
-                              <span className="text-xs text-gray-400">-</span>
+                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">-</span></div>
                             )
                           ) : isKiro ? (
                             isLoadingKiroQuota ? (
-                              <span className="text-xs text-gray-400">加载中...</span>
+                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">加载中...</span></div>
                             ) : kiroQuota?.is_error ? (
-                              <span className="text-xs text-red-500">{kiroQuota.error_message || "错误"}</span>
+                              <div className="h-10 flex items-center"><span className="text-xs text-red-500">{kiroQuota.error_message || "错误"}</span></div>
                             ) : kiroQuota ? (
                               (() => {
                                 const baseLimit = kiroQuota.usage_limit ?? 0;
@@ -905,24 +930,24 @@ export function Accounts() {
                                 const remaining = totalLimit - totalUsage;
                                 const remainingPercent = totalLimit > 0 ? Math.round((remaining / totalLimit) * 100) : 0;
                                 return totalLimit > 0 ? (
-                                  <div className="flex items-center gap-2 text-xs">
+                                  <div className="h-10 flex items-center gap-2 text-xs">
                                     <span className={`font-medium ${getQuotaTextColor(remainingPercent)}`}>
                                       {totalUsage}/{totalLimit} ({remainingPercent}%)
                                     </span>
                                   </div>
-                                ) : null;
+                                ) : <div className="h-10"></div>;
                               })()
                             ) : (
-                              <span className="text-xs text-gray-400">-</span>
+                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">-</span></div>
                             )
                           ) : (
-                            <span className="text-xs text-gray-400">-</span>
+                            <div className="h-10 flex items-center"><span className="text-xs text-gray-400">-</span></div>
                           )}
                         </td>
                         <td className="px-3 py-3">
                           <span className={`inline-block px-2 py-1 text-xs rounded ${
                             account.enabled
-                              ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300"
+                              ? "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300"
                               : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
                           }`}>
                             {account.enabled ? "正常" : "禁用"}
@@ -934,7 +959,7 @@ export function Accounts() {
                               <button
                                 onClick={() => fetchQuota(account.id)}
                                 disabled={isLoadingQuota}
-                                className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                                className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                                 title="刷新额度"
                               >
                                 <svg className={`w-4 h-4 ${isLoadingQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -946,7 +971,7 @@ export function Accounts() {
                               <button
                                 onClick={() => fetchCodexQuota(account.id)}
                                 disabled={isLoadingCodexQuota}
-                                className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingCodexQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                                className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingCodexQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                                 title="刷新额度"
                               >
                                 <svg className={`w-4 h-4 ${isLoadingCodexQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -958,7 +983,7 @@ export function Accounts() {
                               <button
                                 onClick={() => fetchGeminiQuota(account.id)}
                                 disabled={isLoadingGeminiQuota}
-                                className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingGeminiQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                                className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingGeminiQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                                 title="刷新额度"
                               >
                                 <svg className={`w-4 h-4 ${isLoadingGeminiQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -970,7 +995,7 @@ export function Accounts() {
                               <button
                                 onClick={() => fetchKiroQuota(account.id)}
                                 disabled={isLoadingKiroQuota}
-                                className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingKiroQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                                className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingKiroQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                                 title="刷新额度"
                               >
                                 <svg className={`w-4 h-4 ${isLoadingKiroQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -983,7 +1008,7 @@ export function Accounts() {
                               className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${
                                 account.enabled
                                   ? "text-gray-400 hover:text-orange-500"
-                                  : "text-emerald-500 hover:text-emerald-600"
+                                  : "text-blue-500 hover:text-blue-600"
                               }`}
                               title={account.enabled ? "禁用账号" : "启用账号"}
                             >
@@ -1047,7 +1072,7 @@ export function Accounts() {
                       key={account.id}
                       className={`bg-white dark:bg-gray-800 rounded-lg shadow p-4 border-2 transition-colors ${
                         selectedIds.has(account.id)
-                          ? "border-emerald-500"
+                          ? "border-blue-500"
                           : "border-transparent hover:border-gray-200 dark:hover:border-gray-700"
                       }`}
                     >
@@ -1057,7 +1082,7 @@ export function Accounts() {
                             type="checkbox"
                             checked={selectedIds.has(account.id)}
                             onChange={() => toggleSelect(account.id)}
-                            className="w-4 h-4 rounded border-gray-300 text-emerald-500 focus:ring-emerald-500"
+                            className="w-4 h-4 rounded border-gray-300 text-blue-500 focus:ring-blue-500"
                           />
                         </div>
                         <div className="flex items-center gap-2">
@@ -1320,7 +1345,7 @@ export function Accounts() {
                       <div className="mt-4 flex items-center justify-between">
                         <span className={`inline-block px-2 py-1 text-xs rounded ${
                           account.enabled
-                            ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300"
+                            ? "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300"
                             : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
                         }`}>
                           {account.enabled ? "正常" : "禁用"}
@@ -1330,7 +1355,7 @@ export function Accounts() {
                             <button
                               onClick={() => fetchQuota(account.id)}
                               disabled={isLoadingQuota}
-                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                               title="刷新额度"
                             >
                               <svg className={`w-4 h-4 ${isLoadingQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1342,7 +1367,7 @@ export function Accounts() {
                             <button
                               onClick={() => fetchCodexQuota(account.id)}
                               disabled={isLoadingCodexQuota}
-                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingCodexQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingCodexQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                               title="刷新额度"
                             >
                               <svg className={`w-4 h-4 ${isLoadingCodexQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1354,7 +1379,7 @@ export function Accounts() {
                             <button
                               onClick={() => fetchGeminiQuota(account.id)}
                               disabled={isLoadingGeminiQuota}
-                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingGeminiQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingGeminiQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                               title="刷新额度"
                             >
                               <svg className={`w-4 h-4 ${isLoadingGeminiQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1366,7 +1391,7 @@ export function Accounts() {
                             <button
                               onClick={() => fetchKiroQuota(account.id)}
                               disabled={isLoadingKiroQuota}
-                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingKiroQuota ? "text-gray-300" : "text-gray-400 hover:text-emerald-500"}`}
+                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingKiroQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                               title="刷新额度"
                             >
                               <svg className={`w-4 h-4 ${isLoadingKiroQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1379,7 +1404,7 @@ export function Accounts() {
                             className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${
                               account.enabled
                                 ? "text-gray-400 hover:text-orange-500"
-                                : "text-emerald-500 hover:text-emerald-600"
+                                : "text-blue-500 hover:text-blue-600"
                             }`}
                             title={account.enabled ? "禁用账号" : "启用账号"}
                           >

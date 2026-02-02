@@ -182,7 +182,7 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
             <span className="text-lg font-semibold text-gray-800 dark:text-white">服务配置</span>
             <span className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
               <span className={`w-2 h-2 rounded-full ${serverStatus.running ? "bg-green-500" : "bg-gray-400"}`} />
-              {serverStatus.running ? "服务运行中" : "服务已停止"}
+              {serverStatus.running ? `服务运行中 :${serverStatus.port}` : "服务已停止"}
             </span>
           </div>
           <button
