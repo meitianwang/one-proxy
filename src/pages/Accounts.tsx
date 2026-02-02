@@ -215,16 +215,33 @@ export function Accounts() {
   async function fetchAccounts() {
     try {
       setLoading(true);
+      const prevIds = new Set(accounts.map((account) => account.id));
       const result = await invoke<AuthAccount[]>("get_auth_accounts");
       console.log("Fetched accounts:", result);
       console.log("Account count:", result.length);
 
       // If we were waiting for login and got new accounts, stop polling
-      if (loginInProgress && result.length > accounts.length) {
+      const newAccounts = result.filter((account) => !prevIds.has(account.id));
+      if (loginInProgress && newAccounts.length > 0) {
         setLoginInProgress(null);
       }
 
       setAccounts(result);
+      if (newAccounts.length > 0) {
+        // Pull cached quota (if backend already fetched) and refresh quotas for new accounts.
+        loadCachedQuotas();
+        for (const account of newAccounts) {
+          if (account.provider === "antigravity") {
+            fetchQuota(account.id);
+          } else if (account.provider === "openai" || account.provider === "codex") {
+            fetchCodexQuota(account.id);
+          } else if (account.provider === "gemini" || account.provider === "google") {
+            fetchGeminiQuota(account.id);
+          } else if (account.provider === "kiro") {
+            fetchKiroQuota(account.id);
+          }
+        }
+      }
     } catch (error) {
       console.error("Failed to fetch accounts:", error);
     } finally {
