@@ -274,6 +274,39 @@ pub fn openai_to_gemini_messages(messages: &[super::handlers::ChatMessage]) -> V
 
 const GEMINI_CLI_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
 
+fn normalize_thinking_level_for_model(model: &str, level: &str) -> Option<String> {
+    let mut normalized = level.trim().to_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let model_lower = model.to_lowercase();
+    if model_lower.starts_with("gemini-3-pro-high")
+        || model_lower.starts_with("gemini-3-pro-image")
+    {
+        let mapped = match normalized.as_str() {
+            "minimal" | "low" => "low",
+            "medium" | "high" | "xhigh" => "high",
+            "none" => "none",
+            _ => return None,
+        };
+        return Some(mapped.to_string());
+    }
+
+    if model_lower.starts_with("gemini-3-flash") {
+        if normalized == "xhigh" {
+            normalized = "high".to_string();
+        }
+        return match normalized.as_str() {
+            "minimal" | "low" | "medium" | "high" | "none" => Some(normalized),
+            _ => None,
+        };
+    }
+
+    // Other models do not support thinkingLevel (budget-only or unsupported)
+    None
+}
+
 pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
     let mut request = serde_json::Map::new();
     let mut generation_config = serde_json::Map::new();
@@ -286,10 +319,19 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                 thinking_config.insert("thinkingBudget".to_string(), json!(-1));
                 thinking_config.insert("includeThoughts".to_string(), json!(true));
             } else {
-                thinking_config.insert("thinkingLevel".to_string(), json!(effort));
-                thinking_config.insert("includeThoughts".to_string(), json!(effort != "none"));
+                let normalized = normalize_thinking_level_for_model(model, &effort);
+                if let Some(level) = normalized {
+                    if level != "none" {
+                        thinking_config.insert("thinkingLevel".to_string(), json!(level));
+                        thinking_config.insert("includeThoughts".to_string(), json!(true));
+                    } else {
+                        thinking_config.insert("includeThoughts".to_string(), json!(false));
+                    }
+                }
             }
-            generation_config.insert("thinkingConfig".to_string(), Value::Object(thinking_config));
+            if !thinking_config.is_empty() {
+                generation_config.insert("thinkingConfig".to_string(), Value::Object(thinking_config));
+            }
         }
     }
 

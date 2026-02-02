@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 const CLAUDE_API_BASE: &str = "https://api.anthropic.com/v1";
 
@@ -528,7 +529,7 @@ pub fn claude_request_to_openai_chat(
 
     let model_lower = model.to_lowercase();
     let supports_thinking = model_lower.contains("-thinking") || model_lower.starts_with("claude-");
-    let allow_thinking_map = !guard_thinking || supports_thinking;
+    let allow_thinking_map = !guard_thinking;
     if guard_thinking {
         tracing::info!(
             "[Claude->OpenAI] guard_thinking enabled | model={} | supports_thinking={}",
@@ -616,12 +617,20 @@ pub fn claude_request_to_openai_chat(
                         }
                         "tool_use" => {
                             if role == "assistant" {
-                                let id = part.get("id").and_then(|v| v.as_str()).unwrap_or("");
                                 let name = part.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                if name.is_empty() {
+                                    continue;
+                                }
+                                let id = part.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                let tool_id = if id.is_empty() {
+                                    format!("toolu_{}", Uuid::new_v4())
+                                } else {
+                                    id.to_string()
+                                };
                                 let input = part.get("input").cloned().unwrap_or_else(|| json!({}));
                                 let args = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
                                 tool_calls.push(json!({
-                                    "id": id,
+                                    "id": tool_id,
                                     "type": "function",
                                     "function": {
                                         "name": name,
@@ -632,6 +641,9 @@ pub fn claude_request_to_openai_chat(
                         }
                         "tool_result" => {
                             let tool_call_id = part.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
+                            if tool_call_id.is_empty() {
+                                continue;
+                            }
                             let tool_content = part.get("content").unwrap_or(&Value::Null);
                             let content_str = convert_claude_tool_result_content_to_string(tool_content);
                             tool_results.push(json!({
@@ -889,21 +901,25 @@ pub fn openai_to_claude_response_with_options(
 }
 
 fn convert_openai_tool_call(tool_call: &Value) -> Option<Value> {
-    let id = tool_call.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let name = tool_call
         .get("function")
         .and_then(|v| v.get("name"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    if name.is_empty() {
+        return None;
+    }
+    let id = tool_call.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let tool_id = if id.is_empty() {
+        format!("toolu_{}", Uuid::new_v4())
+    } else {
+        id.to_string()
+    };
     let args = tool_call
         .get("function")
         .and_then(|v| v.get("arguments"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-
-    if id.is_empty() && name.is_empty() {
-        return None;
-    }
 
     let input = if !args.is_empty() {
         serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}))
@@ -913,7 +929,7 @@ fn convert_openai_tool_call(tool_call: &Value) -> Option<Value> {
 
     Some(json!({
         "type": "tool_use",
-        "id": id,
+        "id": tool_id,
         "name": name,
         "input": input
     }))

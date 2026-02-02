@@ -138,6 +138,7 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
     if has_antigravity {
         let base = get_antigravity_models();
         models.extend(build_prefixed_models("antigravity", &base));
+        models.extend(build_antigravity_models_with_reasoning(&base));
     }
 
     // Add Claude models if available
@@ -269,6 +270,24 @@ fn build_codex_models_with_reasoning(base: &[ModelInfo]) -> Vec<ModelInfo> {
     models
 }
 
+/// Build Antigravity models with thinking-level variants
+fn build_antigravity_models_with_reasoning(base: &[ModelInfo]) -> Vec<ModelInfo> {
+    let mut models = Vec::new();
+    for m in base {
+        if let Some(levels) = antigravity_supported_levels(&m.id) {
+            for effort in levels {
+                models.push(ModelInfo {
+                    id: format!("antigravity/{}/{}", effort, m.id),
+                    object: m.object.clone(),
+                    created: m.created,
+                    owned_by: m.owned_by.clone(),
+                });
+            }
+        }
+    }
+    models
+}
+
 /// Parse Codex model name with reasoning_effort
 /// e.g. "codex/high/gpt-5-codex" -> ("gpt-5-codex", Some("high"))
 fn parse_codex_model_with_effort(model: &str) -> (String, Option<String>) {
@@ -281,6 +300,42 @@ fn parse_codex_model_with_effort(model: &str) -> (String, Option<String>) {
         }
     }
     (model.to_string(), None)
+}
+
+/// Parse Antigravity model name with thinking level
+/// e.g. "high/gemini-3-pro-high" -> ("gemini-3-pro-high", Some("high"))
+fn parse_antigravity_model_with_effort(model: &str) -> (String, Option<String>) {
+    let efforts = ["none", "auto", "minimal", "low", "medium", "high", "xhigh"];
+    let parts: Vec<&str> = model.splitn(2, '/').collect();
+    if parts.len() == 2 {
+        let potential_effort = parts[0];
+        if efforts.contains(&potential_effort) {
+            return (parts[1].to_string(), Some(potential_effort.to_string()));
+        }
+    }
+    (model.to_string(), None)
+}
+
+fn antigravity_supported_levels(model: &str) -> Option<&'static [&'static str]> {
+    let lower = model.to_lowercase();
+    if lower.starts_with("gemini-3-pro-high") || lower.starts_with("gemini-3-pro-image") {
+        return Some(&["low", "high"]);
+    }
+    if lower.starts_with("gemini-3-flash") {
+        return Some(&["minimal", "low", "medium", "high"]);
+    }
+    None
+}
+
+fn antigravity_level_supported(model: &str, level: &str) -> bool {
+    let level = level.trim().to_lowercase();
+    if level == "none" || level == "auto" {
+        return antigravity_supported_levels(model).is_some();
+    }
+    if let Some(levels) = antigravity_supported_levels(model) {
+        return levels.iter().any(|l| *l == level);
+    }
+    false
 }
 
 /// Get static Gemini model definitions
@@ -671,6 +726,11 @@ struct ClaudeStreamState {
     text_started: bool,
     finish_reason: Option<String>,
     tool_calls: HashMap<i32, ToolCallAccumulator>,
+    tool_call_block_index: HashMap<i32, i32>,
+    thinking_index: Option<i32>,
+    text_index: Option<i32>,
+    next_block_index: i32,
+    block_types: HashMap<i32, &'static str>,
 }
 
 fn map_openai_finish_reason(reason: Option<&str>) -> Option<&'static str> {
@@ -692,6 +752,12 @@ fn openai_chunk_to_claude_events(
     state: &mut ClaudeStreamState,
     reasoning_as_text: bool,
 ) -> Vec<Event> {
+    fn alloc_block_index(state: &mut ClaudeStreamState) -> i32 {
+        let idx = state.next_block_index;
+        state.next_block_index += 1;
+        idx
+    }
+
     let mut events = Vec::new();
     let parsed: Value = match serde_json::from_str(chunk) {
         Ok(v) => v,
@@ -754,15 +820,30 @@ fn openai_chunk_to_claude_events(
                 }
                 // Close thinking block before starting text block
                 if state.thinking_started && !state.thinking_closed {
+                    let thinking_index = state.thinking_index.unwrap_or(0);
                     let stop_payload = json!({
                         "type": "content_block_stop",
-                        "index": 0
+                        "index": thinking_index
                     });
                     events.push(build_claude_event("content_block_stop", stop_payload));
                     state.thinking_closed = true;
                 }
 
-                let text_index = if state.thinking_started { 1 } else { 0 };
+                if let Some(idx) = state.text_index {
+                    if state.block_types.get(&idx).copied() != Some("text") {
+                        state.text_index = None;
+                        state.text_started = false;
+                    }
+                }
+
+                let text_index = match state.text_index {
+                    Some(idx) => idx,
+                    None => {
+                        let idx = alloc_block_index(state);
+                        state.text_index = Some(idx);
+                        idx
+                    }
+                };
                 if !state.text_started {
                     let payload = json!({
                         "type": "content_block_start",
@@ -773,6 +854,7 @@ fn openai_chunk_to_claude_events(
                         }
                     });
                     events.push(build_claude_event("content_block_start", payload));
+                    state.block_types.insert(text_index, "text");
                     state.text_started = true;
                 }
                 let payload = json!({
@@ -793,10 +875,21 @@ fn openai_chunk_to_claude_events(
                     if reasoning_as_text {
                         emit_text(reasoning, state, &mut events);
                     } else if !state.thinking_closed {
+                        if let Some(idx) = state.thinking_index {
+                            if state.block_types.get(&idx).copied() != Some("thinking") {
+                                state.thinking_index = None;
+                                state.thinking_started = false;
+                            }
+                        }
                         if !state.thinking_started {
+                            let thinking_index = state.thinking_index.unwrap_or_else(|| {
+                                let idx = alloc_block_index(state);
+                                state.thinking_index = Some(idx);
+                                idx
+                            });
                             let payload = json!({
                                 "type": "content_block_start",
-                                "index": 0,
+                                "index": thinking_index,
                                 "content_block": {
                                     "type": "thinking",
                                     "thinking": "",
@@ -804,11 +897,13 @@ fn openai_chunk_to_claude_events(
                                 }
                             });
                             events.push(build_claude_event("content_block_start", payload));
+                            state.block_types.insert(thinking_index, "thinking");
                             state.thinking_started = true;
                         }
+                        let thinking_index = state.thinking_index.unwrap_or(0);
                         let payload = json!({
                             "type": "content_block_delta",
-                            "index": 0,
+                            "index": thinking_index,
                             "delta": {
                                 "type": "thinking_delta",
                                 "thinking": reasoning
@@ -830,6 +925,14 @@ fn openai_chunk_to_claude_events(
                         .get("index")
                         .and_then(|v| v.as_i64())
                         .unwrap_or(0) as i32;
+                    let block_index = match state.tool_call_block_index.get(&index) {
+                        Some(idx) => *idx,
+                        None => {
+                            let idx = alloc_block_index(state);
+                            state.tool_call_block_index.insert(index, idx);
+                            idx
+                        }
+                    };
                     let entry = state.tool_calls.entry(index).or_default();
 
                     if let Some(id) = tool_call.get("id").and_then(|v| v.as_str()) {
@@ -854,18 +957,19 @@ fn openai_chunk_to_claude_events(
 
                     if !entry.started && !entry.name.is_empty() {
                         if state.text_started {
-                            let text_index = if state.thinking_started { 1 } else { 0 };
+                            let text_index = state.text_index.unwrap_or(0);
                             let stop_payload = json!({
                                 "type": "content_block_stop",
                                 "index": text_index
                             });
                             events.push(build_claude_event("content_block_stop", stop_payload));
                             state.text_started = false;
+                            state.text_index = None;
                         }
 
                         let payload = json!({
                             "type": "content_block_start",
-                            "index": index,
+                            "index": block_index,
                             "content_block": {
                                 "type": "tool_use",
                                 "id": entry.id,
@@ -874,6 +978,7 @@ fn openai_chunk_to_claude_events(
                             }
                         });
                         events.push(build_claude_event("content_block_start", payload));
+                        state.block_types.insert(block_index, "tool_use");
                         entry.started = true;
                     }
                 }
@@ -889,18 +994,19 @@ fn finalize_claude_stream(state: &mut ClaudeStreamState) -> Vec<Event> {
 
     // Close thinking block if it was started but not yet closed
     if state.thinking_started && !state.thinking_closed {
+        let thinking_index = state.thinking_index.unwrap_or(0);
         events.push(build_claude_event(
             "content_block_stop",
             json!({
                 "type": "content_block_stop",
-                "index": 0
+                "index": thinking_index
             }),
         ));
     }
 
     // Close text block
     if state.text_started {
-        let text_index = if state.thinking_started { 1 } else { 0 };
+        let text_index = state.text_index.unwrap_or(0);
         events.push(build_claude_event(
             "content_block_stop",
             json!({
@@ -910,10 +1016,14 @@ fn finalize_claude_stream(state: &mut ClaudeStreamState) -> Vec<Event> {
         ));
     }
 
-    let mut tool_indexes: Vec<i32> = state.tool_calls.keys().copied().collect();
-    tool_indexes.sort_unstable();
-    for index in tool_indexes {
-        if let Some(tool_call) = state.tool_calls.get(&index) {
+    let mut tool_blocks: Vec<(i32, &ToolCallAccumulator)> = Vec::new();
+    for (tool_index, tool_call) in &state.tool_calls {
+        if let Some(block_index) = state.tool_call_block_index.get(tool_index) {
+            tool_blocks.push((*block_index, tool_call));
+        }
+    }
+    tool_blocks.sort_by_key(|(index, _)| *index);
+    for (block_index, tool_call) in tool_blocks {
             let args = if tool_call.arguments.trim().is_empty() {
                 "{}".to_string()
             } else {
@@ -921,7 +1031,7 @@ fn finalize_claude_stream(state: &mut ClaudeStreamState) -> Vec<Event> {
             };
             let input_delta = json!({
                 "type": "content_block_delta",
-                "index": index,
+                "index": block_index,
                 "delta": {
                     "type": "input_json_delta",
                     "partial_json": args
@@ -930,10 +1040,9 @@ fn finalize_claude_stream(state: &mut ClaudeStreamState) -> Vec<Event> {
             events.push(build_claude_event("content_block_delta", input_delta));
             let stop_payload = json!({
                 "type": "content_block_stop",
-                "index": index
+                "index": block_index
             });
             events.push(build_claude_event("content_block_stop", stop_payload));
-        }
     }
 
     let stop_reason = map_openai_finish_reason(state.finish_reason.as_deref());
@@ -2211,7 +2320,29 @@ pub async fn chat_completions(
     }
 
     if provider_override.as_deref() == Some("antigravity") {
-        let auths = get_antigravity_auths(&model).await;
+        let (actual_model, reasoning_effort) = parse_antigravity_model_with_effort(&model);
+        let mut openai_raw = raw.clone();
+        if let Some(ref effort) = reasoning_effort {
+            if !antigravity_level_supported(&actual_model, effort) {
+                let supported = antigravity_supported_levels(&actual_model)
+                    .map(|levels| levels.join(", "))
+                    .unwrap_or_else(|| "none".to_string());
+                return Json(json!({
+                    "error": {
+                        "message": format!(
+                            "Thinking level '{}' is not supported by model '{}'. Supported levels: {}. Remove the level prefix to use the default behavior.",
+                            effort, actual_model, supported
+                        ),
+                        "type": "invalid_request_error",
+                        "code": 400
+                    }
+                }))
+                .into_response();
+            }
+            openai_raw["reasoning_effort"] = json!(effort);
+        }
+
+        let auths = get_antigravity_auths(&actual_model).await;
         if auths.is_empty() {
             return Json(json!({
                 "error": {
@@ -2232,7 +2363,7 @@ pub async fn chat_completions(
             } = auth;
             let client = AntigravityClient::new(access_token);
             let antigravity_request =
-                antigravity::openai_to_antigravity_request(&raw, &model, project_id);
+                antigravity::openai_to_antigravity_request(&openai_raw, &actual_model, project_id);
 
             if is_stream {
                 match client.stream_generate_content(&antigravity_request, None).await {
@@ -2259,12 +2390,12 @@ pub async fn chat_completions(
                 }
             }
 
-            if antigravity::should_use_stream_for_non_stream(&model) {
+            if antigravity::should_use_stream_for_non_stream(&actual_model) {
                 match client.stream_generate_content(&antigravity_request, None).await {
                     Ok(response) => match antigravity::collect_antigravity_stream(response).await {
                         Ok(payload) => {
                             let openai_response =
-                                gemini::gemini_to_openai_response(&payload, &model, &request_id);
+                                gemini::gemini_to_openai_response(&payload, &actual_model, &request_id);
                             return Json(openai_response).into_response();
                         }
                         Err(e) => {
@@ -2301,7 +2432,7 @@ pub async fn chat_completions(
             match client.generate_content(&antigravity_request, None).await {
                 Ok(response) => {
                     let openai_response =
-                        gemini::gemini_to_openai_response(&response, &model, &request_id);
+                        gemini::gemini_to_openai_response(&response, &actual_model, &request_id);
                     return Json(openai_response).into_response();
                 }
                 Err(e) => {
@@ -2956,7 +3087,29 @@ pub async fn completions(
     }
 
     if provider_override.as_deref() == Some("antigravity") {
-        let auths = get_antigravity_auths(&model).await;
+        let (actual_model, reasoning_effort) = parse_antigravity_model_with_effort(&model);
+        let mut openai_raw = chat_request.clone();
+        if let Some(ref effort) = reasoning_effort {
+            if !antigravity_level_supported(&actual_model, effort) {
+                let supported = antigravity_supported_levels(&actual_model)
+                    .map(|levels| levels.join(", "))
+                    .unwrap_or_else(|| "none".to_string());
+                return Json(json!({
+                    "error": {
+                        "message": format!(
+                            "Thinking level '{}' is not supported by model '{}'. Supported levels: {}. Remove the level prefix to use the default behavior.",
+                            effort, actual_model, supported
+                        ),
+                        "type": "invalid_request_error",
+                        "code": 400
+                    }
+                }))
+                .into_response();
+            }
+            openai_raw["reasoning_effort"] = json!(effort);
+        }
+
+        let auths = get_antigravity_auths(&actual_model).await;
         if auths.is_empty() {
             return Json(json!({
                 "error": {
@@ -2977,7 +3130,7 @@ pub async fn completions(
             } = auth;
             let client = AntigravityClient::new(access_token);
             let antigravity_request =
-                antigravity::openai_to_antigravity_request(&chat_request, &model, project_id);
+                antigravity::openai_to_antigravity_request(&openai_raw, &actual_model, project_id);
 
             if is_stream {
                 match client.stream_generate_content(&antigravity_request, None).await {
@@ -3017,12 +3170,12 @@ pub async fn completions(
                 }
             }
 
-            if antigravity::should_use_stream_for_non_stream(&model) {
+            if antigravity::should_use_stream_for_non_stream(&actual_model) {
                 match client.stream_generate_content(&antigravity_request, None).await {
                     Ok(response) => match antigravity::collect_antigravity_stream(response).await {
                         Ok(payload) => {
                             let openai_response =
-                                gemini::gemini_to_openai_response(&payload, &model, &request_id);
+                                gemini::gemini_to_openai_response(&payload, &actual_model, &request_id);
                             let completions_response = convert_chat_response_to_completions(&openai_response);
                             return Json(completions_response).into_response();
                         }
@@ -3060,7 +3213,7 @@ pub async fn completions(
             match client.generate_content(&antigravity_request, None).await {
                 Ok(response) => {
                     let openai_response =
-                        gemini::gemini_to_openai_response(&response, &model, &request_id);
+                        gemini::gemini_to_openai_response(&response, &actual_model, &request_id);
                     let completions_response = convert_chat_response_to_completions(&openai_response);
                     return Json(completions_response).into_response();
                 }
@@ -3431,7 +3584,7 @@ pub async fn claude_messages(
         _ => claude::ClaudeImageHandling::Base64AndUrl,
     };
     let guard_thinking = provider_override.as_deref() == Some("antigravity");
-    let openai_raw = claude::claude_request_to_openai_chat(&raw, &model, image_handling, guard_thinking);
+    let mut openai_raw = claude::claude_request_to_openai_chat(&raw, &model, image_handling, guard_thinking);
 
     if provider_override.as_deref() == Some("gemini") {
         let auth = match get_gemini_auth(&model).await {
@@ -3689,12 +3842,33 @@ pub async fn claude_messages(
     }
 
     if provider_override.as_deref() == Some("antigravity") {
-        let model_lower = model.to_lowercase();
+        let (actual_model, reasoning_effort) = parse_antigravity_model_with_effort(&model);
+        let model_lower = actual_model.to_lowercase();
         let supports_thinking =
             model_lower.contains("-thinking") || model_lower.starts_with("claude-");
         let reasoning_as_text = !supports_thinking;
 
-        let auths = get_antigravity_auths(&model).await;
+        if let Some(ref effort) = reasoning_effort {
+            if !antigravity_level_supported(&actual_model, effort) {
+                let supported = antigravity_supported_levels(&actual_model)
+                    .map(|levels| levels.join(", "))
+                    .unwrap_or_else(|| "none".to_string());
+                return Json(json!({
+                    "error": {
+                        "message": format!(
+                            "Thinking level '{}' is not supported by model '{}'. Supported levels: {}. Remove the level prefix to use the default behavior.",
+                            effort, actual_model, supported
+                        ),
+                        "type": "invalid_request_error",
+                        "code": 400
+                    }
+                }))
+                .into_response();
+            }
+            openai_raw["reasoning_effort"] = json!(effort);
+        }
+
+        let auths = get_antigravity_auths(&actual_model).await;
         if auths.is_empty() {
             return Json(json!({
                 "error": {
@@ -3715,7 +3889,7 @@ pub async fn claude_messages(
             } = auth;
             let client = AntigravityClient::new(access_token);
             let antigravity_request =
-                antigravity::openai_to_antigravity_request(&openai_raw, &model, project_id);
+                antigravity::openai_to_antigravity_request(&openai_raw, &actual_model, project_id);
 
             if is_stream {
                 match client.stream_generate_content(&antigravity_request, None).await {
@@ -3723,7 +3897,7 @@ pub async fn claude_messages(
                         let upstream = antigravity::antigravity_stream_to_openai_chunks(response);
                         let stream = openai_chunks_to_claude_events_with_options(
                             upstream,
-                            &model,
+                            &actual_model,
                             reasoning_as_text,
                         );
                         return Sse::new(stream).into_response();
@@ -3747,15 +3921,15 @@ pub async fn claude_messages(
                 }
             }
 
-            if antigravity::should_use_stream_for_non_stream(&model) {
+            if antigravity::should_use_stream_for_non_stream(&actual_model) {
                 match client.stream_generate_content(&antigravity_request, None).await {
                     Ok(response) => match antigravity::collect_antigravity_stream(response).await {
                         Ok(payload) => {
                             let openai_response =
-                                gemini::gemini_to_openai_response(&payload, &model, &request_id);
+                                gemini::gemini_to_openai_response(&payload, &actual_model, &request_id);
                             let claude_response = claude::openai_to_claude_response_with_options(
                                 &openai_response,
-                                &model,
+                                &actual_model,
                                 &request_id,
                                 reasoning_as_text,
                             );
@@ -3795,10 +3969,10 @@ pub async fn claude_messages(
             match client.generate_content(&antigravity_request, None).await {
                 Ok(response) => {
                     let openai_response =
-                        gemini::gemini_to_openai_response(&response, &model, &request_id);
+                        gemini::gemini_to_openai_response(&response, &actual_model, &request_id);
                     let claude_response = claude::openai_to_claude_response_with_options(
                         &openai_response,
-                        &model,
+                        &actual_model,
                         &request_id,
                         reasoning_as_text,
                     );
