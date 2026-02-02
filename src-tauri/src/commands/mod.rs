@@ -200,3 +200,24 @@ pub async fn save_settings(settings: SettingsData) -> Result<(), String> {
     config.quota_refresh_interval = settings.quota_refresh_interval;
     config::update_config(config).map_err(|e| e.to_string())
 }
+
+// ============ Request Logs Commands ============
+
+#[tauri::command]
+pub async fn get_request_logs(
+    limit: u32,
+    offset: u32,
+    filter: Option<crate::db::LogFilter>,
+) -> Result<Vec<crate::db::RequestLogEntry>, String> {
+    crate::db::get_request_logs(limit, offset, filter).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_request_logs_count(filter: Option<crate::db::LogFilter>) -> Result<i64, String> {
+    crate::db::get_request_logs_count(filter).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn clear_request_logs() -> Result<(), String> {
+    crate::db::clear_request_logs().map_err(|e| e.to_string())
+}

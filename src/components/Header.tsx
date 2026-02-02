@@ -9,6 +9,7 @@ export function Header({ currentPage, onPageChange }: HeaderProps) {
   const navItems: { id: Page; label: string }[] = [
     { id: "dashboard", label: "仪表盘" },
     { id: "accounts", label: "账号管理" },
+    { id: "logs", label: "请求日志" },
     { id: "settings", label: "设置" },
   ];
 

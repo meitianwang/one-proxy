@@ -80,6 +80,9 @@ pub fn run() {
             commands::get_cached_quotas,
             commands::get_settings,
             commands::save_settings,
+            commands::get_request_logs,
+            commands::get_request_logs_count,
+            commands::clear_request_logs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

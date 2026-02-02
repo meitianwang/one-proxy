@@ -3,9 +3,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { Dashboard } from "./pages/Dashboard";
 import { Accounts } from "./pages/Accounts";
 import { Settings } from "./pages/Settings";
+import { RequestLogs } from "./pages/RequestLogs";
 import { Header } from "./components/Header";
 
-export type Page = "dashboard" | "accounts" | "settings";
+export type Page = "dashboard" | "accounts" | "logs" | "settings";
 
 export interface ServerStatus {
   running: boolean;
@@ -54,6 +55,8 @@ function App() {
         return <Dashboard serverStatus={serverStatus} onStatusChange={fetchServerStatus} />;
       case "accounts":
         return <Accounts />;
+      case "logs":
+        return <RequestLogs />;
       case "settings":
         return <Settings />;
       default:

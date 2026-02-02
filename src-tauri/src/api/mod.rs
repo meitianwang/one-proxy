@@ -32,6 +32,55 @@ pub struct AppState {
     pub app_handle: tauri::AppHandle,
 }
 
+/// Determine protocol from request path
+fn protocol_from_path(path: &str) -> Option<String> {
+    if path.starts_with("/v1/chat/completions") || path.starts_with("/v1/completions") || path.starts_with("/v1/models") {
+        Some("openai".to_string())
+    } else if path.starts_with("/v1/messages") {
+        Some("anthropic".to_string())
+    } else if path.starts_with("/v1beta/models") {
+        Some("gemini".to_string())
+    } else {
+        None
+    }
+}
+
+/// Request logging middleware
+async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
+    let start = std::time::Instant::now();
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let protocol = protocol_from_path(&path);
+
+    let response = next.run(request).await;
+
+    let duration_ms = start.elapsed().as_millis() as i64;
+    let status = response.status().as_u16() as i32;
+
+    // Determine if this is an error
+    let error_message = if status >= 400 {
+        Some(format!("HTTP {}", status))
+    } else {
+        None
+    };
+
+    // Save log to database (ignore errors to not affect the response)
+    let _ = crate::db::save_request_log(
+        status,
+        &method,
+        None, // model - will be set by handler via update
+        protocol.as_deref(),
+        None, // account_id - will be set by handler via update
+        &path,
+        0, // input_tokens
+        0, // output_tokens
+        duration_ms,
+        error_message.as_deref(),
+    );
+
+    response
+}
+
 /// API Key authentication middleware
 async fn auth_middleware(request: Request<Body>, next: Next) -> Response {
     let config = crate::config::get_config().unwrap_or_default();
@@ -137,7 +186,8 @@ pub async fn start_server(app_handle: tauri::AppHandle) -> Result<()> {
         .route("/v1beta/models", get(handlers::gemini_models))
         .route("/v1beta/models/*action", post(handlers::gemini_handler))
         .route("/v1beta/models/*action", get(handlers::gemini_get_handler))
-        .layer(middleware::from_fn(auth_middleware));
+        .layer(middleware::from_fn(auth_middleware))
+        .layer(middleware::from_fn(logging_middleware));
 
     // Routes that don't require authentication
     let public_routes = Router::new()
