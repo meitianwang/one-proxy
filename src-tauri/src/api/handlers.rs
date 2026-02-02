@@ -725,6 +725,8 @@ struct ClaudeStreamState {
     thinking_closed: bool,
     text_started: bool,
     finish_reason: Option<String>,
+    input_tokens: u32,
+    output_tokens: u32,
     tool_calls: HashMap<i32, ToolCallAccumulator>,
     tool_call_block_index: HashMap<i32, i32>,
     thinking_index: Option<i32>,
@@ -758,11 +760,46 @@ fn openai_chunk_to_claude_events(
         idx
     }
 
+    fn update_usage(state: &mut ClaudeStreamState, usage: &Value) {
+        let input = usage
+            .get("input_tokens")
+            .and_then(|v| v.as_u64())
+            .or_else(|| usage.get("prompt_tokens").and_then(|v| v.as_u64()))
+            .or_else(|| {
+                usage
+                    .get("total_tokens")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|total| {
+                        usage
+                            .get("completion_tokens")
+                            .and_then(|v| v.as_u64())
+                            .map(|completion| total.saturating_sub(completion))
+                    })
+            })
+            .unwrap_or(0) as u32;
+        let output = usage
+            .get("output_tokens")
+            .and_then(|v| v.as_u64())
+            .or_else(|| usage.get("completion_tokens").and_then(|v| v.as_u64()))
+            .unwrap_or(0) as u32;
+
+        if input > 0 {
+            state.input_tokens = input;
+        }
+        if output > 0 {
+            state.output_tokens = output;
+        }
+    }
+
     let mut events = Vec::new();
     let parsed: Value = match serde_json::from_str(chunk) {
         Ok(v) => v,
         Err(_) => return events,
     };
+
+    if let Some(usage) = parsed.get("usage") {
+        update_usage(state, usage);
+    }
 
     if !state.message_started {
         if state.message_id.is_empty() {
@@ -794,8 +831,8 @@ fn openai_chunk_to_claude_events(
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": 0,
-                    "output_tokens": 0
+                    "input_tokens": state.input_tokens,
+                    "output_tokens": state.output_tokens
                 }
             }
         });
@@ -992,6 +1029,33 @@ fn openai_chunk_to_claude_events(
 fn finalize_claude_stream(state: &mut ClaudeStreamState) -> Vec<Event> {
     let mut events = Vec::new();
 
+    if !state.message_started {
+        if state.message_id.is_empty() {
+            state.message_id = format!("msg_{}", uuid::Uuid::new_v4());
+        }
+        if state.model.is_empty() {
+            state.model = "unknown".to_string();
+        }
+        let payload = json!({
+            "type": "message_start",
+            "message": {
+                "id": state.message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": state.model,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": state.input_tokens,
+                    "output_tokens": state.output_tokens
+                }
+            }
+        });
+        events.push(build_claude_event("message_start", payload));
+        state.message_started = true;
+    }
+
     // Close thinking block if it was started but not yet closed
     if state.thinking_started && !state.thinking_closed {
         let thinking_index = state.thinking_index.unwrap_or(0);
@@ -1055,7 +1119,8 @@ fn finalize_claude_stream(state: &mut ClaudeStreamState) -> Vec<Event> {
                 "stop_sequence": null
             },
             "usage": {
-                "output_tokens": 0
+                "input_tokens": state.input_tokens,
+                "output_tokens": state.output_tokens
             }
         }),
     ));

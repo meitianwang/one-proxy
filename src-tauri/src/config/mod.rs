@@ -225,11 +225,28 @@ pub fn resolve_auth_dir() -> PathBuf {
         .map(|c| c.auth_dir)
         .unwrap_or_else(default_auth_dir);
 
-    if auth_dir.starts_with("~") {
+    let path = if auth_dir.starts_with("~") {
+        let trimmed = auth_dir.trim_start_matches("~/").trim_start_matches('~');
         if let Some(home) = dirs::home_dir() {
-            return home.join(&auth_dir[2..]);
+            return home.join(trimmed);
         }
+        tracing::warn!("Home dir not found; falling back to app config dir for auth storage.");
+        PathBuf::from(trimmed)
+    } else {
+        PathBuf::from(&auth_dir)
+    };
+
+    if path.is_absolute() {
+        return path;
     }
 
-    PathBuf::from(auth_dir)
+    if let Some(base) = get_config_path().and_then(|p| p.parent().map(|p| p.to_path_buf())) {
+        return base.join(&path);
+    }
+
+    if let Some(data_dir) = dirs::data_dir() {
+        return data_dir.join("cli-proxy-api").join(&path);
+    }
+
+    path
 }

@@ -1,8 +1,23 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 interface SettingsData {
   quota_refresh_interval: number;
+}
+
+interface AppConfig {
+  host: string;
+  port: number;
+  debug: boolean;
+  "auth-dir": string;
+  "api-keys": string[];
+  "proxy-url": string;
+  "request-retry": number;
+  routing: {
+    strategy: string;
+  };
+  [key: string]: unknown;
 }
 
 interface CustomProviderEntry {
@@ -39,11 +54,13 @@ export function Settings() {
   const [settings, setSettings] = useState<SettingsData>({
     quota_refresh_interval: 5,
   });
+  const [appConfig, setAppConfig] = useState<AppConfig | null>(null);
   const [customProviders, setCustomProviders] = useState<CustomProvidersData>({
     openai_compatibility: [],
     claude_code_compatibility: [],
   });
   const [loading, setLoading] = useState(true);
+  const [configLoading, setConfigLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [activeTab, setActiveTab] = useState<"general" | "openai" | "claude">("general");
@@ -51,6 +68,7 @@ export function Settings() {
   useEffect(() => {
     loadSettings();
     loadCustomProviders();
+    loadConfig();
   }, []);
 
   async function loadSettings() {
@@ -61,6 +79,17 @@ export function Settings() {
       console.error("Failed to load settings:", error);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function loadConfig() {
+    try {
+      const data = await invoke<AppConfig>("get_config");
+      setAppConfig(data);
+    } catch (error) {
+      console.error("Failed to load config:", error);
+    } finally {
+      setConfigLoading(false);
     }
   }
 
@@ -87,6 +116,9 @@ export function Settings() {
     setSaved(false);
     try {
       await invoke("save_settings", { settings });
+      if (appConfig) {
+        await invoke("save_config", { config: appConfig });
+      }
       // Filter out empty api_keys before saving
       const cleanProviders = (providers: CustomProviderEntry[]) =>
         providers.map(p => ({
@@ -171,7 +203,7 @@ export function Settings() {
     setCustomProviders({ ...customProviders, [key]: providers });
   }
 
-  if (loading) {
+  if (loading || configLoading) {
     return (
       <div className="flex items-center justify-center h-64">
         <span className="text-gray-500 dark:text-gray-400">加载中...</span>
@@ -350,6 +382,50 @@ export function Settings() {
       <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-6 space-y-6">
         {activeTab === "general" && (
           <>
+            <div className="space-y-2">
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                凭据存储目录
+              </label>
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                OAuth 登录凭据与 API Key 账号信息的保存位置。建议选择可写目录。
+              </p>
+              <div className="flex flex-col gap-2 md:flex-row md:items-center">
+                <input
+                  type="text"
+                  value={appConfig?.["auth-dir"] ?? ""}
+                  onChange={(e) =>
+                    setAppConfig((prev) =>
+                      prev ? { ...prev, "auth-dir": e.target.value } : prev
+                    )
+                  }
+                  placeholder="例如：/Users/you/.cli-proxy-api"
+                  className="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-800 dark:text-white text-sm"
+                />
+                <button
+                  onClick={async () => {
+                    try {
+                      const selected = await openDialog({
+                        directory: true,
+                        multiple: false,
+                      });
+                      if (typeof selected === "string") {
+                        setAppConfig((prev) =>
+                          prev ? { ...prev, "auth-dir": selected } : prev
+                        );
+                      }
+                    } catch (error) {
+                      console.error("Failed to pick directory:", error);
+                    }
+                  }}
+                  className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700"
+                >
+                  选择目录
+                </button>
+              </div>
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                修改后新登录会写入新目录，旧账号需要手动迁移或重新登录。
+              </p>
+            </div>
             {/* Quota Refresh Interval */}
             <div className="space-y-2">
               <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
