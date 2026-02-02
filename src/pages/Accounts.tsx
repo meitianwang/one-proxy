@@ -595,8 +595,8 @@ export function Accounts() {
         {/* Header */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-lg bg-blue-100 flex items-center justify-center">
-              <svg className="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <div className="w-10 h-10 rounded-lg bg-gray-100 dark:bg-gray-700 flex items-center justify-center">
+              <svg className="w-5 h-5 text-gray-600 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m13.5-9a2.5 2.5 0 11-5 0 2.5 2.5 0 015 0z" />
               </svg>
             </div>
@@ -613,7 +613,7 @@ export function Accounts() {
               <button
                 onClick={() => setShowAddMenu(!showAddMenu)}
                 disabled={loginInProgress !== null}
-                className="px-4 py-2 rounded-lg bg-blue-500 hover:bg-blue-600 text-white text-sm font-medium flex items-center gap-2 disabled:opacity-50"
+                className="px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600 text-white text-sm font-medium flex items-center gap-2 disabled:opacity-50"
               >
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
@@ -675,7 +675,7 @@ export function Accounts() {
             <div className="flex border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
               <button
                 onClick={() => setViewMode("list")}
-                className={`p-2 ${viewMode === "list" ? "bg-blue-100 dark:bg-blue-900/30 text-blue-600" : "hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-500"}`}
+                className={`p-2 ${viewMode === "list" ? "bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-white" : "hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-500"}`}
                 title="列表视图"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -684,7 +684,7 @@ export function Accounts() {
               </button>
               <button
                 onClick={() => setViewMode("card")}
-                className={`p-2 ${viewMode === "card" ? "bg-blue-100 dark:bg-blue-900/30 text-blue-600" : "hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-500"}`}
+                className={`p-2 ${viewMode === "card" ? "bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-white" : "hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-500"}`}
                 title="卡片视图"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -703,15 +703,15 @@ export function Accounts() {
                 type="checkbox"
                 checked={allSelected}
                 onChange={toggleSelectAll}
-                className="w-4 h-4 rounded border-gray-300 text-blue-500 focus:ring-blue-500"
+                className="w-4 h-4 rounded border-gray-300 text-gray-800 focus:ring-gray-500"
               />
-              <span className="text-sm text-blue-600 dark:text-blue-400">全选</span>
+              <span className="text-sm text-gray-600 dark:text-gray-400">全选</span>
             </label>
             {selectedIds.size > 0 && (
               <div className="flex items-center gap-2">
                 <button
                   onClick={handleBatchEnable}
-                  className="px-3 py-1 text-xs rounded-lg bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/30 dark:text-blue-400 dark:hover:bg-blue-900/50"
+                  className="px-3 py-1 text-xs rounded-lg bg-gray-200 text-gray-700 hover:bg-gray-300 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600"
                 >
                   批量启用 ({selectedIds.size})
                 </button>
@@ -724,7 +724,7 @@ export function Accounts() {
               </div>
             )}
           </div>
-          <span className="text-sm text-blue-600 dark:text-blue-400">
+          <span className="text-sm text-gray-600 dark:text-gray-400">
             共 {filteredAccounts.length} 个账号
           </span>
         </div>
@@ -733,7 +733,7 @@ export function Accounts() {
         {viewMode === "list" && (
           <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-x-auto">
             <table className="w-full min-w-[600px]">
-              <thead className="bg-blue-50 dark:bg-blue-900/20">
+              <thead className="bg-gray-50 dark:bg-gray-700/50">
                 <tr>
                   <th className="w-10 px-3 py-3"></th>
                   <th className="w-56 px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">邮箱</th>

@@ -190,7 +190,7 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
             className={`px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-colors ${
               serverStatus.running
                 ? "bg-red-500 hover:bg-red-600 text-white"
-                : "bg-blue-500 hover:bg-blue-600 text-white"
+                : "bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600 text-white"
             }`}
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -232,7 +232,7 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
               <button
                 onClick={toggleLanAccess}
                 className={`relative w-12 h-6 rounded-full transition-colors ${
-                  isLanAccess() ? "bg-blue-500" : "bg-gray-300 dark:bg-gray-600"
+                  isLanAccess() ? "bg-gray-800 dark:bg-gray-600" : "bg-gray-300 dark:bg-gray-600"
                 }`}
               >
                 <span
@@ -291,8 +291,8 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
       {/* Multi-Protocol Support */}
       <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-6">
         <div className="flex items-center gap-3 mb-4">
-          <div className="w-10 h-10 rounded-lg bg-blue-100 dark:bg-blue-900 flex items-center justify-center">
-            <svg className="w-5 h-5 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <div className="w-10 h-10 rounded-lg bg-gray-100 dark:bg-gray-700 flex items-center justify-center">
+            <svg className="w-5 h-5 text-gray-600 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
             </svg>
           </div>
@@ -310,11 +310,11 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
                 onClick={() => setSelectedProtocol("openai")}
                 className={`p-3 rounded-lg border text-left transition-colors ${
                   selectedProtocol === "openai"
-                    ? "border-blue-500 bg-blue-50 dark:bg-blue-900/30"
+                    ? "border-gray-800 bg-gray-100 dark:bg-gray-700 dark:border-gray-500"
                     : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
                 }`}
               >
-                <p className={`text-sm font-medium ${selectedProtocol === "openai" ? "text-blue-600 dark:text-blue-400" : "text-gray-800 dark:text-white"}`}>
+                <p className={`text-sm font-medium ${selectedProtocol === "openai" ? "text-gray-800 dark:text-white" : "text-gray-800 dark:text-white"}`}>
                   OpenAI 协议
                 </p>
                 <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">/v1/chat/completions</p>
@@ -323,11 +323,11 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
                 onClick={() => setSelectedProtocol("anthropic")}
                 className={`p-3 rounded-lg border text-left transition-colors ${
                   selectedProtocol === "anthropic"
-                    ? "border-blue-500 bg-blue-50 dark:bg-blue-900/30"
+                    ? "border-gray-800 bg-gray-100 dark:bg-gray-700 dark:border-gray-500"
                     : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
                 }`}
               >
-                <p className={`text-sm font-medium ${selectedProtocol === "anthropic" ? "text-blue-600 dark:text-blue-400" : "text-gray-800 dark:text-white"}`}>
+                <p className={`text-sm font-medium ${selectedProtocol === "anthropic" ? "text-gray-800 dark:text-white" : "text-gray-800 dark:text-white"}`}>
                   Anthropic 协议
                 </p>
                 <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">/v1/messages</p>
@@ -349,11 +349,11 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
                       onClick={() => setSelectedModel(model.id)}
                       className={`w-full p-2 rounded-lg border text-left text-sm transition-colors ${
                         selectedModel === model.id
-                          ? "border-blue-500 bg-blue-50 dark:bg-blue-900/30"
+                          ? "border-gray-800 bg-gray-100 dark:bg-gray-700 dark:border-gray-500"
                           : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
                       }`}
                     >
-                      <span className={`font-medium ${selectedModel === model.id ? "text-blue-600 dark:text-blue-400" : "text-gray-800 dark:text-white"}`}>
+                      <span className={`font-medium ${selectedModel === model.id ? "text-gray-800 dark:text-white" : "text-gray-800 dark:text-white"}`}>
                         {model.name}
                       </span>
                       {model.desc && <span className="text-xs text-gray-500 dark:text-gray-400 ml-2">{model.desc}</span>}
@@ -374,7 +374,7 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
                   setCopied(true);
                   setTimeout(() => setCopied(false), 2000);
                 }}
-                className="text-xs text-blue-500 hover:text-blue-600 flex items-center gap-1"
+                className="text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 flex items-center gap-1"
               >
                 {copied ? (
                   <>
