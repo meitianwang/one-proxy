@@ -16,6 +16,7 @@ use super::gemini::{self, GeminiClient};
 use super::kiro;
 use super::AppState;
 use crate::auth::{self, providers::{google, anthropic, antigravity as antigravity_oauth, openai}, AuthFile, TokenInfo};
+use crate::auth::providers::antigravity::QuotaData as AntigravityQuotaData;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -1635,118 +1636,207 @@ async fn get_codex_token(model: &str) -> Option<String> {
     None
 }
 
-/// Get a valid Antigravity access token from stored credentials
-async fn get_antigravity_auth(model: &str) -> Option<AntigravityAuth> {
-    let candidates = select_auth_candidates("antigravity", model);
-    for candidate in candidates {
-        let content = match std::fs::read_to_string(&candidate.path) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let mut json: serde_json::Value = match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+fn normalize_antigravity_model(model: &str) -> String {
+    let name = model.split('/').last().unwrap_or(model).trim().to_lowercase();
+    name
+}
 
-        let snapshot = match parse_token_snapshot(&json) {
-            Some(s) => s,
-            None => continue,
-        };
+fn antigravity_quota_status(quota: &AntigravityQuotaData, model: &str) -> Option<bool> {
+    let model_name = normalize_antigravity_model(model);
+    let is_claude = model_name.contains("claude");
+    let mut matched = false;
+    let mut any_available = false;
 
-        let mut project_id = json
-            .get("project_id")
-            .and_then(|v| v.as_str())
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-
-        if !is_expired(snapshot.expires_at) {
-            if project_id.is_none() {
-                if let Ok(pid) = antigravity_oauth::fetch_project_id(&snapshot.access_token).await {
-                    if !pid.trim().is_empty() {
-                        project_id = Some(pid.clone());
-                        json["project_id"] = serde_json::json!(pid);
-                        if let Ok(updated_content) = serde_json::to_string_pretty(&json) {
-                            let _ = std::fs::write(&candidate.path, updated_content);
-                        }
-                    }
-                }
-            }
-            return Some(AntigravityAuth {
-                access_token: snapshot.access_token,
-                project_id,
-            });
+    for entry in &quota.models {
+        let entry_name = entry.name.trim().to_lowercase();
+        let is_match = entry_name == model_name || (is_claude && entry_name.contains("claude"));
+        if !is_match {
+            continue;
         }
-
-        let refresh_token = match snapshot.refresh_token {
-            Some(v) => v,
-            None => continue,
-        };
-
-        if let Ok(new_tokens) = antigravity_oauth::refresh_token(&refresh_token).await {
-            let new_expiry = new_tokens.expires_in.map(|secs| {
-                (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
-            });
-
-            match snapshot.location {
-                TokenLocation::Nested => {
-                    if json.get("token").is_none() {
-                        json["token"] = json!({});
-                    }
-                    if let Some(obj) = json.get_mut("token").and_then(|v| v.as_object_mut()) {
-                        obj.insert(
-                            "access_token".to_string(),
-                            serde_json::json!(new_tokens.access_token),
-                        );
-                        if let Some(new_refresh) = &new_tokens.refresh_token {
-                            obj.insert("refresh_token".to_string(), serde_json::json!(new_refresh));
-                        }
-                        if let Some(exp) = new_expiry.clone() {
-                            let key = snapshot.expiry_key.unwrap_or("expires_at");
-                            obj.insert(key.to_string(), serde_json::json!(exp));
-                        }
-                        obj.insert(
-                            "token_type".to_string(),
-                            serde_json::json!(new_tokens.token_type),
-                        );
-                    }
-                }
-                TokenLocation::Root => {
-                    json["access_token"] = serde_json::json!(new_tokens.access_token);
-                    if let Some(new_refresh) = &new_tokens.refresh_token {
-                        json["refresh_token"] = serde_json::json!(new_refresh);
-                    }
-                    if let Some(exp) = new_expiry.clone() {
-                        json["expired"] = serde_json::json!(exp);
-                    }
-                    if let Some(secs) = new_tokens.expires_in {
-                        json["expires_in"] = serde_json::json!(secs);
-                        json["timestamp"] = serde_json::json!(chrono::Utc::now().timestamp_millis());
-                    }
-                    json["token_type"] = serde_json::json!(new_tokens.token_type);
-                    json["type"] = serde_json::json!("antigravity");
-                }
-            }
-
-            if project_id.is_none() {
-                if let Ok(pid) = antigravity_oauth::fetch_project_id(&new_tokens.access_token).await {
-                    if !pid.trim().is_empty() {
-                        project_id = Some(pid.clone());
-                        json["project_id"] = serde_json::json!(pid);
-                    }
-                }
-            }
-
-            if let Ok(updated_content) = serde_json::to_string_pretty(&json) {
-                let _ = std::fs::write(&candidate.path, updated_content);
-            }
-
-            return Some(AntigravityAuth {
-                access_token: new_tokens.access_token,
-                project_id,
-            });
+        matched = true;
+        if entry.percentage > 0 {
+            any_available = true;
+            break;
         }
     }
-    None
+
+    if !matched {
+        None
+    } else {
+        Some(any_available)
+    }
+}
+
+fn antigravity_candidate_has_quota(candidate: &AuthCandidate, model: &str) -> Option<bool> {
+    let account_id = candidate
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())?;
+
+    let cache = crate::db::get_quota_cache(&account_id).ok().flatten()?;
+    if cache.provider != "antigravity" {
+        return None;
+    }
+    let quota: AntigravityQuotaData = serde_json::from_str(&cache.quota_data).ok()?;
+    antigravity_quota_status(&quota, model)
+}
+
+fn parse_antigravity_status(message: &str) -> Option<u16> {
+    let needle = "Antigravity request failed:";
+    let start = message.find(needle)?;
+    let rest = &message[start + needle.len()..];
+    let mut digits = String::new();
+    for ch in rest.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else if !digits.is_empty() {
+            break;
+        }
+    }
+    digits.parse().ok()
+}
+
+fn should_rotate_antigravity_error(message: &str) -> bool {
+    match parse_antigravity_status(message) {
+        Some(429 | 401 | 403 | 500) => true,
+        _ => {
+            let lower = message.to_lowercase();
+            lower.contains("quota_exhausted")
+                || lower.contains("resource_exhausted")
+                || lower.contains("rate_limit_exceeded")
+        }
+    }
+}
+
+/// Get a valid Antigravity access token from stored credentials
+async fn get_antigravity_auth(model: &str) -> Option<AntigravityAuth> {
+    get_antigravity_auths(model).await.into_iter().next()
+}
+
+async fn load_antigravity_auth_from_candidate(candidate: &AuthCandidate) -> Option<AntigravityAuth> {
+    let content = std::fs::read_to_string(&candidate.path).ok()?;
+    let mut json: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    let snapshot = parse_token_snapshot(&json)?;
+
+    let mut project_id = json
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    if !is_expired(snapshot.expires_at) {
+        if project_id.is_none() {
+            if let Ok(pid) = antigravity_oauth::fetch_project_id(&snapshot.access_token).await {
+                if !pid.trim().is_empty() {
+                    project_id = Some(pid.clone());
+                    json["project_id"] = serde_json::json!(pid);
+                    if let Ok(updated_content) = serde_json::to_string_pretty(&json) {
+                        let _ = std::fs::write(&candidate.path, updated_content);
+                    }
+                }
+            }
+        }
+        return Some(AntigravityAuth {
+            access_token: snapshot.access_token,
+            project_id,
+        });
+    }
+
+    let refresh_token = snapshot.refresh_token?;
+    let new_tokens = antigravity_oauth::refresh_token(&refresh_token).await.ok()?;
+    let new_expiry = new_tokens.expires_in.map(|secs| {
+        (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
+    });
+
+    match snapshot.location {
+        TokenLocation::Nested => {
+            if json.get("token").is_none() {
+                json["token"] = json!({});
+            }
+            if let Some(obj) = json.get_mut("token").and_then(|v| v.as_object_mut()) {
+                obj.insert(
+                    "access_token".to_string(),
+                    serde_json::json!(new_tokens.access_token),
+                );
+                if let Some(new_refresh) = &new_tokens.refresh_token {
+                    obj.insert("refresh_token".to_string(), serde_json::json!(new_refresh));
+                }
+                if let Some(exp) = new_expiry.clone() {
+                    let key = snapshot.expiry_key.unwrap_or("expires_at");
+                    obj.insert(key.to_string(), serde_json::json!(exp));
+                }
+                obj.insert(
+                    "token_type".to_string(),
+                    serde_json::json!(new_tokens.token_type),
+                );
+            }
+        }
+        TokenLocation::Root => {
+            json["access_token"] = serde_json::json!(new_tokens.access_token);
+            if let Some(new_refresh) = &new_tokens.refresh_token {
+                json["refresh_token"] = serde_json::json!(new_refresh);
+            }
+            if let Some(exp) = new_expiry.clone() {
+                json["expired"] = serde_json::json!(exp);
+            }
+            if let Some(secs) = new_tokens.expires_in {
+                json["expires_in"] = serde_json::json!(secs);
+                json["timestamp"] = serde_json::json!(chrono::Utc::now().timestamp_millis());
+            }
+            json["token_type"] = serde_json::json!(new_tokens.token_type);
+            json["type"] = serde_json::json!("antigravity");
+        }
+    }
+
+    if project_id.is_none() {
+        if let Ok(pid) = antigravity_oauth::fetch_project_id(&new_tokens.access_token).await {
+            if !pid.trim().is_empty() {
+                project_id = Some(pid.clone());
+                json["project_id"] = serde_json::json!(pid);
+            }
+        }
+    }
+
+    if let Ok(updated_content) = serde_json::to_string_pretty(&json) {
+        let _ = std::fs::write(&candidate.path, updated_content);
+    }
+
+    Some(AntigravityAuth {
+        access_token: new_tokens.access_token,
+        project_id,
+    })
+}
+
+async fn get_antigravity_auths(model: &str) -> Vec<AntigravityAuth> {
+    let candidates = select_auth_candidates("antigravity", model);
+    let candidates = if candidates.len() <= 1 {
+        candidates
+    } else {
+        let mut ranked: Vec<(usize, AuthCandidate, i32)> = candidates
+            .into_iter()
+            .enumerate()
+            .map(|(idx, candidate)| {
+                let rank = match antigravity_candidate_has_quota(&candidate, model) {
+                    Some(true) => 0,
+                    None => 1,
+                    Some(false) => 2,
+                };
+                (idx, candidate, rank)
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+        ranked.into_iter().map(|(_, candidate, _)| candidate).collect()
+    };
+
+    let mut auths = Vec::new();
+    for candidate in candidates {
+        if let Some(auth) = load_antigravity_auth_from_candidate(&candidate).await {
+            auths.push(auth);
+        }
+    }
+    auths
 }
 
 /// Get a valid Kiro access token from stored credentials
@@ -2121,73 +2211,109 @@ pub async fn chat_completions(
     }
 
     if provider_override.as_deref() == Some("antigravity") {
-        let auth = match get_antigravity_auth(&model).await {
-            Some(a) => a,
-            None => {
-                return Json(json!({
-                    "error": {
-                        "message": "No valid Antigravity credentials found. Please login with Antigravity first.",
-                        "type": "authentication_error",
-                        "code": 401
-                    }
-                }))
-                .into_response();
-            }
-        };
-
-        let AntigravityAuth {
-            access_token,
-            project_id,
-        } = auth;
-        let client = AntigravityClient::new(access_token);
-        let antigravity_request =
-            antigravity::openai_to_antigravity_request(&raw, &model, project_id);
-
-        if is_stream {
-            match client.stream_generate_content(&antigravity_request, None).await {
-                Ok(response) => {
-                    let stream = antigravity::antigravity_stream_to_openai_events(response);
-                    return Sse::new(stream).into_response();
+        let auths = get_antigravity_auths(&model).await;
+        if auths.is_empty() {
+            return Json(json!({
+                "error": {
+                    "message": "No valid Antigravity credentials found. Please login with Antigravity first.",
+                    "type": "authentication_error",
+                    "code": 401
                 }
-                Err(e) => {
-                    tracing::error!("Antigravity API error: {}", e);
-                    return Json(json!({
-                        "error": {
-                            "message": format!("Antigravity API error: {}", e),
-                            "type": "api_error",
-                            "code": 500
-                        }
-                    }))
-                    .into_response();
-                }
-            }
+            }))
+            .into_response();
         }
 
-        if antigravity::should_use_stream_for_non_stream(&model) {
-            match client.stream_generate_content(&antigravity_request, None).await {
-                Ok(response) => match antigravity::collect_antigravity_stream(response).await {
-                    Ok(payload) => {
-                        let openai_response =
-                            gemini::gemini_to_openai_response(&payload, &model, &request_id);
-                        return Json(openai_response).into_response();
+        let mut last_error: Option<String> = None;
+        let total = auths.len();
+        for (idx, auth) in auths.into_iter().enumerate() {
+            let AntigravityAuth {
+                access_token,
+                project_id,
+            } = auth;
+            let client = AntigravityClient::new(access_token);
+            let antigravity_request =
+                antigravity::openai_to_antigravity_request(&raw, &model, project_id);
+
+            if is_stream {
+                match client.stream_generate_content(&antigravity_request, None).await {
+                    Ok(response) => {
+                        let stream = antigravity::antigravity_stream_to_openai_events(response);
+                        return Sse::new(stream).into_response();
                     }
                     Err(e) => {
-                        tracing::error!("Antigravity API error: {}", e);
+                        let msg = e.to_string();
+                        tracing::error!("Antigravity API error: {}", msg);
+                        last_error = Some(msg.clone());
+                        if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                            continue;
+                        }
                         return Json(json!({
                             "error": {
-                                "message": format!("Antigravity API error: {}", e),
+                                "message": format!("Antigravity API error: {}", msg),
                                 "type": "api_error",
                                 "code": 500
                             }
                         }))
                         .into_response();
                     }
-                },
+                }
+            }
+
+            if antigravity::should_use_stream_for_non_stream(&model) {
+                match client.stream_generate_content(&antigravity_request, None).await {
+                    Ok(response) => match antigravity::collect_antigravity_stream(response).await {
+                        Ok(payload) => {
+                            let openai_response =
+                                gemini::gemini_to_openai_response(&payload, &model, &request_id);
+                            return Json(openai_response).into_response();
+                        }
+                        Err(e) => {
+                            tracing::error!("Antigravity API error: {}", e);
+                            return Json(json!({
+                                "error": {
+                                    "message": format!("Antigravity API error: {}", e),
+                                    "type": "api_error",
+                                    "code": 500
+                                }
+                            }))
+                            .into_response();
+                        }
+                    },
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::error!("Antigravity API error: {}", msg);
+                        last_error = Some(msg.clone());
+                        if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                            continue;
+                        }
+                        return Json(json!({
+                            "error": {
+                                "message": format!("Antigravity API error: {}", msg),
+                                "type": "api_error",
+                                "code": 500
+                            }
+                        }))
+                        .into_response();
+                    }
+                }
+            }
+
+            match client.generate_content(&antigravity_request, None).await {
+                Ok(response) => {
+                    let openai_response =
+                        gemini::gemini_to_openai_response(&response, &model, &request_id);
+                    return Json(openai_response).into_response();
+                }
                 Err(e) => {
-                    tracing::error!("Antigravity API error: {}", e);
+                    let msg = e.to_string();
+                    tracing::error!("Antigravity API error: {}", msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                        continue;
+                    }
                     return Json(json!({
                         "error": {
-                            "message": format!("Antigravity API error: {}", e),
+                            "message": format!("Antigravity API error: {}", msg),
                             "type": "api_error",
                             "code": 500
                         }
@@ -2197,24 +2323,15 @@ pub async fn chat_completions(
             }
         }
 
-        match client.generate_content(&antigravity_request, None).await {
-            Ok(response) => {
-                let openai_response =
-                    gemini::gemini_to_openai_response(&response, &model, &request_id);
-                return Json(openai_response).into_response();
+        let message = last_error.unwrap_or_else(|| "Antigravity API error".to_string());
+        return Json(json!({
+            "error": {
+                "message": format!("Antigravity API error: {}", message),
+                "type": "api_error",
+                "code": 500
             }
-            Err(e) => {
-                tracing::error!("Antigravity API error: {}", e);
-                return Json(json!({
-                    "error": {
-                        "message": format!("Antigravity API error: {}", e),
-                        "type": "api_error",
-                        "code": 500
-                    }
-                }))
-                .into_response();
-            }
-        }
+        }))
+        .into_response();
     }
 
     if provider_override.as_deref() == Some("kiro") {
@@ -2839,87 +2956,124 @@ pub async fn completions(
     }
 
     if provider_override.as_deref() == Some("antigravity") {
-        let auth = match get_antigravity_auth(&model).await {
-            Some(a) => a,
-            None => {
-                return Json(json!({
-                    "error": {
-                        "message": "No valid Antigravity credentials found. Please login with Antigravity first.",
-                        "type": "authentication_error",
-                        "code": 401
-                    }
-                }))
-                .into_response();
-            }
-        };
-
-        let AntigravityAuth {
-            access_token,
-            project_id,
-        } = auth;
-        let client = AntigravityClient::new(access_token);
-        let antigravity_request =
-            antigravity::openai_to_antigravity_request(&chat_request, &model, project_id);
-
-        if is_stream {
-            match client.stream_generate_content(&antigravity_request, None).await {
-                Ok(response) => {
-                    let upstream = antigravity::antigravity_stream_to_openai_chunks(response);
-                    let stream = async_stream::stream! {
-                        futures::pin_mut!(upstream);
-                        while let Some(chunk) = upstream.next().await {
-                            if chunk == "[DONE]" {
-                                yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
-                                return;
-                            }
-                            if let Some(converted) = convert_chat_stream_chunk_to_completions(&chunk) {
-                                yield Ok::<Event, Infallible>(Event::default().data(converted));
-                            }
-                        }
-                        yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
-                    };
-                    return Sse::new(stream).into_response();
+        let auths = get_antigravity_auths(&model).await;
+        if auths.is_empty() {
+            return Json(json!({
+                "error": {
+                    "message": "No valid Antigravity credentials found. Please login with Antigravity first.",
+                    "type": "authentication_error",
+                    "code": 401
                 }
-                Err(e) => {
-                    tracing::error!("Antigravity API error: {}", e);
-                    return Json(json!({
-                        "error": {
-                            "message": format!("Antigravity API error: {}", e),
-                            "type": "api_error",
-                            "code": 500
-                        }
-                    }))
-                    .into_response();
-                }
-            }
+            }))
+            .into_response();
         }
 
-        if antigravity::should_use_stream_for_non_stream(&model) {
-            match client.stream_generate_content(&antigravity_request, None).await {
-                Ok(response) => match antigravity::collect_antigravity_stream(response).await {
-                    Ok(payload) => {
-                        let openai_response =
-                            gemini::gemini_to_openai_response(&payload, &model, &request_id);
-                        let completions_response = convert_chat_response_to_completions(&openai_response);
-                        return Json(completions_response).into_response();
+        let mut last_error: Option<String> = None;
+        let total = auths.len();
+        for (idx, auth) in auths.into_iter().enumerate() {
+            let AntigravityAuth {
+                access_token,
+                project_id,
+            } = auth;
+            let client = AntigravityClient::new(access_token);
+            let antigravity_request =
+                antigravity::openai_to_antigravity_request(&chat_request, &model, project_id);
+
+            if is_stream {
+                match client.stream_generate_content(&antigravity_request, None).await {
+                    Ok(response) => {
+                        let upstream = antigravity::antigravity_stream_to_openai_chunks(response);
+                        let stream = async_stream::stream! {
+                            futures::pin_mut!(upstream);
+                            while let Some(chunk) = upstream.next().await {
+                                if chunk == "[DONE]" {
+                                    yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
+                                    return;
+                                }
+                                if let Some(converted) = convert_chat_stream_chunk_to_completions(&chunk) {
+                                    yield Ok::<Event, Infallible>(Event::default().data(converted));
+                                }
+                            }
+                            yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
+                        };
+                        return Sse::new(stream).into_response();
                     }
                     Err(e) => {
-                        tracing::error!("Antigravity API error: {}", e);
+                        let msg = e.to_string();
+                        tracing::error!("Antigravity API error: {}", msg);
+                        last_error = Some(msg.clone());
+                        if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                            continue;
+                        }
                         return Json(json!({
                             "error": {
-                                "message": format!("Antigravity API error: {}", e),
+                                "message": format!("Antigravity API error: {}", msg),
                                 "type": "api_error",
                                 "code": 500
                             }
                         }))
                         .into_response();
                     }
-                },
+                }
+            }
+
+            if antigravity::should_use_stream_for_non_stream(&model) {
+                match client.stream_generate_content(&antigravity_request, None).await {
+                    Ok(response) => match antigravity::collect_antigravity_stream(response).await {
+                        Ok(payload) => {
+                            let openai_response =
+                                gemini::gemini_to_openai_response(&payload, &model, &request_id);
+                            let completions_response = convert_chat_response_to_completions(&openai_response);
+                            return Json(completions_response).into_response();
+                        }
+                        Err(e) => {
+                            tracing::error!("Antigravity API error: {}", e);
+                            return Json(json!({
+                                "error": {
+                                    "message": format!("Antigravity API error: {}", e),
+                                    "type": "api_error",
+                                    "code": 500
+                                }
+                            }))
+                            .into_response();
+                        }
+                    },
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::error!("Antigravity API error: {}", msg);
+                        last_error = Some(msg.clone());
+                        if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                            continue;
+                        }
+                        return Json(json!({
+                            "error": {
+                                "message": format!("Antigravity API error: {}", msg),
+                                "type": "api_error",
+                                "code": 500
+                            }
+                        }))
+                        .into_response();
+                    }
+                }
+            }
+
+            match client.generate_content(&antigravity_request, None).await {
+                Ok(response) => {
+                    let openai_response =
+                        gemini::gemini_to_openai_response(&response, &model, &request_id);
+                    let completions_response = convert_chat_response_to_completions(&openai_response);
+                    return Json(completions_response).into_response();
+                }
                 Err(e) => {
-                    tracing::error!("Antigravity API error: {}", e);
+                    let msg = e.to_string();
+                    tracing::error!("Antigravity API error: {}", msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                        continue;
+                    }
                     return Json(json!({
                         "error": {
-                            "message": format!("Antigravity API error: {}", e),
+                            "message": format!("Antigravity API error: {}", msg),
                             "type": "api_error",
                             "code": 500
                         }
@@ -2929,25 +3083,15 @@ pub async fn completions(
             }
         }
 
-        match client.generate_content(&antigravity_request, None).await {
-            Ok(response) => {
-                let openai_response =
-                    gemini::gemini_to_openai_response(&response, &model, &request_id);
-                let completions_response = convert_chat_response_to_completions(&openai_response);
-                return Json(completions_response).into_response();
+        let message = last_error.unwrap_or_else(|| "Antigravity API error".to_string());
+        return Json(json!({
+            "error": {
+                "message": format!("Antigravity API error: {}", message),
+                "type": "api_error",
+                "code": 500
             }
-            Err(e) => {
-                tracing::error!("Antigravity API error: {}", e);
-                return Json(json!({
-                    "error": {
-                        "message": format!("Antigravity API error: {}", e),
-                        "type": "api_error",
-                        "code": 500
-                    }
-                }))
-                .into_response();
-            }
-        }
+        }))
+        .into_response();
     }
 
     if provider_override.as_deref() == Some("kiro") {
@@ -3550,84 +3694,126 @@ pub async fn claude_messages(
             model_lower.contains("-thinking") || model_lower.starts_with("claude-");
         let reasoning_as_text = !supports_thinking;
 
-        let auth = match get_antigravity_auth(&model).await {
-            Some(a) => a,
-            None => {
-                return Json(json!({
-                    "error": {
-                        "message": "No valid Antigravity credentials found. Please login with Antigravity first.",
-                        "type": "authentication_error",
-                        "code": 401
-                    }
-                }))
-                .into_response();
-            }
-        };
-
-        let AntigravityAuth {
-            access_token,
-            project_id,
-        } = auth;
-        let client = AntigravityClient::new(access_token);
-        let antigravity_request =
-            antigravity::openai_to_antigravity_request(&openai_raw, &model, project_id);
-
-        if is_stream {
-            match client.stream_generate_content(&antigravity_request, None).await {
-                Ok(response) => {
-                    let upstream = antigravity::antigravity_stream_to_openai_chunks(response);
-                    let stream = openai_chunks_to_claude_events_with_options(
-                        upstream,
-                        &model,
-                        reasoning_as_text,
-                    );
-                    return Sse::new(stream).into_response();
+        let auths = get_antigravity_auths(&model).await;
+        if auths.is_empty() {
+            return Json(json!({
+                "error": {
+                    "message": "No valid Antigravity credentials found. Please login with Antigravity first.",
+                    "type": "authentication_error",
+                    "code": 401
                 }
-                Err(e) => {
-                    tracing::error!("Antigravity API error: {}", e);
-                    return Json(json!({
-                        "error": {
-                            "message": format!("Antigravity API error: {}", e),
-                            "type": "api_error",
-                            "code": 500
-                        }
-                    }))
-                    .into_response();
-                }
-            }
+            }))
+            .into_response();
         }
 
-        if antigravity::should_use_stream_for_non_stream(&model) {
-            match client.stream_generate_content(&antigravity_request, None).await {
-                Ok(response) => match antigravity::collect_antigravity_stream(response).await {
-                    Ok(payload) => {
-                        let openai_response =
-                            gemini::gemini_to_openai_response(&payload, &model, &request_id);
-                        let claude_response = claude::openai_to_claude_response_with_options(
-                            &openai_response,
+        let mut last_error: Option<String> = None;
+        let total = auths.len();
+        for (idx, auth) in auths.into_iter().enumerate() {
+            let AntigravityAuth {
+                access_token,
+                project_id,
+            } = auth;
+            let client = AntigravityClient::new(access_token);
+            let antigravity_request =
+                antigravity::openai_to_antigravity_request(&openai_raw, &model, project_id);
+
+            if is_stream {
+                match client.stream_generate_content(&antigravity_request, None).await {
+                    Ok(response) => {
+                        let upstream = antigravity::antigravity_stream_to_openai_chunks(response);
+                        let stream = openai_chunks_to_claude_events_with_options(
+                            upstream,
                             &model,
-                            &request_id,
                             reasoning_as_text,
                         );
-                        return Json(claude_response).into_response();
+                        return Sse::new(stream).into_response();
                     }
                     Err(e) => {
-                        tracing::error!("Antigravity API error: {}", e);
+                        let msg = e.to_string();
+                        tracing::error!("Antigravity API error: {}", msg);
+                        last_error = Some(msg.clone());
+                        if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                            continue;
+                        }
                         return Json(json!({
                             "error": {
-                                "message": format!("Antigravity API error: {}", e),
+                                "message": format!("Antigravity API error: {}", msg),
                                 "type": "api_error",
                                 "code": 500
                             }
                         }))
                         .into_response();
                     }
-                },
+                }
+            }
+
+            if antigravity::should_use_stream_for_non_stream(&model) {
+                match client.stream_generate_content(&antigravity_request, None).await {
+                    Ok(response) => match antigravity::collect_antigravity_stream(response).await {
+                        Ok(payload) => {
+                            let openai_response =
+                                gemini::gemini_to_openai_response(&payload, &model, &request_id);
+                            let claude_response = claude::openai_to_claude_response_with_options(
+                                &openai_response,
+                                &model,
+                                &request_id,
+                                reasoning_as_text,
+                            );
+                            return Json(claude_response).into_response();
+                        }
+                        Err(e) => {
+                            tracing::error!("Antigravity API error: {}", e);
+                            return Json(json!({
+                                "error": {
+                                    "message": format!("Antigravity API error: {}", e),
+                                    "type": "api_error",
+                                    "code": 500
+                                }
+                            }))
+                            .into_response();
+                        }
+                    },
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::error!("Antigravity API error: {}", msg);
+                        last_error = Some(msg.clone());
+                        if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                            continue;
+                        }
+                        return Json(json!({
+                            "error": {
+                                "message": format!("Antigravity API error: {}", msg),
+                                "type": "api_error",
+                                "code": 500
+                            }
+                        }))
+                        .into_response();
+                    }
+                }
+            }
+
+            match client.generate_content(&antigravity_request, None).await {
+                Ok(response) => {
+                    let openai_response =
+                        gemini::gemini_to_openai_response(&response, &model, &request_id);
+                    let claude_response = claude::openai_to_claude_response_with_options(
+                        &openai_response,
+                        &model,
+                        &request_id,
+                        reasoning_as_text,
+                    );
+                    return Json(claude_response).into_response();
+                }
                 Err(e) => {
-                    tracing::error!("Antigravity API error: {}", e);
+                    let msg = e.to_string();
+                    tracing::error!("Antigravity API error: {}", msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                        continue;
+                    }
                     return Json(json!({
                         "error": {
-                            "message": format!("Antigravity API error: {}", e),
+                            "message": format!("Antigravity API error: {}", msg),
                             "type": "api_error",
                             "code": 500
                         }
@@ -3637,30 +3823,15 @@ pub async fn claude_messages(
             }
         }
 
-        match client.generate_content(&antigravity_request, None).await {
-            Ok(response) => {
-                let openai_response =
-                    gemini::gemini_to_openai_response(&response, &model, &request_id);
-                let claude_response = claude::openai_to_claude_response_with_options(
-                    &openai_response,
-                    &model,
-                    &request_id,
-                    reasoning_as_text,
-                );
-                return Json(claude_response).into_response();
+        let message = last_error.unwrap_or_else(|| "Antigravity API error".to_string());
+        return Json(json!({
+            "error": {
+                "message": format!("Antigravity API error: {}", message),
+                "type": "api_error",
+                "code": 500
             }
-            Err(e) => {
-                tracing::error!("Antigravity API error: {}", e);
-                return Json(json!({
-                    "error": {
-                        "message": format!("Antigravity API error: {}", e),
-                        "type": "api_error",
-                        "code": 500
-                    }
-                }))
-                .into_response();
-            }
-        }
+        }))
+        .into_response();
     }
 
     // Handle custom providers (Claude Code-compatible only for /v1/messages endpoint)

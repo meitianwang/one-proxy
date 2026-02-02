@@ -45,46 +45,97 @@ fn protocol_from_path(path: &str) -> Option<String> {
     }
 }
 
+/// Extract model name from request body JSON
+fn extract_model_from_body(body: &[u8]) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
+    json.get("model").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
 /// Request logging middleware
 async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
     let start = std::time::Instant::now();
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
 
-    let response = next.run(request).await;
+    // Skip logging for model list requests early
+    if path == "/v1/models" || (path.starts_with("/v1beta/models") && method == "GET") {
+        return next.run(request).await;
+    }
 
-    // Skip logging for model list requests
-    if path == "/v1/models" || path.starts_with("/v1beta/models") && method == "GET" {
+    // Extract model from request body for POST requests
+    if method == "POST" {
+        // Buffer the body to extract model
+        let (parts, body) = request.into_parts();
+        let bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+            Ok(b) => b,
+            Err(_) => {
+                // If we can't read the body, just continue without model info
+                let request = Request::from_parts(parts, Body::empty());
+                let response = next.run(request).await;
+                return response;
+            }
+        };
+        
+        let model = extract_model_from_body(&bytes);
+        
+        // Reconstruct the request with the buffered body
+        let request = Request::from_parts(parts, Body::from(bytes.to_vec()));
+        let response = next.run(request).await;
+        
+        let protocol = protocol_from_path(&path);
+        let duration_ms = start.elapsed().as_millis() as i64;
+        let status = response.status().as_u16() as i32;
+        
+        let error_message = if status >= 400 {
+            Some(format!("HTTP {}", status))
+        } else {
+            None
+        };
+        
+        let _ = crate::db::save_request_log(
+            status,
+            &method,
+            model.as_deref(),
+            protocol.as_deref(),
+            None,
+            &path,
+            0,
+            0,
+            duration_ms,
+            error_message.as_deref(),
+        );
+        
         return response;
     }
+
+    let response = next.run(request).await;
 
     let protocol = protocol_from_path(&path);
     let duration_ms = start.elapsed().as_millis() as i64;
     let status = response.status().as_u16() as i32;
 
-    // Determine if this is an error
     let error_message = if status >= 400 {
         Some(format!("HTTP {}", status))
     } else {
         None
     };
 
-    // Save log to database (ignore errors to not affect the response)
     let _ = crate::db::save_request_log(
         status,
         &method,
-        None, // model - will be set by handler via update
+        None,
         protocol.as_deref(),
-        None, // account_id - will be set by handler via update
+        None,
         &path,
-        0, // input_tokens
-        0, // output_tokens
+        0,
+        0,
         duration_ms,
         error_message.as_deref(),
     );
 
     response
 }
+
 
 /// API Key authentication middleware
 async fn auth_middleware(request: Request<Body>, next: Next) -> Response {
