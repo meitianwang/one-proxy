@@ -221,3 +221,98 @@ pub async fn get_request_logs_count(filter: Option<crate::db::LogFilter>) -> Res
 pub async fn clear_request_logs() -> Result<(), String> {
     crate::db::clear_request_logs().map_err(|e| e.to_string())
 }
+
+// ============ Claude Code Config Commands ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeCodeConfig {
+    pub opus_model: String,
+    pub sonnet_model: String,
+    pub haiku_model: String,
+}
+
+#[tauri::command]
+pub async fn get_claude_code_config() -> Result<Option<ClaudeCodeConfig>, String> {
+    let home = dirs::home_dir().ok_or("Cannot find home directory")?;
+    let settings_path = home.join(".claude").join("settings.json");
+
+    if !settings_path.exists() {
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(&settings_path)
+        .map_err(|e| format!("Failed to read settings.json: {}", e))?;
+
+    let json: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse settings.json: {}", e))?;
+
+    let env = json.get("env").and_then(|v| v.as_object());
+
+    if let Some(env) = env {
+        Ok(Some(ClaudeCodeConfig {
+            opus_model: env.get("ANTHROPIC_DEFAULT_OPUS_MODEL")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            sonnet_model: env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            haiku_model: env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+pub async fn save_claude_code_config(claude_config: ClaudeCodeConfig) -> Result<(), String> {
+    let home = dirs::home_dir().ok_or("Cannot find home directory")?;
+    let claude_dir = home.join(".claude");
+    let settings_path = claude_dir.join("settings.json");
+
+    // Ensure .claude directory exists
+    std::fs::create_dir_all(&claude_dir)
+        .map_err(|e| format!("Failed to create .claude directory: {}", e))?;
+
+    // Get current config for base URL and API key
+    let app_config = config::get_config().unwrap_or_default();
+    let base_url = format!("http://127.0.0.1:{}", app_config.port);
+    let api_key = app_config.api_keys.first()
+        .cloned()
+        .unwrap_or_else(|| "sk-oneproxy".to_string());
+
+    // Read existing settings to preserve other fields
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
+        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    // Update env section
+    let env = serde_json::json!({
+        "ANTHROPIC_AUTH_TOKEN": api_key,
+        "ANTHROPIC_BASE_URL": base_url,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": claude_config.opus_model,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": claude_config.sonnet_model,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": claude_config.haiku_model,
+        "API_TIMEOUT_MS": "3000000",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+    });
+
+    settings["env"] = env;
+
+    // Write back
+    let content = serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("Failed to serialize settings: {}", e))?;
+
+    std::fs::write(&settings_path, content)
+        .map_err(|e| format!("Failed to write settings.json: {}", e))?;
+
+    tracing::info!("Claude Code config saved to {:?}", settings_path);
+    Ok(())
+}

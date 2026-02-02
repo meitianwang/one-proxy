@@ -15,6 +15,12 @@ interface AppConfig {
   };
 }
 
+interface ClaudeCodeConfig {
+  opus_model: string;
+  sonnet_model: string;
+  haiku_model: string;
+}
+
 interface DashboardProps {
   serverStatus: ServerStatus;
   onStatusChange: () => void;
@@ -27,6 +33,15 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
   const [selectedModel, setSelectedModel] = useState("gemini-2.5-flash");
   const [models, setModels] = useState<{ id: string; name: string; desc: string }[]>([]);
   const [copied, setCopied] = useState(false);
+
+  // Claude Code config state
+  const [claudeConfig, setClaudeConfig] = useState<ClaudeCodeConfig>({
+    opus_model: "",
+    sonnet_model: "",
+    haiku_model: "",
+  });
+  const [claudeConfigSaving, setClaudeConfigSaving] = useState(false);
+  const [claudeConfigSaved, setClaudeConfigSaved] = useState(false);
 
   const baseUrl = `http://127.0.0.1:${config?.port ?? 8417}`;
   const apiKey = config?.["api-keys"]?.[0] ?? "your-api-key";
@@ -52,6 +67,7 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
 
   useEffect(() => {
     fetchConfig();
+    fetchClaudeCodeConfig();
   }, []);
 
   useEffect(() => {
@@ -96,6 +112,32 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
       console.error("Failed to fetch config:", error);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function fetchClaudeCodeConfig() {
+    try {
+      const result = await invoke<ClaudeCodeConfig | null>("get_claude_code_config");
+      if (result) {
+        setClaudeConfig(result);
+      }
+    } catch (error) {
+      console.error("Failed to fetch Claude Code config:", error);
+    }
+  }
+
+  async function saveClaudeCodeConfig() {
+    setClaudeConfigSaving(true);
+    setClaudeConfigSaved(false);
+    try {
+      await invoke("save_claude_code_config", { claudeConfig });
+      setClaudeConfigSaved(true);
+      setTimeout(() => setClaudeConfigSaved(false), 2000);
+    } catch (error) {
+      console.error("Failed to save Claude Code config:", error);
+      alert(`保存失败: ${error}`);
+    } finally {
+      setClaudeConfigSaving(false);
     }
   }
 
@@ -398,6 +440,112 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
             </pre>
           </div>
         </div>
+      </div>
+
+      {/* Claude Code Config */}
+      <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-6">
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-lg bg-gray-100 dark:bg-gray-700 flex items-center justify-center">
+              <svg className="w-5 h-5 text-gray-600 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+              </svg>
+            </div>
+            <div>
+              <h3 className="text-lg font-semibold text-gray-800 dark:text-white">Claude Code 配置</h3>
+              <p className="text-sm text-gray-500 dark:text-gray-400">配置 ~/.claude/settings.json 模型映射</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {claudeConfigSaved && (
+              <span className="text-sm text-green-600 dark:text-green-400 flex items-center gap-1">
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                </svg>
+                已保存
+              </span>
+            )}
+            <button
+              onClick={saveClaudeCodeConfig}
+              disabled={claudeConfigSaving}
+              className="px-4 py-2 bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600 text-white rounded-lg font-medium disabled:opacity-50 flex items-center gap-2"
+            >
+              {claudeConfigSaving ? (
+                <>
+                  <svg className="w-4 h-4 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  保存中...
+                </>
+              ) : (
+                "写入配置"
+              )}
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {/* Opus Model */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+              Opus 模型
+            </label>
+            <select
+              value={claudeConfig.opus_model}
+              onChange={(e) => setClaudeConfig({ ...claudeConfig, opus_model: e.target.value })}
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-800 dark:text-white text-sm"
+            >
+              <option value="">选择模型...</option>
+              {models.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.id}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Sonnet Model */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+              Sonnet 模型
+            </label>
+            <select
+              value={claudeConfig.sonnet_model}
+              onChange={(e) => setClaudeConfig({ ...claudeConfig, sonnet_model: e.target.value })}
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-800 dark:text-white text-sm"
+            >
+              <option value="">选择模型...</option>
+              {models.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.id}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Haiku Model */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+              Haiku 模型
+            </label>
+            <select
+              value={claudeConfig.haiku_model}
+              onChange={(e) => setClaudeConfig({ ...claudeConfig, haiku_model: e.target.value })}
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-800 dark:text-white text-sm"
+            >
+              <option value="">选择模型...</option>
+              {models.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.id}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        <p className="mt-4 text-xs text-gray-500 dark:text-gray-400">
+          配置将写入 ~/.claude/settings.json，用于 Claude Code CLI 的模型映射。保存后需要重启 Claude Code 生效。
+        </p>
       </div>
     </div>
   );

@@ -83,6 +83,8 @@ pub fn run() {
             commands::get_request_logs,
             commands::get_request_logs_count,
             commands::clear_request_logs,
+            commands::get_claude_code_config,
+            commands::save_claude_code_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
