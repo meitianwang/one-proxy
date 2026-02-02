@@ -15,7 +15,10 @@ const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json";
 const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 const CLIENT_SECRET: &str = "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";
-const REDIRECT_URI: &str = "http://localhost:8417/antigravity/callback";
+fn get_redirect_uri() -> String {
+    let config = crate::config::get_config().unwrap_or_default();
+    format!("http://localhost:{}/antigravity/callback", config.port)
+}
 const API_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
 const API_VERSION: &str = "v1internal";
 const API_USER_AGENT: &str = "google-api-nodejs-client/9.15.1";
@@ -104,11 +107,12 @@ pub async fn start_oauth() -> Result<String> {
     ]
     .join(" ");
 
+    let redirect_uri = get_redirect_uri();
     let auth_url = format!(
         "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}&code_challenge={}&code_challenge_method=S256",
         AUTH_URL,
         CLIENT_ID,
-        urlencoding::encode(REDIRECT_URI),
+        urlencoding::encode(&redirect_uri),
         urlencoding::encode(&scopes),
         state,
         code_challenge
@@ -127,13 +131,14 @@ pub async fn exchange_code(code: &str, state: &str) -> Result<TokenResponse> {
 
     let client = reqwest::Client::new();
 
+    let redirect_uri = get_redirect_uri();
     let params = [
         ("client_id", CLIENT_ID),
         ("client_secret", CLIENT_SECRET),
         ("code", code),
         ("code_verifier", &session.code_verifier),
         ("grant_type", "authorization_code"),
-        ("redirect_uri", REDIRECT_URI),
+        ("redirect_uri", redirect_uri.as_str()),
     ];
 
     let response = client
