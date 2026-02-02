@@ -4488,6 +4488,15 @@ pub async fn antigravity_callback(
             }
 
             tracing::info!("Saved Antigravity auth file to {:?}", path);
+            let account_id = format!("antigravity_{}", identifier);
+            match auth::fetch_antigravity_quota(&account_id).await {
+                Ok(_) => tracing::info!("Fetched Antigravity quota for new account {}", account_id),
+                Err(e) => tracing::warn!(
+                    "Failed to fetch Antigravity quota for new account {}: {}",
+                    account_id,
+                    e
+                ),
+            }
             Html(OAUTH_SUCCESS_HTML.to_string())
         }
         Err(e) => {
