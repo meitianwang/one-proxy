@@ -299,6 +299,10 @@ pub fn antigravity_stream_to_openai_chunks(
         let mut state = AntigravityStreamState {
             unix_timestamp: 0,
             function_index: 0,
+            active_function_name: None,
+            active_function_id: None,
+            active_function_args: String::new(),
+            active_function_index: 0,
         };
         let mut buffer = String::new();
         let mut stream = response.bytes_stream();
@@ -382,6 +386,10 @@ pub async fn collect_antigravity_stream(response: reqwest::Response) -> Result<V
 struct AntigravityStreamState {
     unix_timestamp: i64,
     function_index: i32,
+    active_function_name: Option<String>,
+    active_function_id: Option<String>,
+    active_function_args: String,
+    active_function_index: i32,
 }
 
 fn convert_antigravity_stream_chunk(data: &str, state: &mut AntigravityStreamState) -> Vec<String> {
@@ -499,35 +507,79 @@ fn convert_antigravity_stream_chunk(data: &str, state: &mut AntigravityStreamSta
 
             if let Some(function_call) = function_call {
                 has_function_call = true;
-                let mut index = state.function_index;
-                if let Some(arr) = template["choices"][0]["delta"]["tool_calls"].as_array() {
-                    index = arr.len() as i32;
-                } else {
+                if !template["choices"][0]["delta"]["tool_calls"].is_array() {
                     template["choices"][0]["delta"]["tool_calls"] = json!([]);
                 }
-                let fc_name = function_call.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let counter = FUNCTION_CALL_ID_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
-                let nanos = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
+
+                let fc_name = function_call
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if fc_name.is_empty() {
+                    continue;
+                }
+
+                let args_value = function_call.get("args").cloned().unwrap_or(json!(""));
+                let args_str = if let Some(s) = args_value.as_str() {
+                    s.to_string()
+                } else {
+                    serde_json::to_string(&args_value).unwrap_or_else(|_| "{}".to_string())
+                };
+
+                let is_continuation = state
+                    .active_function_name
+                    .as_ref()
+                    .map(|n| n == fc_name)
+                    .unwrap_or(false)
+                    && args_str.starts_with(&state.active_function_args);
+
+                let (tool_id, tool_index, delta_args, include_name) = if is_continuation {
+                    let delta = args_str[state.active_function_args.len()..].to_string();
+                    state.active_function_args = args_str.clone();
+                    (
+                        state
+                            .active_function_id
+                            .clone()
+                            .unwrap_or_else(|| fc_name.to_string()),
+                        state.active_function_index,
+                        delta,
+                        false,
+                    )
+                } else {
+                    let counter = FUNCTION_CALL_ID_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+                    let nanos = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    let new_id = format!("{}-{}-{}", fc_name, nanos, counter);
+                    let new_index = state.function_index;
+                    state.function_index += 1;
+                    state.active_function_name = Some(fc_name.to_string());
+                    state.active_function_id = Some(new_id.clone());
+                    state.active_function_args = args_str.clone();
+                    state.active_function_index = new_index;
+                    (new_id, new_index, args_str.clone(), true)
+                };
+
+                if delta_args.is_empty() && !include_name {
+                    continue;
+                }
+
                 let mut tool_call = json!({
-                    "id": format!("{}-{}-{}", fc_name, nanos, counter),
-                    "index": index,
+                    "id": tool_id,
+                    "index": tool_index,
                     "type": "function",
                     "function": {
-                        "name": fc_name,
-                        "arguments": ""
+                        "arguments": delta_args
                     }
                 });
-                if let Some(args) = function_call.get("args") {
-                    tool_call["function"]["arguments"] = args.clone();
+                if include_name {
+                    tool_call["function"]["name"] = json!(fc_name);
                 }
                 if let Some(arr) = template["choices"][0]["delta"]["tool_calls"].as_array_mut() {
                     arr.push(tool_call);
                 }
                 template["choices"][0]["delta"]["role"] = json!("assistant");
-                state.function_index += 1;
                 continue;
             }
 

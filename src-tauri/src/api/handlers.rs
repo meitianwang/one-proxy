@@ -665,6 +665,8 @@ struct ClaudeStreamState {
     message_id: String,
     model: String,
     message_started: bool,
+    thinking_started: bool,
+    thinking_closed: bool,
     text_started: bool,
     finish_reason: Option<String>,
     tool_calls: HashMap<i32, ToolCallAccumulator>,
@@ -684,7 +686,11 @@ fn build_claude_event(event: &str, payload: Value) -> Event {
     Event::default().event(event).data(payload.to_string())
 }
 
-fn openai_chunk_to_claude_events(chunk: &str, state: &mut ClaudeStreamState) -> Vec<Event> {
+fn openai_chunk_to_claude_events(
+    chunk: &str,
+    state: &mut ClaudeStreamState,
+    reasoning_as_text: bool,
+) -> Vec<Event> {
     let mut events = Vec::new();
     let parsed: Value = match serde_json::from_str(chunk) {
         Ok(v) => v,
@@ -741,30 +747,80 @@ fn openai_chunk_to_claude_events(chunk: &str, state: &mut ClaudeStreamState) -> 
             }
         }
         if let Some(delta) = choice.get("delta") {
-            if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
-                if !content.is_empty() {
-                    if !state.text_started {
-                        let payload = json!({
-                            "type": "content_block_start",
-                            "index": 0,
-                            "content_block": {
-                                "type": "text",
-                                "text": ""
-                            }
-                        });
-                        events.push(build_claude_event("content_block_start", payload));
-                        state.text_started = true;
-                    }
+            let emit_text = |text: &str, state: &mut ClaudeStreamState, events: &mut Vec<Event>| {
+                if text.is_empty() {
+                    return;
+                }
+                // Close thinking block before starting text block
+                if state.thinking_started && !state.thinking_closed {
+                    let stop_payload = json!({
+                        "type": "content_block_stop",
+                        "index": 0
+                    });
+                    events.push(build_claude_event("content_block_stop", stop_payload));
+                    state.thinking_closed = true;
+                }
+
+                let text_index = if state.thinking_started { 1 } else { 0 };
+                if !state.text_started {
                     let payload = json!({
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": {
-                            "type": "text_delta",
-                            "text": content
+                        "type": "content_block_start",
+                        "index": text_index,
+                        "content_block": {
+                            "type": "text",
+                            "text": ""
                         }
                     });
-                    events.push(build_claude_event("content_block_delta", payload));
+                    events.push(build_claude_event("content_block_start", payload));
+                    state.text_started = true;
                 }
+                let payload = json!({
+                    "type": "content_block_delta",
+                    "index": text_index,
+                    "delta": {
+                        "type": "text_delta",
+                        "text": text
+                    }
+                });
+                events.push(build_claude_event("content_block_delta", payload));
+            };
+
+            // Handle reasoning_content (thinking) - index 0
+            // Only process if thinking block hasn't been closed yet
+            if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                if !reasoning.is_empty() {
+                    if reasoning_as_text {
+                        emit_text(reasoning, state, &mut events);
+                    } else if !state.thinking_closed {
+                        if !state.thinking_started {
+                            let payload = json!({
+                                "type": "content_block_start",
+                                "index": 0,
+                                "content_block": {
+                                    "type": "thinking",
+                                    "thinking": "",
+                                    "signature": format!("sig_{}", uuid::Uuid::new_v4().to_string().replace("-", "")[..32].to_string())
+                                }
+                            });
+                            events.push(build_claude_event("content_block_start", payload));
+                            state.thinking_started = true;
+                        }
+                        let payload = json!({
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": "thinking_delta",
+                                "thinking": reasoning
+                            }
+                        });
+                        events.push(build_claude_event("content_block_delta", payload));
+                    }
+                }
+            }
+
+            // Handle content (text) - index 1 if thinking exists, else index 0
+            if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                emit_text(content, state, &mut events);
             }
 
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
@@ -797,9 +853,10 @@ fn openai_chunk_to_claude_events(chunk: &str, state: &mut ClaudeStreamState) -> 
 
                     if !entry.started && !entry.name.is_empty() {
                         if state.text_started {
+                            let text_index = if state.thinking_started { 1 } else { 0 };
                             let stop_payload = json!({
                                 "type": "content_block_stop",
-                                "index": 0
+                                "index": text_index
                             });
                             events.push(build_claude_event("content_block_stop", stop_payload));
                             state.text_started = false;
@@ -828,12 +885,26 @@ fn openai_chunk_to_claude_events(chunk: &str, state: &mut ClaudeStreamState) -> 
 
 fn finalize_claude_stream(state: &mut ClaudeStreamState) -> Vec<Event> {
     let mut events = Vec::new();
-    if state.text_started {
+
+    // Close thinking block if it was started but not yet closed
+    if state.thinking_started && !state.thinking_closed {
         events.push(build_claude_event(
             "content_block_stop",
             json!({
                 "type": "content_block_stop",
                 "index": 0
+            }),
+        ));
+    }
+
+    // Close text block
+    if state.text_started {
+        let text_index = if state.thinking_started { 1 } else { 0 };
+        events.push(build_claude_event(
+            "content_block_stop",
+            json!({
+                "type": "content_block_stop",
+                "index": text_index
             }),
         ));
     }
@@ -872,6 +943,9 @@ fn finalize_claude_stream(state: &mut ClaudeStreamState) -> Vec<Event> {
             "delta": {
                 "stop_reason": stop_reason,
                 "stop_sequence": null
+            },
+            "usage": {
+                "output_tokens": 0
             }
         }),
     ));
@@ -889,7 +963,19 @@ fn openai_chunks_to_claude_events<S>(
 where
     S: futures::Stream<Item = String>,
 {
+    openai_chunks_to_claude_events_with_options(upstream, model_hint, false)
+}
+
+fn openai_chunks_to_claude_events_with_options<S>(
+    upstream: S,
+    model_hint: &str,
+    reasoning_as_text: bool,
+) -> impl futures::Stream<Item = Result<Event, Infallible>>
+where
+    S: futures::Stream<Item = String>,
+{
     let model_hint = model_hint.to_string();
+    let reasoning_as_text = reasoning_as_text;
     async_stream::stream! {
         let mut state = ClaudeStreamState {
             model: model_hint,
@@ -903,7 +989,7 @@ where
                 }
                 return;
             }
-            for event in openai_chunk_to_claude_events(&chunk, &mut state) {
+            for event in openai_chunk_to_claude_events(&chunk, &mut state, reasoning_as_text) {
                 yield Ok::<Event, Infallible>(event);
             }
         }
@@ -3200,7 +3286,8 @@ pub async fn claude_messages(
         Some("kiro") => claude::ClaudeImageHandling::Base64TypeOnly,
         _ => claude::ClaudeImageHandling::Base64AndUrl,
     };
-    let openai_raw = claude::claude_request_to_openai_chat(&raw, &model, image_handling);
+    let guard_thinking = provider_override.as_deref() == Some("antigravity");
+    let openai_raw = claude::claude_request_to_openai_chat(&raw, &model, image_handling, guard_thinking);
 
     if provider_override.as_deref() == Some("gemini") {
         let auth = match get_gemini_auth(&model).await {
@@ -3458,6 +3545,11 @@ pub async fn claude_messages(
     }
 
     if provider_override.as_deref() == Some("antigravity") {
+        let model_lower = model.to_lowercase();
+        let supports_thinking =
+            model_lower.contains("-thinking") || model_lower.starts_with("claude-");
+        let reasoning_as_text = !supports_thinking;
+
         let auth = match get_antigravity_auth(&model).await {
             Some(a) => a,
             None => {
@@ -3484,7 +3576,11 @@ pub async fn claude_messages(
             match client.stream_generate_content(&antigravity_request, None).await {
                 Ok(response) => {
                     let upstream = antigravity::antigravity_stream_to_openai_chunks(response);
-                    let stream = openai_chunks_to_claude_events(upstream, &model);
+                    let stream = openai_chunks_to_claude_events_with_options(
+                        upstream,
+                        &model,
+                        reasoning_as_text,
+                    );
                     return Sse::new(stream).into_response();
                 }
                 Err(e) => {
@@ -3507,8 +3603,12 @@ pub async fn claude_messages(
                     Ok(payload) => {
                         let openai_response =
                             gemini::gemini_to_openai_response(&payload, &model, &request_id);
-                        let claude_response =
-                            claude::openai_to_claude_response(&openai_response, &model, &request_id);
+                        let claude_response = claude::openai_to_claude_response_with_options(
+                            &openai_response,
+                            &model,
+                            &request_id,
+                            reasoning_as_text,
+                        );
                         return Json(claude_response).into_response();
                     }
                     Err(e) => {
@@ -3541,8 +3641,12 @@ pub async fn claude_messages(
             Ok(response) => {
                 let openai_response =
                     gemini::gemini_to_openai_response(&response, &model, &request_id);
-                let claude_response =
-                    claude::openai_to_claude_response(&openai_response, &model, &request_id);
+                let claude_response = claude::openai_to_claude_response_with_options(
+                    &openai_response,
+                    &model,
+                    &request_id,
+                    reasoning_as_text,
+                );
                 return Json(claude_response).into_response();
             }
             Err(e) => {
@@ -3615,7 +3719,7 @@ pub async fn claude_messages(
             let provider_name = provider_key.split(':').nth(1).unwrap_or("custom");
 
             // Convert Claude request to OpenAI format
-            let openai_request = claude::claude_request_to_openai_chat(&raw, &model, claude::ClaudeImageHandling::Base64Any);
+            let openai_request = claude::claude_request_to_openai_chat(&raw, &model, claude::ClaudeImageHandling::Base64Any, false);
             let mut payload = openai_request;
             payload["model"] = json!(model);
             if is_stream {

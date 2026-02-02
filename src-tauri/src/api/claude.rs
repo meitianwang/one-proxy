@@ -497,6 +497,7 @@ pub fn claude_request_to_openai_chat(
     raw: &Value,
     model: &str,
     image_handling: ClaudeImageHandling,
+    guard_thinking: bool,
 ) -> Value {
     let mut out = json!({
         "model": model,
@@ -525,24 +526,36 @@ pub fn claude_request_to_openai_chat(
         out["stream"] = stream.clone();
     }
 
-    if let Some(thinking) = raw.get("thinking").and_then(|v| v.as_object()) {
-        if let Some(Value::String(tt)) = thinking.get("type") {
-            match tt.as_str() {
-                "enabled" => {
-                    if let Some(budget) = thinking.get("budget_tokens").and_then(|v| v.as_i64()) {
-                        if let Some(level) = convert_budget_to_level(budget) {
+    let model_lower = model.to_lowercase();
+    let supports_thinking = model_lower.contains("-thinking") || model_lower.starts_with("claude-");
+    let allow_thinking_map = !guard_thinking || supports_thinking;
+    if guard_thinking {
+        tracing::info!(
+            "[Claude->OpenAI] guard_thinking enabled | model={} | supports_thinking={}",
+            model,
+            supports_thinking
+        );
+    }
+    if allow_thinking_map {
+        if let Some(thinking) = raw.get("thinking").and_then(|v| v.as_object()) {
+            if let Some(Value::String(tt)) = thinking.get("type") {
+                match tt.as_str() {
+                    "enabled" => {
+                        if let Some(budget) = thinking.get("budget_tokens").and_then(|v| v.as_i64()) {
+                            if let Some(level) = convert_budget_to_level(budget) {
+                                out["reasoning_effort"] = json!(level);
+                            }
+                        } else if let Some(level) = convert_budget_to_level(-1) {
                             out["reasoning_effort"] = json!(level);
                         }
-                    } else if let Some(level) = convert_budget_to_level(-1) {
-                        out["reasoning_effort"] = json!(level);
                     }
-                }
-                "disabled" => {
-                    if let Some(level) = convert_budget_to_level(0) {
-                        out["reasoning_effort"] = json!(level);
+                    "disabled" => {
+                        if let Some(level) = convert_budget_to_level(0) {
+                            out["reasoning_effort"] = json!(level);
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }
@@ -747,6 +760,15 @@ pub fn openai_to_claude_response(
     model: &str,
     request_id: &str,
 ) -> Value {
+    openai_to_claude_response_with_options(openai_response, model, request_id, false)
+}
+
+pub fn openai_to_claude_response_with_options(
+    openai_response: &Value,
+    model: &str,
+    request_id: &str,
+    reasoning_as_text: bool,
+) -> Value {
     if let Some(error) = openai_response.get("error") {
         return json!({
             "error": error
@@ -812,7 +834,11 @@ pub fn openai_to_claude_response(
 
     if let Some(reasoning) = message.get("reasoning_content").and_then(|v| v.as_str()) {
         if !reasoning.is_empty() {
-            content_blocks.push(json!({ "type": "thinking", "thinking": reasoning }));
+            if reasoning_as_text {
+                content_blocks.push(json!({ "type": "text", "text": reasoning }));
+            } else {
+                content_blocks.push(json!({ "type": "thinking", "thinking": reasoning }));
+            }
         }
     }
 
