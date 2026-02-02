@@ -9,6 +9,7 @@ const CLAUDE_API_BASE: &str = "https://api.anthropic.com/v1";
 #[derive(Debug, Clone)]
 pub struct ClaudeClient {
     access_token: String,
+    base_url: String,
     http_client: reqwest::Client,
 }
 
@@ -63,12 +64,25 @@ impl ClaudeClient {
     pub fn new(access_token: String) -> Self {
         Self {
             access_token,
+            base_url: CLAUDE_API_BASE.to_string(),
+            http_client: reqwest::Client::new(),
+        }
+    }
+
+    pub fn new_with_base_url(access_token: String, base_url: impl Into<String>) -> Self {
+        let mut base_url = base_url.into();
+        while base_url.ends_with('/') {
+            base_url.pop();
+        }
+        Self {
+            access_token,
+            base_url,
             http_client: reqwest::Client::new(),
         }
     }
 
     pub async fn create_message(&self, request: ClaudeRequest) -> Result<ClaudeResponse> {
-        let url = format!("{}/messages", CLAUDE_API_BASE);
+        let url = format!("{}/messages", self.base_url);
 
         let response = self
             .http_client

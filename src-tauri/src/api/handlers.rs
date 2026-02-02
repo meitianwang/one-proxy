@@ -37,6 +37,9 @@ struct AntigravityAuth {
     project_id: Option<String>,
 }
 
+const KIMI_ANTHROPIC_BASE: &str = "https://api.kimi.com/coding/v1";
+const GLM_ANTHROPIC_BASE: &str = "https://open.bigmodel.cn/api/anthropic/v1";
+
 // Root endpoint
 pub async fn root() -> Json<Value> {
     Json(json!({
@@ -73,6 +76,8 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
     let mut has_codex = false;
     let mut has_antigravity = false;
     let mut has_claude = false;
+    let mut has_kimi = false;
+    let mut has_glm = false;
     let mut has_kiro = false;
 
     // Check which providers have valid auth files
@@ -104,6 +109,8 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
                                 "codex" => has_codex = true,
                                 "antigravity" => has_antigravity = true,
                                 "claude" => has_claude = true,
+                                "kimi" => has_kimi = true,
+                                "glm" => has_glm = true,
                                 "kiro" => has_kiro = true,
                                 _ => {}
                             }
@@ -136,6 +143,18 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
     if has_claude {
         let base = get_claude_models();
         models.extend(build_prefixed_models("claude", &base));
+    }
+
+    // Add Kimi models if available
+    if has_kimi {
+        let base = get_kimi_models();
+        models.extend(build_prefixed_models("kimi", &base));
+    }
+
+    // Add GLM models if available
+    if has_glm {
+        let base = get_glm_models();
+        models.extend(build_prefixed_models("glm", &base));
     }
 
     // Add Kiro models if available
@@ -320,6 +339,8 @@ fn normalize_provider_prefix(prefix: &str) -> Option<String> {
         "openai" => Some("codex".to_string()),
         "claude" => Some("claude".to_string()),
         "antigravity" => Some("antigravity".to_string()),
+        "kimi" => Some("kimi".to_string()),
+        "glm" => Some("glm".to_string()),
         "kiro" => Some("kiro".to_string()),
         _ => None,
     }
@@ -483,6 +504,77 @@ fn maybe_decompress_gzip(bytes: &[u8]) -> Vec<u8> {
         }
     }
     bytes.to_vec()
+}
+
+async fn forward_claude_compatible(
+    payload: Value,
+    base_url: &str,
+    token: &str,
+    is_stream: bool,
+    provider_label: &str,
+) -> Response {
+    let base = base_url.trim_end_matches('/').to_string();
+    if base.is_empty() {
+        return Json(json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": format!("{} API error: missing base URL", provider_label)
+            }
+        }))
+        .into_response();
+    }
+    let url = format!("{}/messages", base);
+    let client = reqwest::Client::new();
+    let response = match client
+        .post(url)
+        .header("x-api-key", token)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": format!("{} API error: {}", provider_label, e)
+                }
+            }))
+            .into_response();
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.bytes().await.unwrap_or_default();
+        let mut resp = Response::new(Body::from(body));
+        *resp.status_mut() = status;
+        resp.headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        return resp;
+    }
+
+    if is_stream {
+        let stream = response
+            .bytes_stream()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        let mut resp = Response::new(Body::from_stream(stream));
+        *resp.status_mut() = StatusCode::OK;
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        return resp;
+    }
+
+    let body = response.bytes().await.unwrap_or_default();
+    let body = maybe_decompress_gzip(&body);
+    let json_body: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    Json(json_body).into_response()
 }
 
 #[derive(Default)]
@@ -842,6 +934,42 @@ fn get_claude_models() -> Vec<ModelInfo> {
     ]
 }
 
+/// Get static Kimi model definitions
+fn get_kimi_models() -> Vec<ModelInfo> {
+    let created = chrono::Utc::now().timestamp();
+    vec![ModelInfo {
+        id: "kimi-for-coding".to_string(),
+        object: "model".to_string(),
+        created,
+        owned_by: "kimi".to_string(),
+    }]
+}
+
+/// Get static GLM model definitions
+fn get_glm_models() -> Vec<ModelInfo> {
+    let created = chrono::Utc::now().timestamp();
+    vec![
+        ModelInfo {
+            id: "glm-4.7".to_string(),
+            object: "model".to_string(),
+            created,
+            owned_by: "zhipuai".to_string(),
+        },
+        ModelInfo {
+            id: "glm-4.5-air".to_string(),
+            object: "model".to_string(),
+            created,
+            owned_by: "zhipuai".to_string(),
+        },
+        ModelInfo {
+            id: "glm-4.5-flash".to_string(),
+            object: "model".to_string(),
+            created,
+            owned_by: "zhipuai".to_string(),
+        },
+    ]
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -1060,6 +1188,35 @@ fn parse_token_snapshot(json: &Value) -> Option<TokenSnapshot> {
         location: TokenLocation::Root,
         expiry_key: Some("expired"),
     })
+}
+
+fn extract_api_key(json: &Value) -> Option<String> {
+    let fields = ["access_token", "api_key"];
+    if let Some(token_obj) = json.get("token").and_then(|v| v.as_object()) {
+        for key in fields {
+            let value = token_obj
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            if let Some(found) = value {
+                return Some(found.to_string());
+            }
+        }
+    }
+
+    for key in fields {
+        let value = json
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        if let Some(found) = value {
+            return Some(found.to_string());
+        }
+    }
+
+    None
 }
 
 fn is_expired(expires_at: Option<chrono::DateTime<chrono::Utc>>) -> bool {
@@ -1460,6 +1617,44 @@ async fn get_kiro_auth(model: &str) -> Option<kiro::KiroAuth> {
     None
 }
 
+/// Get a Kimi API key from stored credentials
+async fn get_kimi_token(model: &str) -> Option<String> {
+    let candidates = select_auth_candidates("kimi", model);
+    for candidate in candidates {
+        let content = match std::fs::read_to_string(&candidate.path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(token) = extract_api_key(&json) {
+            return Some(token);
+        }
+    }
+    None
+}
+
+/// Get a GLM API key from stored credentials
+async fn get_glm_token(model: &str) -> Option<String> {
+    let candidates = select_auth_candidates("glm", model);
+    for candidate in candidates {
+        let content = match std::fs::read_to_string(&candidate.path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(token) = extract_api_key(&json) {
+            return Some(token);
+        }
+    }
+    None
+}
+
 pub async fn chat_completions(
     State(_state): State<AppState>,
     Json(raw): Json<Value>,
@@ -1472,7 +1667,7 @@ pub async fn chat_completions(
     if provider_override.is_none() {
         return Json(json!({
             "error": {
-                "message": "Model must include provider prefix (e.g. 'gemini/...', 'claude/...', 'codex/...', 'antigravity/...', 'kiro/...').",
+                "message": "Model must include provider prefix (e.g. 'gemini/...', 'claude/...', 'codex/...', 'antigravity/...', 'kimi/...', 'glm/...', 'kiro/...').",
                 "type": "invalid_request_error",
                 "code": 400
             }
@@ -1823,6 +2018,71 @@ pub async fn chat_completions(
         }
     }
 
+    if matches!(provider_override.as_deref(), Some("kimi") | Some("glm")) {
+        let request: ChatCompletionRequest = match serde_json::from_value(raw.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                return Json(json!({
+                    "error": {
+                        "message": format!("Invalid request: {}", e),
+                        "type": "invalid_request_error",
+                        "code": 400
+                    }
+                }))
+                .into_response();
+            }
+        };
+
+        let (token, base_url, provider_label) = match provider_override.as_deref() {
+            Some("kimi") => (get_kimi_token(&model).await, KIMI_ANTHROPIC_BASE, "Kimi"),
+            Some("glm") => (get_glm_token(&model).await, GLM_ANTHROPIC_BASE, "GLM"),
+            _ => (None, "", "Unknown"),
+        };
+
+        let token = match token {
+            Some(t) => t,
+            None => {
+                return Json(json!({
+                    "error": {
+                        "message": format!("No valid {} credentials found. Please add an API key first.", provider_label),
+                        "type": "authentication_error",
+                        "code": 401
+                    }
+                }))
+                .into_response();
+            }
+        };
+
+        let client = ClaudeClient::new_with_base_url(token, base_url);
+        let (messages, system) = claude::openai_to_claude_messages(&request.messages);
+        let claude_request = ClaudeRequest {
+            model: model.clone(),
+            messages,
+            max_tokens: request.max_tokens.unwrap_or(4096),
+            temperature: request.temperature,
+            system,
+        };
+
+        match client.create_message(claude_request).await {
+            Ok(response) => {
+                let openai_response =
+                    claude::claude_to_openai_response(&response, &model, &request_id);
+                return Json(openai_response).into_response();
+            }
+            Err(e) => {
+                tracing::error!("{} API error: {}", provider_label, e);
+                return Json(json!({
+                    "error": {
+                        "message": format!("{} API error: {}", provider_label, e),
+                        "type": "api_error",
+                        "code": 500
+                    }
+                }))
+                .into_response();
+            }
+        }
+    }
+
     if provider_override.as_deref() == Some("claude") {
         let request: ChatCompletionRequest = match serde_json::from_value(raw.clone()) {
             Ok(r) => r,
@@ -1858,7 +2118,7 @@ pub async fn chat_completions(
         let (messages, system) = claude::openai_to_claude_messages(&request.messages);
 
         let claude_request = ClaudeRequest {
-            model: request.model.clone(),
+            model: model.clone(),
             messages,
             max_tokens: request.max_tokens.unwrap_or(4096),
             temperature: request.temperature,
@@ -1868,7 +2128,7 @@ pub async fn chat_completions(
         match client.create_message(claude_request).await {
             Ok(response) => {
             let openai_response =
-                claude::claude_to_openai_response(&response, &request.model, &request_id);
+                claude::claude_to_openai_response(&response, &model, &request_id);
             return Json(openai_response).into_response();
         }
             Err(e) => {
@@ -1887,7 +2147,7 @@ pub async fn chat_completions(
 
     Json(json!({
         "error": {
-            "message": "Unsupported provider. Use a supported provider prefix (gemini/..., claude/..., codex/..., antigravity/..., kiro/...).",
+            "message": "Unsupported provider. Use a supported provider prefix (gemini/..., claude/..., codex/..., antigravity/..., kimi/..., glm/..., kiro/...).",
             "type": "invalid_request_error",
             "code": 400
         }
@@ -1908,7 +2168,7 @@ pub async fn completions(
     if provider_override.is_none() {
         return Json(json!({
             "error": {
-                "message": "Model must include provider prefix (e.g. 'gemini/...', 'claude/...', 'codex/...', 'antigravity/...', 'kiro/...').",
+                "message": "Model must include provider prefix (e.g. 'gemini/...', 'claude/...', 'codex/...', 'antigravity/...', 'kimi/...', 'glm/...', 'kiro/...').",
                 "type": "invalid_request_error",
                 "code": 400
             }
@@ -2306,6 +2566,72 @@ pub async fn completions(
         }
     }
 
+    if matches!(provider_override.as_deref(), Some("kimi") | Some("glm")) {
+        let request: ChatCompletionRequest = match serde_json::from_value(chat_request.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                return Json(json!({
+                    "error": {
+                        "message": format!("Invalid request: {}", e),
+                        "type": "invalid_request_error",
+                        "code": 400
+                    }
+                }))
+                .into_response();
+            }
+        };
+
+        let (token, base_url, provider_label) = match provider_override.as_deref() {
+            Some("kimi") => (get_kimi_token(&model).await, KIMI_ANTHROPIC_BASE, "Kimi"),
+            Some("glm") => (get_glm_token(&model).await, GLM_ANTHROPIC_BASE, "GLM"),
+            _ => (None, "", "Unknown"),
+        };
+
+        let token = match token {
+            Some(t) => t,
+            None => {
+                return Json(json!({
+                    "error": {
+                        "message": format!("No valid {} credentials found. Please add an API key first.", provider_label),
+                        "type": "authentication_error",
+                        "code": 401
+                    }
+                }))
+                .into_response();
+            }
+        };
+
+        let client = ClaudeClient::new_with_base_url(token, base_url);
+        let (messages, system) = claude::openai_to_claude_messages(&request.messages);
+        let claude_request = ClaudeRequest {
+            model: model.clone(),
+            messages,
+            max_tokens: request.max_tokens.unwrap_or(4096),
+            temperature: request.temperature,
+            system,
+        };
+
+        match client.create_message(claude_request).await {
+            Ok(response) => {
+                let openai_response =
+                    claude::claude_to_openai_response(&response, &model, &request_id);
+                let completions_response = convert_chat_response_to_completions(&openai_response);
+                return Json(completions_response).into_response();
+            }
+            Err(e) => {
+                tracing::error!("{} API error: {}", provider_label, e);
+                return Json(json!({
+                    "error": {
+                        "message": format!("{} API error: {}", provider_label, e),
+                        "type": "api_error",
+                        "code": 500
+                    }
+                }))
+                .into_response();
+            }
+        }
+    }
+
     if provider_override.as_deref() == Some("claude") {
         let request: ChatCompletionRequest = match serde_json::from_value(chat_request.clone()) {
             Ok(r) => r,
@@ -2338,7 +2664,7 @@ pub async fn completions(
         let client = ClaudeClient::new(token);
         let (messages, system) = claude::openai_to_claude_messages(&request.messages);
         let claude_request = ClaudeRequest {
-            model: request.model.clone(),
+            model: model.clone(),
             messages,
             max_tokens: request.max_tokens.unwrap_or(4096),
             temperature: request.temperature,
@@ -2348,7 +2674,7 @@ pub async fn completions(
         match client.create_message(claude_request).await {
             Ok(response) => {
                 let openai_response =
-                    claude::claude_to_openai_response(&response, &request.model, &request_id);
+                    claude::claude_to_openai_response(&response, &model, &request_id);
                 let completions_response = convert_chat_response_to_completions(&openai_response);
                 return Json(completions_response).into_response();
             }
@@ -2368,7 +2694,7 @@ pub async fn completions(
 
     Json(json!({
         "error": {
-            "message": "Unsupported provider. Use a supported provider prefix (gemini/..., claude/..., codex/..., antigravity/..., kiro/...).",
+            "message": "Unsupported provider. Use a supported provider prefix (gemini/..., claude/..., codex/..., antigravity/..., kimi/..., glm/..., kiro/...).",
             "type": "invalid_request_error",
             "code": 400
         }
@@ -2389,7 +2715,7 @@ pub async fn claude_messages(
     if provider_override.is_none() {
         return Json(json!({
             "error": {
-                "message": "Model must include provider prefix (e.g. 'gemini/...', 'claude/...', 'codex/...', 'antigravity/...', 'kiro/...').",
+                "message": "Model must include provider prefix (e.g. 'gemini/...', 'claude/...', 'codex/...', 'antigravity/...', 'kimi/...', 'glm/...', 'kiro/...').",
                 "type": "invalid_request_error",
                 "code": 400
             }
@@ -2418,57 +2744,44 @@ pub async fn claude_messages(
             payload["stream"] = json!(true);
         }
 
-        let url = "https://api.anthropic.com/v1/messages";
-        let client = reqwest::Client::new();
-        let response = match client
-            .post(url)
-            .header("x-api-key", token)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
+        return forward_claude_compatible(
+            payload,
+            "https://api.anthropic.com/v1",
+            &token,
+            is_stream,
+            "Claude",
+        )
+        .await;
+    }
+
+    if matches!(provider_override.as_deref(), Some("kimi") | Some("glm")) {
+        let (token, base_url, provider_label) = match provider_override.as_deref() {
+            Some("kimi") => (get_kimi_token(&model).await, KIMI_ANTHROPIC_BASE, "Kimi"),
+            Some("glm") => (get_glm_token(&model).await, GLM_ANTHROPIC_BASE, "GLM"),
+            _ => (None, "", "Unknown"),
+        };
+
+        let token = match token {
+            Some(t) => t,
+            None => {
                 return Json(json!({
-                    "type": "error",
                     "error": {
-                        "type": "api_error",
-                        "message": format!("Claude API error: {}", e)
+                        "message": format!("No valid {} credentials found. Please add an API key first.", provider_label),
+                        "type": "authentication_error",
+                        "code": 401
                     }
                 }))
                 .into_response();
             }
         };
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.bytes().await.unwrap_or_default();
-            let mut resp = Response::new(Body::from(body));
-            *resp.status_mut() = status;
-            resp.headers_mut()
-                .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            return resp;
-        }
-
+        let mut payload = raw.clone();
+        payload["model"] = json!(model);
         if is_stream {
-            let stream = response
-                .bytes_stream()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
-            let mut resp = Response::new(Body::from_stream(stream));
-            *resp.status_mut() = StatusCode::OK;
-            resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/event-stream"),
-            );
-            return resp;
+            payload["stream"] = json!(true);
         }
 
-        let body = response.bytes().await.unwrap_or_default();
-        let body = maybe_decompress_gzip(&body);
-        let json_body: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-        return Json(json_body).into_response();
+        return forward_claude_compatible(payload, base_url, &token, is_stream, provider_label).await;
     }
 
     let image_handling = match provider_override.as_deref() {
@@ -2839,7 +3152,7 @@ pub async fn claude_messages(
 
     Json(json!({
         "error": {
-            "message": "Unsupported provider. Use a supported provider prefix (gemini/..., claude/..., codex/..., antigravity/..., kiro/...).",
+            "message": "Unsupported provider. Use a supported provider prefix (gemini/..., claude/..., codex/..., antigravity/..., kimi/..., glm/..., kiro/...).",
             "type": "invalid_request_error",
             "code": 400
         }
