@@ -307,7 +307,23 @@ impl ThinkingParser {
             None => return result,
         };
 
-        if let Some(idx) = self.thinking_buffer.find(&close_tag) {
+        let mut found_idx = None;
+        let mut search_from = 0;
+        while search_from < self.thinking_buffer.len() {
+            let slice = &self.thinking_buffer[search_from..];
+            if let Some(pos) = slice.find(&close_tag) {
+                let idx = search_from + pos;
+                if self.thinking_buffer.is_char_boundary(idx) {
+                    found_idx = Some(idx);
+                    break;
+                }
+                search_from = clamp_to_char_boundary(&self.thinking_buffer, idx + 1);
+                continue;
+            }
+            break;
+        }
+
+        if let Some(idx) = found_idx {
             let thinking_content = self.thinking_buffer[..idx].to_string();
             let after_tag = self.thinking_buffer[idx + close_tag.len()..].to_string();
 
@@ -331,7 +347,13 @@ impl ThinkingParser {
         }
 
         if self.thinking_buffer.len() > self.max_tag_length {
-            let split_at = self.thinking_buffer.len() - self.max_tag_length;
+            let split_at = clamp_to_char_boundary(
+                &self.thinking_buffer,
+                self.thinking_buffer.len().saturating_sub(self.max_tag_length),
+            );
+            if split_at == 0 {
+                return result;
+            }
             let send_part = self.thinking_buffer[..split_at].to_string();
             self.thinking_buffer = self.thinking_buffer[split_at..].to_string();
 
@@ -392,6 +414,20 @@ impl ThinkingParser {
         }
         Some(text)
     }
+}
+
+fn clamp_to_char_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    if s.is_char_boundary(idx) {
+        return idx;
+    }
+    let mut i = idx;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 #[derive(Default)]
