@@ -122,6 +122,16 @@ pub async fn start_oauth_login(
 }
 
 #[tauri::command]
+pub async fn save_api_key_account(
+    provider: String,
+    api_key: String,
+    label: Option<String>,
+) -> Result<AuthAccount, String> {
+    crate::auth::save_api_key_account(&provider, &api_key, label.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn delete_account(account_id: String) -> Result<(), String> {
     crate::auth::delete_account(&account_id).map_err(|e| e.to_string())
 }
@@ -315,4 +325,84 @@ pub async fn save_claude_code_config(claude_config: ClaudeCodeConfig) -> Result<
 
     tracing::info!("Claude Code config saved to {:?}", settings_path);
     Ok(())
+}
+
+// ============ Custom Provider Commands ============
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomProviderEntry {
+    pub name: String,
+    pub prefix: Option<String>,
+    pub base_url: String,
+    pub api_keys: Vec<String>,
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomProvidersData {
+    pub openai_compatibility: Vec<CustomProviderEntry>,
+    pub claude_code_compatibility: Vec<CustomProviderEntry>,
+}
+
+#[tauri::command]
+pub async fn get_custom_providers() -> Result<CustomProvidersData, String> {
+    let config = config::get_config().ok_or_else(|| "Config not initialized".to_string())?;
+
+    let openai_compat = config.openai_compatibility.iter().map(|e| CustomProviderEntry {
+        name: e.name.clone(),
+        prefix: e.prefix.clone(),
+        base_url: e.base_url.clone(),
+        api_keys: e.api_key_entries.iter().map(|k| k.api_key.clone()).collect(),
+        models: e.models.clone(),
+    }).collect();
+
+    let claude_compat = config.claude_code_compatibility.iter().map(|e| CustomProviderEntry {
+        name: e.name.clone(),
+        prefix: e.prefix.clone(),
+        base_url: e.base_url.clone(),
+        api_keys: e.api_key_entries.iter().map(|k| k.api_key.clone()).collect(),
+        models: e.models.clone(),
+    }).collect();
+
+    Ok(CustomProvidersData {
+        openai_compatibility: openai_compat,
+        claude_code_compatibility: claude_compat,
+    })
+}
+
+#[tauri::command]
+pub async fn save_custom_providers(data: CustomProvidersData) -> Result<(), String> {
+    let mut config = config::get_config().ok_or_else(|| "Config not initialized".to_string())?;
+
+    config.openai_compatibility = data.openai_compatibility.iter().map(|e| {
+        config::OpenAICompatEntry {
+            name: e.name.clone(),
+            prefix: e.prefix.clone(),
+            base_url: e.base_url.clone(),
+            api_key_entries: e.api_keys.iter().map(|k| config::ApiKeyEntry {
+                api_key: k.clone(),
+                prefix: None,
+                base_url: None,
+                proxy_url: None,
+            }).collect(),
+            models: e.models.clone(),
+        }
+    }).collect();
+
+    config.claude_code_compatibility = data.claude_code_compatibility.iter().map(|e| {
+        config::ClaudeCodeCompatEntry {
+            name: e.name.clone(),
+            prefix: e.prefix.clone(),
+            base_url: e.base_url.clone(),
+            api_key_entries: e.api_keys.iter().map(|k| config::ApiKeyEntry {
+                api_key: k.clone(),
+                prefix: None,
+                base_url: None,
+                proxy_url: None,
+            }).collect(),
+            models: e.models.clone(),
+        }
+    }).collect();
+
+    config::update_config(config).map_err(|e| e.to_string())
 }

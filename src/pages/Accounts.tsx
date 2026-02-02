@@ -72,11 +72,23 @@ interface CachedQuota {
   last_updated: number;
 }
 
-const PROVIDERS = [
-  { id: "google", name: "Gemini CLI", label: "Gemini", color: "bg-blue-100 text-blue-700" },
-  { id: "openai", name: "Codex", label: "Codex", color: "bg-green-100 text-green-700" },
-  { id: "antigravity", name: "Antigravity", label: "Antigravity", color: "bg-gray-100 text-gray-700" },
-  { id: "kiro", name: "Kiro", label: "Kiro", color: "bg-orange-100 text-orange-700" },
+type ProviderAuthType = "oauth" | "api_key";
+
+interface ProviderInfo {
+  id: string;
+  name: string;
+  label: string;
+  color: string;
+  authType: ProviderAuthType;
+}
+
+const PROVIDERS: ProviderInfo[] = [
+  { id: "google", name: "Gemini CLI", label: "Gemini", color: "bg-blue-100 text-blue-700", authType: "oauth" },
+  { id: "openai", name: "Codex", label: "Codex", color: "bg-green-100 text-green-700", authType: "oauth" },
+  { id: "antigravity", name: "Antigravity", label: "Antigravity", color: "bg-gray-100 text-gray-700", authType: "oauth" },
+  { id: "kiro", name: "Kiro", label: "Kiro", color: "bg-orange-100 text-orange-700", authType: "oauth" },
+  { id: "kimi", name: "Kimi API", label: "Kimi", color: "bg-rose-100 text-rose-700", authType: "api_key" },
+  { id: "glm", name: "GLM API", label: "GLM", color: "bg-cyan-100 text-cyan-700", authType: "api_key" },
 ];
 
 // Map provider names from auth files to display info
@@ -99,6 +111,11 @@ export function Accounts() {
   const [pendingGeminiAccountId, setPendingGeminiAccountId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [showAddMenu, setShowAddMenu] = useState(false);
+  const [showApiKeyModal, setShowApiKeyModal] = useState(false);
+  const [apiKeyProvider, setApiKeyProvider] = useState<string | null>(null);
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [apiKeyLabel, setApiKeyLabel] = useState("");
+  const [apiKeySaving, setApiKeySaving] = useState(false);
   const [viewMode, setViewMode] = useState<"list" | "card">("card");
   const [quotaData, setQuotaData] = useState<Record<string, QuotaData>>({});
   const [quotaLoading, setQuotaLoading] = useState<Record<string, boolean>>({});
@@ -377,6 +394,45 @@ export function Accounts() {
     setLoginInProgress(null);
   }
 
+  function openApiKeyModal(provider: string) {
+    setApiKeyProvider(provider);
+    setApiKeyInput("");
+    setApiKeyLabel("");
+    setShowApiKeyModal(true);
+  }
+
+  function closeApiKeyModal() {
+    setShowApiKeyModal(false);
+    setApiKeyProvider(null);
+    setApiKeyInput("");
+    setApiKeyLabel("");
+    setApiKeySaving(false);
+  }
+
+  async function handleSaveApiKey() {
+    const provider = apiKeyProvider?.trim();
+    const apiKey = apiKeyInput.trim();
+    if (!provider) return;
+    if (!apiKey) {
+      alert("请输入 API Key");
+      return;
+    }
+    try {
+      setApiKeySaving(true);
+      await invoke("save_api_key_account", {
+        provider,
+        apiKey,
+        label: apiKeyLabel.trim() || null,
+      });
+      await fetchAccounts();
+      closeApiKeyModal();
+    } catch (error) {
+      console.error("Failed to save API key:", error);
+      alert(`保存失败: ${error}`);
+      setApiKeySaving(false);
+    }
+  }
+
   async function handleDelete(accountId: string) {
     const confirmed = await ask("确定要删除此账户吗？", {
       title: "删除确认",
@@ -567,6 +623,7 @@ export function Accounts() {
     }
   }
 
+  const apiKeyProviderInfo = apiKeyProvider ? getProviderInfo(apiKeyProvider) : null;
   const filteredAccounts = accounts;
 
   const allSelected = filteredAccounts.length > 0 && filteredAccounts.every((a) => selectedIds.has(a.id));
@@ -602,7 +659,7 @@ export function Accounts() {
             </div>
             <div>
               <h2 className="text-xl font-bold text-gray-800 dark:text-white">账号管理</h2>
-              <p className="text-sm text-gray-500 dark:text-gray-400">管理你的 OAuth 账号</p>
+              <p className="text-sm text-gray-500 dark:text-gray-400">管理你的 OAuth / API Key 账号</p>
             </div>
           </div>
 
@@ -627,7 +684,11 @@ export function Accounts() {
                       key={provider.id}
                       onClick={() => {
                         setShowAddMenu(false);
-                        handleLogin(provider.id);
+                        if (provider.authType === "oauth") {
+                          handleLogin(provider.id);
+                        } else {
+                          openApiKeyModal(provider.id);
+                        }
                       }}
                       className="w-full px-4 py-2 text-left text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700"
                     >
@@ -1466,6 +1527,61 @@ export function Accounts() {
                 className="px-4 py-2 rounded-lg bg-blue-500 hover:bg-blue-600 text-white"
               >
                 继续登录
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {showApiKeyModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div className="w-full max-w-md rounded-lg bg-white dark:bg-gray-800 shadow-lg border border-gray-200 dark:border-gray-700 p-6">
+            <h4 className="text-lg font-semibold text-gray-800 dark:text-white">
+              添加 {apiKeyProviderInfo?.label ?? "API"} 密钥
+            </h4>
+            <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
+              API Key 将保存在本地配置中，仅用于代理转发。
+            </p>
+            <div className="mt-4 space-y-3">
+              <div>
+                <label className="block text-sm text-gray-700 dark:text-gray-300 mb-1">
+                  备注（可选）
+                </label>
+                <input
+                  type="text"
+                  value={apiKeyLabel}
+                  onChange={(e) => setApiKeyLabel(e.target.value)}
+                  placeholder="例如：主账号 / 备用"
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-800 dark:text-white"
+                />
+              </div>
+              <div>
+                <label className="block text-sm text-gray-700 dark:text-gray-300 mb-1">
+                  API Key
+                </label>
+                <input
+                  type="password"
+                  value={apiKeyInput}
+                  onChange={(e) => setApiKeyInput(e.target.value)}
+                  placeholder="请输入 API Key"
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-800 dark:text-white"
+                />
+              </div>
+            </div>
+            <div className="mt-6 flex justify-end gap-2">
+              <button
+                onClick={closeApiKeyModal}
+                className="px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleSaveApiKey}
+                disabled={apiKeySaving}
+                className={`px-4 py-2 rounded-lg text-white ${
+                  apiKeySaving ? "bg-gray-400" : "bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600"
+                }`}
+              >
+                {apiKeySaving ? "保存中..." : "保存"}
               </button>
             </div>
           </div>

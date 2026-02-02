@@ -66,6 +66,7 @@ pub fn run() {
             commands::stop_server,
             commands::get_server_status,
             commands::start_oauth_login,
+            commands::save_api_key_account,
             commands::delete_account,
             commands::set_account_enabled,
             commands::set_gemini_project_id,
@@ -85,6 +86,8 @@ pub fn run() {
             commands::clear_request_logs,
             commands::get_claude_code_config,
             commands::save_claude_code_config,
+            commands::get_custom_providers,
+            commands::save_custom_providers,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -61,6 +61,9 @@ pub struct AppConfig {
     #[serde(default)]
     pub openai_compatibility: Vec<OpenAICompatEntry>,
 
+    #[serde(default)]
+    pub claude_code_compatibility: Vec<ClaudeCodeCompatEntry>,
+
     #[serde(default = "default_quota_refresh_interval")]
     pub quota_refresh_interval: u32,
 }
@@ -152,6 +155,21 @@ pub struct OpenAICompatEntry {
     pub base_url: String,
     #[serde(default)]
     pub api_key_entries: Vec<ApiKeyEntry>,
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct ClaudeCodeCompatEntry {
+    pub name: String,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key_entries: Vec<ApiKeyEntry>,
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 pub async fn init_config(app: &AppHandle) -> Result<()> {

@@ -1,7 +1,7 @@
 // API request handlers
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path, Query, State},
     http::{header, HeaderValue, StatusCode},
     response::{sse::Event, Html, IntoResponse, Json, Response, Sse},
@@ -179,6 +179,61 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
         }
     }
 
+    // Add custom provider models
+    if let Some(config) = crate::config::get_config() {
+        let created = chrono::Utc::now().timestamp();
+
+        // OpenAI-compatible providers
+        for entry in &config.openai_compatibility {
+            if entry.api_key_entries.is_empty() {
+                continue;
+            }
+            let prefix = entry.prefix.as_ref().unwrap_or(&entry.name);
+            let custom_models: Vec<ModelInfo> = entry.models.iter().map(|m| ModelInfo {
+                id: m.clone(),
+                object: "model".to_string(),
+                created,
+                owned_by: entry.name.clone(),
+            }).collect();
+            if custom_models.is_empty() {
+                // If no models specified, add a placeholder
+                models.push(ModelInfo {
+                    id: format!("{}/default", prefix),
+                    object: "model".to_string(),
+                    created,
+                    owned_by: entry.name.clone(),
+                });
+            } else {
+                models.extend(build_prefixed_models(prefix, &custom_models));
+            }
+        }
+
+        // Claude Code-compatible providers
+        for entry in &config.claude_code_compatibility {
+            if entry.api_key_entries.is_empty() {
+                continue;
+            }
+            let prefix = entry.prefix.as_ref().unwrap_or(&entry.name);
+            let custom_models: Vec<ModelInfo> = entry.models.iter().map(|m| ModelInfo {
+                id: m.clone(),
+                object: "model".to_string(),
+                created,
+                owned_by: entry.name.clone(),
+            }).collect();
+            if custom_models.is_empty() {
+                // If no models specified, add a placeholder
+                models.push(ModelInfo {
+                    id: format!("{}/default", prefix),
+                    object: "model".to_string(),
+                    created,
+                    owned_by: entry.name.clone(),
+                });
+            } else {
+                models.extend(build_prefixed_models(prefix, &custom_models));
+            }
+        }
+    }
+
     Json(ModelsResponse {
         object: "list".to_string(),
         data: models,
@@ -333,7 +388,8 @@ fn parse_provider_prefix(model: &str) -> (Option<String>, String) {
 }
 
 fn normalize_provider_prefix(prefix: &str) -> Option<String> {
-    match prefix.trim().to_lowercase().as_str() {
+    let lower = prefix.trim().to_lowercase();
+    match lower.as_str() {
         "gemini" => Some("gemini".to_string()),
         "codex" => Some("codex".to_string()),
         "openai" => Some("codex".to_string()),
@@ -342,7 +398,26 @@ fn normalize_provider_prefix(prefix: &str) -> Option<String> {
         "kimi" => Some("kimi".to_string()),
         "glm" => Some("glm".to_string()),
         "kiro" => Some("kiro".to_string()),
-        _ => None,
+        _ => {
+            // Check custom providers
+            if let Some(config) = crate::config::get_config() {
+                // Check OpenAI-compatible providers
+                for entry in &config.openai_compatibility {
+                    let provider_prefix = entry.prefix.as_ref().unwrap_or(&entry.name);
+                    if provider_prefix.to_lowercase() == lower {
+                        return Some(format!("openai-compat:{}", provider_prefix.to_lowercase()));
+                    }
+                }
+                // Check Claude Code-compatible providers
+                for entry in &config.claude_code_compatibility {
+                    let provider_prefix = entry.prefix.as_ref().unwrap_or(&entry.name);
+                    if provider_prefix.to_lowercase() == lower {
+                        return Some(format!("claude-compat:{}", provider_prefix.to_lowercase()));
+                    }
+                }
+            }
+            None
+        }
     }
 }
 
@@ -1655,6 +1730,151 @@ async fn get_glm_token(model: &str) -> Option<String> {
     None
 }
 
+/// Custom provider info for OpenAI-compatible or Claude Code-compatible providers
+#[derive(Debug, Clone)]
+struct CustomProviderInfo {
+    base_url: String,
+    api_key: String,
+    provider_type: CustomProviderType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CustomProviderType {
+    OpenAICompat,
+    ClaudeCodeCompat,
+}
+
+/// API key selector state for custom providers (round-robin)
+static CUSTOM_PROVIDER_KEY_SELECTOR: Lazy<Mutex<HashMap<String, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Get custom provider info by prefix
+fn get_custom_provider_info(provider_key: &str) -> Option<CustomProviderInfo> {
+    let config = crate::config::get_config()?;
+
+    // Check if it's an OpenAI-compatible provider
+    if let Some(prefix) = provider_key.strip_prefix("openai-compat:") {
+        for entry in &config.openai_compatibility {
+            let entry_prefix = entry.prefix.as_ref().unwrap_or(&entry.name).to_lowercase();
+            if entry_prefix == prefix {
+                if entry.api_key_entries.is_empty() {
+                    return None;
+                }
+                // Round-robin selection of API keys
+                let api_key = {
+                    let mut selector = CUSTOM_PROVIDER_KEY_SELECTOR.lock().unwrap();
+                    let idx = selector.entry(provider_key.to_string()).or_insert(0);
+                    let key = &entry.api_key_entries[*idx % entry.api_key_entries.len()].api_key;
+                    *idx = idx.wrapping_add(1);
+                    key.clone()
+                };
+                return Some(CustomProviderInfo {
+                    base_url: entry.base_url.clone(),
+                    api_key,
+                    provider_type: CustomProviderType::OpenAICompat,
+                });
+            }
+        }
+    }
+
+    // Check if it's a Claude Code-compatible provider
+    if let Some(prefix) = provider_key.strip_prefix("claude-compat:") {
+        for entry in &config.claude_code_compatibility {
+            let entry_prefix = entry.prefix.as_ref().unwrap_or(&entry.name).to_lowercase();
+            if entry_prefix == prefix {
+                if entry.api_key_entries.is_empty() {
+                    return None;
+                }
+                // Round-robin selection of API keys
+                let api_key = {
+                    let mut selector = CUSTOM_PROVIDER_KEY_SELECTOR.lock().unwrap();
+                    let idx = selector.entry(provider_key.to_string()).or_insert(0);
+                    let key = &entry.api_key_entries[*idx % entry.api_key_entries.len()].api_key;
+                    *idx = idx.wrapping_add(1);
+                    key.clone()
+                };
+                return Some(CustomProviderInfo {
+                    base_url: entry.base_url.clone(),
+                    api_key,
+                    provider_type: CustomProviderType::ClaudeCodeCompat,
+                });
+            }
+        }
+    }
+
+    None
+}
+
+/// Forward request to OpenAI-compatible provider
+async fn forward_openai_compatible(
+    payload: Value,
+    base_url: &str,
+    api_key: &str,
+    is_stream: bool,
+    provider_label: &str,
+) -> Response {
+    let base = base_url.trim_end_matches('/').to_string();
+    if base.is_empty() {
+        return Json(json!({
+            "error": {
+                "message": format!("{} API error: missing base URL", provider_label),
+                "type": "api_error",
+                "code": 500
+            }
+        }))
+        .into_response();
+    }
+    let url = format!("{}/chat/completions", base);
+    let client = reqwest::Client::new();
+    let response = match client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(json!({
+                "error": {
+                    "message": format!("{} API error: {}", provider_label, e),
+                    "type": "api_error",
+                    "code": 500
+                }
+            }))
+            .into_response();
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.bytes().await.unwrap_or_default();
+        let mut resp = Response::new(Body::from(body));
+        *resp.status_mut() = status;
+        resp.headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        return resp;
+    }
+
+    if is_stream {
+        let stream = response
+            .bytes_stream()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        let mut resp = Response::new(Body::from_stream(stream));
+        *resp.status_mut() = StatusCode::OK;
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        return resp;
+    }
+
+    let body = response.bytes().await.unwrap_or_default();
+    let body = maybe_decompress_gzip(&body);
+    let json_body: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    Json(json_body).into_response()
+}
+
 pub async fn chat_completions(
     State(_state): State<AppState>,
     Json(raw): Json<Value>,
@@ -2145,9 +2365,198 @@ pub async fn chat_completions(
         }
     }
 
+    // Handle custom providers (OpenAI-compatible and Claude Code-compatible)
+    if let Some(ref provider_key) = provider_override {
+        if provider_key.starts_with("openai-compat:") || provider_key.starts_with("claude-compat:") {
+            let provider_info = match get_custom_provider_info(provider_key) {
+                Some(info) => info,
+                None => {
+                    let provider_name = provider_key.split(':').nth(1).unwrap_or("unknown");
+                    return Json(json!({
+                        "error": {
+                            "message": format!("No API key configured for custom provider '{}'. Please add an API key in settings.", provider_name),
+                            "type": "authentication_error",
+                            "code": 401
+                        }
+                    }))
+                    .into_response();
+                }
+            };
+
+            let provider_name = provider_key.split(':').nth(1).unwrap_or("custom");
+
+            // Prepare the request payload with the actual model name
+            let mut payload = raw.clone();
+            payload["model"] = json!(model);
+
+            match provider_info.provider_type {
+                CustomProviderType::OpenAICompat => {
+                    return forward_openai_compatible(
+                        payload,
+                        &provider_info.base_url,
+                        &provider_info.api_key,
+                        is_stream,
+                        provider_name,
+                    ).await;
+                }
+                CustomProviderType::ClaudeCodeCompat => {
+                    // Convert OpenAI request to Claude format, call API, convert response back
+                    let request: ChatCompletionRequest = match serde_json::from_value(raw.clone()) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Json(json!({
+                                "error": {
+                                    "message": format!("Invalid request: {}", e),
+                                    "type": "invalid_request_error",
+                                    "code": 400
+                                }
+                            }))
+                            .into_response();
+                        }
+                    };
+
+                    let (messages, system) = claude::openai_to_claude_messages(&request.messages);
+                    let claude_payload = json!({
+                        "model": model,
+                        "messages": messages,
+                        "max_tokens": request.max_tokens.unwrap_or(4096),
+                        "temperature": request.temperature,
+                        "system": system,
+                        "stream": is_stream
+                    });
+
+                    if is_stream {
+                        // Streaming: forward and convert Claude stream to OpenAI stream
+                        let base = provider_info.base_url.trim_end_matches('/').to_string();
+                        let url = format!("{}/messages", base);
+                        let client = reqwest::Client::new();
+                        let response = match client
+                            .post(&url)
+                            .header("x-api-key", &provider_info.api_key)
+                            .header("anthropic-version", "2023-06-01")
+                            .header("content-type", "application/json")
+                            .json(&claude_payload)
+                            .send()
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                return Json(json!({
+                                    "error": {
+                                        "message": format!("{} API error: {}", provider_name, e),
+                                        "type": "api_error",
+                                        "code": 500
+                                    }
+                                }))
+                                .into_response();
+                            }
+                        };
+
+                        if !response.status().is_success() {
+                            let status = response.status();
+                            let body = response.bytes().await.unwrap_or_default();
+                            let mut resp = Response::new(Body::from(body));
+                            *resp.status_mut() = status;
+                            resp.headers_mut()
+                                .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                            return resp;
+                        }
+
+                        // Convert Claude stream to OpenAI stream
+                        let byte_stream = response.bytes_stream();
+                        let model_clone = model.clone();
+                        let stream = byte_stream
+                            .map(move |result| {
+                                match result {
+                                    Ok(bytes) => {
+                                        let text = String::from_utf8_lossy(&bytes);
+                                        let mut output = String::new();
+                                        for line in text.lines() {
+                                            if let Some(data) = line.strip_prefix("data: ") {
+                                                if data.trim().is_empty() || data.trim() == "[DONE]" {
+                                                    continue;
+                                                }
+                                                if let Ok(event) = serde_json::from_str::<Value>(data) {
+                                                    // Convert Claude event to OpenAI chunk
+                                                    let openai_chunk = claude::claude_stream_to_openai_chunk(&event, &model_clone);
+                                                    if let Some(chunk) = openai_chunk {
+                                                        output.push_str(&format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap_or_default()));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Ok::<_, std::io::Error>(Bytes::from(output))
+                                    }
+                                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                                }
+                            });
+
+                        let mut resp = Response::new(Body::from_stream(stream));
+                        *resp.status_mut() = StatusCode::OK;
+                        resp.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("text/event-stream"),
+                        );
+                        return resp;
+                    }
+
+                    // Non-streaming: call API and convert response
+                    let response = forward_claude_compatible(
+                        claude_payload,
+                        &provider_info.base_url,
+                        &provider_info.api_key,
+                        false,
+                        provider_name,
+                    ).await;
+
+                    // Extract the Claude response and convert to OpenAI format
+                    let (parts, body) = response.into_parts();
+                    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return Json(json!({
+                                "error": {
+                                    "message": format!("Failed to read response: {}", e),
+                                    "type": "api_error",
+                                    "code": 500
+                                }
+                            }))
+                            .into_response();
+                        }
+                    };
+
+                    if !parts.status.is_success() {
+                        let mut resp = Response::new(Body::from(body_bytes));
+                        *resp.status_mut() = parts.status;
+                        resp.headers_mut()
+                            .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                        return resp;
+                    }
+
+                    let claude_response: Value = match serde_json::from_slice(&body_bytes) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return Json(json!({
+                                "error": {
+                                    "message": format!("Failed to parse response: {}", e),
+                                    "type": "api_error",
+                                    "code": 500
+                                }
+                            }))
+                            .into_response();
+                        }
+                    };
+
+                    let openai_response = claude::claude_value_to_openai_response(&claude_response, &model, &request_id);
+                    return Json(openai_response).into_response();
+                }
+            }
+        }
+    }
+
     Json(json!({
         "error": {
-            "message": "Unsupported provider. Use a supported provider prefix (gemini/..., claude/..., codex/..., antigravity/..., kimi/..., glm/..., kiro/...).",
+            "message": "Unsupported provider. Use a supported provider prefix (gemini/..., claude/..., codex/..., antigravity/..., kimi/..., glm/..., kiro/..., or custom providers).",
             "type": "invalid_request_error",
             "code": 400
         }
@@ -3150,9 +3559,193 @@ pub async fn claude_messages(
         }
     }
 
+    // Handle custom providers (Claude Code-compatible only for /v1/messages endpoint)
+    if let Some(ref provider_key) = provider_override {
+        if provider_key.starts_with("claude-compat:") {
+            let provider_info = match get_custom_provider_info(provider_key) {
+                Some(info) => info,
+                None => {
+                    let provider_name = provider_key.split(':').nth(1).unwrap_or("unknown");
+                    return Json(json!({
+                        "error": {
+                            "message": format!("No API key configured for custom provider '{}'. Please add an API key in settings.", provider_name),
+                            "type": "authentication_error",
+                            "code": 401
+                        }
+                    }))
+                    .into_response();
+                }
+            };
+
+            let provider_name = provider_key.split(':').nth(1).unwrap_or("custom");
+
+            let mut payload = raw.clone();
+            payload["model"] = json!(model);
+            if is_stream {
+                payload["stream"] = json!(true);
+            }
+
+            return forward_claude_compatible(
+                payload,
+                &provider_info.base_url,
+                &provider_info.api_key,
+                is_stream,
+                provider_name,
+            ).await;
+        }
+
+        // Handle OpenAI-compatible providers for /v1/messages endpoint
+        // Convert Claude request to OpenAI format, call API, convert response back
+        if provider_key.starts_with("openai-compat:") {
+            let provider_info = match get_custom_provider_info(provider_key) {
+                Some(info) => info,
+                None => {
+                    let provider_name = provider_key.split(':').nth(1).unwrap_or("unknown");
+                    return Json(json!({
+                        "error": {
+                            "message": format!("No API key configured for custom provider '{}'. Please add an API key in settings.", provider_name),
+                            "type": "authentication_error",
+                            "code": 401
+                        }
+                    }))
+                    .into_response();
+                }
+            };
+
+            let provider_name = provider_key.split(':').nth(1).unwrap_or("custom");
+
+            // Convert Claude request to OpenAI format
+            let openai_request = claude::claude_request_to_openai_chat(&raw, &model, claude::ClaudeImageHandling::Base64Any);
+            let mut payload = openai_request;
+            payload["model"] = json!(model);
+            if is_stream {
+                payload["stream"] = json!(true);
+            }
+
+            // For streaming, we need to convert OpenAI stream to Claude stream
+            if is_stream {
+                let base = provider_info.base_url.trim_end_matches('/').to_string();
+                let url = format!("{}/chat/completions", base);
+                let client = reqwest::Client::new();
+                let response = match client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", provider_info.api_key))
+                    .header("content-type", "application/json")
+                    .json(&payload)
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return Json(json!({
+                            "error": {
+                                "message": format!("{} API error: {}", provider_name, e),
+                                "type": "api_error",
+                                "code": 500
+                            }
+                        }))
+                        .into_response();
+                    }
+                };
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.bytes().await.unwrap_or_default();
+                    let mut resp = Response::new(Body::from(body));
+                    *resp.status_mut() = status;
+                    resp.headers_mut()
+                        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                    return resp;
+                }
+
+                // Convert OpenAI stream to Claude stream
+                let byte_stream = response.bytes_stream();
+                let upstream = byte_stream
+                    .map(|result| {
+                        result.map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                    })
+                    .filter_map(|result| async move {
+                        match result {
+                            Ok(text) => {
+                                // Parse SSE lines
+                                let mut chunks = Vec::new();
+                                for line in text.lines() {
+                                    if let Some(data) = line.strip_prefix("data: ") {
+                                        if data.trim() != "[DONE]" && !data.trim().is_empty() {
+                                            chunks.push(data.to_string());
+                                        }
+                                    }
+                                }
+                                if chunks.is_empty() {
+                                    None
+                                } else {
+                                    Some(chunks.join("\n"))
+                                }
+                            }
+                            Err(_) => None,
+                        }
+                    })
+                    .flat_map(|text| futures::stream::iter(text.lines().map(|s| s.to_string()).collect::<Vec<_>>()));
+
+                let stream = openai_chunks_to_claude_events(upstream, &model);
+                return Sse::new(stream).into_response();
+            }
+
+            // Non-streaming: call API and convert response
+            let response = forward_openai_compatible(
+                payload,
+                &provider_info.base_url,
+                &provider_info.api_key,
+                false,
+                provider_name,
+            ).await;
+
+            // Extract the OpenAI response and convert to Claude format
+            let (parts, body) = response.into_parts();
+            let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+                Ok(b) => b,
+                Err(e) => {
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Failed to read response: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            };
+
+            if !parts.status.is_success() {
+                let mut resp = Response::new(Body::from(body_bytes));
+                *resp.status_mut() = parts.status;
+                resp.headers_mut()
+                    .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                return resp;
+            }
+
+            let openai_response: Value = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Failed to parse response: {}", e),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            };
+
+            let claude_response = claude::openai_to_claude_response(&openai_response, &model, &request_id);
+            return Json(claude_response).into_response();
+        }
+    }
+
     Json(json!({
         "error": {
-            "message": "Unsupported provider. Use a supported provider prefix (gemini/..., claude/..., codex/..., antigravity/..., kimi/..., glm/..., kiro/...).",
+            "message": "Unsupported provider. Use a supported provider prefix (gemini/..., claude/..., codex/..., antigravity/..., kimi/..., glm/..., kiro/..., or custom providers).",
             "type": "invalid_request_error",
             "code": 400
         }

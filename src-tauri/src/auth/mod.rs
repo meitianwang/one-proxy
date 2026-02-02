@@ -297,6 +297,92 @@ pub fn save_auth_file(auth_file: &AuthFile, path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn sanitize_identifier(input: &str) -> String {
+    let mut out = String::new();
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if ch == '-' || ch == '_' {
+            out.push(ch);
+        } else if ch.is_ascii_whitespace() {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+fn provider_display_name(provider: &str) -> &str {
+    match provider {
+        "kimi" => "Kimi",
+        "glm" => "GLM",
+        _ => provider,
+    }
+}
+
+pub fn save_api_key_account(provider: &str, api_key: &str, label: Option<&str>) -> Result<AuthAccount> {
+    let provider = provider.trim().to_lowercase();
+    if provider.is_empty() {
+        return Err(anyhow::anyhow!("provider is required"));
+    }
+    match provider.as_str() {
+        "kimi" | "glm" => {}
+        _ => return Err(anyhow::anyhow!("Unsupported provider: {}", provider)),
+    }
+
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err(anyhow::anyhow!("api_key is required"));
+    }
+
+    let display_name = label
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{} API Key", provider_display_name(&provider)));
+
+    let mut identifier = sanitize_identifier(&display_name);
+    if identifier.is_empty() {
+        identifier = provider.clone();
+    }
+    if identifier.len() > 24 {
+        identifier.truncate(24);
+    }
+    let suffix = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let suffix = &suffix[..8];
+    let identifier = format!("{}-{}", identifier, suffix);
+
+    let auth_file = AuthFile {
+        provider: provider.clone(),
+        email: Some(display_name.clone()),
+        token: TokenInfo {
+            access_token: api_key.to_string(),
+            refresh_token: None,
+            expires_at: None,
+            token_type: "api_key".to_string(),
+        },
+        project_id: None,
+        enabled: true,
+        prefix: None,
+    };
+
+    let path = get_auth_file_path(&provider, &identifier);
+    save_auth_file(&auth_file, &path)?;
+
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&identifier)
+        .to_string();
+
+    Ok(AuthAccount {
+        id,
+        provider,
+        email: Some(display_name),
+        enabled: true,
+        prefix: None,
+    })
+}
+
 pub fn delete_account(account_id: &str) -> Result<()> {
     let auth_dir = crate::config::resolve_auth_dir();
     let path = auth_dir.join(format!("{}.json", account_id));

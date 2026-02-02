@@ -199,6 +199,148 @@ pub fn claude_to_openai_response(
     })
 }
 
+/// Convert Claude response (as Value) to OpenAI format
+pub fn claude_value_to_openai_response(
+    claude_response: &Value,
+    model: &str,
+    request_id: &str,
+) -> Value {
+    // Check for error
+    if let Some(error) = claude_response.get("error") {
+        return serde_json::json!({
+            "error": {
+                "message": error.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown error"),
+                "type": error.get("type").and_then(|v| v.as_str()).unwrap_or("api_error"),
+                "code": 500
+            }
+        });
+    }
+
+    // Extract content text
+    let content = claude_response
+        .get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+
+    // Extract finish reason
+    let finish_reason = claude_response
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .map(|r| match r {
+            "end_turn" => "stop",
+            "max_tokens" => "length",
+            "stop_sequence" => "stop",
+            _ => "stop",
+        })
+        .unwrap_or("stop");
+
+    // Extract usage
+    let usage = claude_response.get("usage");
+    let prompt_tokens = usage
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let completion_tokens = usage
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    serde_json::json!({
+        "id": format!("chatcmpl-{}", request_id),
+        "object": "chat.completion",
+        "created": chrono::Utc::now().timestamp(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": content
+            },
+            "finish_reason": finish_reason
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens
+        }
+    })
+}
+
+/// Convert Claude streaming event to OpenAI streaming chunk
+pub fn claude_stream_to_openai_chunk(event: &Value, model: &str) -> Option<Value> {
+    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    match event_type {
+        "message_start" => {
+            // First chunk with role
+            Some(serde_json::json!({
+                "id": event.get("message").and_then(|m| m.get("id")).and_then(|v| v.as_str()).unwrap_or("chatcmpl-stream"),
+                "object": "chat.completion.chunk",
+                "created": chrono::Utc::now().timestamp(),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": ""
+                    },
+                    "finish_reason": null
+                }]
+            }))
+        }
+        "content_block_delta" => {
+            // Text delta
+            let empty = serde_json::json!({});
+            let delta = event.get("delta").unwrap_or(&empty);
+            let text = delta.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if text.is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "id": "chatcmpl-stream",
+                "object": "chat.completion.chunk",
+                "created": chrono::Utc::now().timestamp(),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": text
+                    },
+                    "finish_reason": null
+                }]
+            }))
+        }
+        "message_delta" => {
+            // Final chunk with finish_reason
+            let stop_reason = event.get("delta")
+                .and_then(|d| d.get("stop_reason"))
+                .and_then(|v| v.as_str())
+                .map(|r| match r {
+                    "end_turn" => "stop",
+                    "max_tokens" => "length",
+                    "stop_sequence" => "stop",
+                    _ => "stop",
+                })
+                .unwrap_or("stop");
+            Some(serde_json::json!({
+                "id": "chatcmpl-stream",
+                "object": "chat.completion.chunk",
+                "created": chrono::Utc::now().timestamp(),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": stop_reason
+                }]
+            }))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum ClaudeImageHandling {
     Drop,
