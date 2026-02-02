@@ -50,10 +50,15 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
     let start = std::time::Instant::now();
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
-    let protocol = protocol_from_path(&path);
 
     let response = next.run(request).await;
 
+    // Skip logging for model list requests
+    if path == "/v1/models" || path.starts_with("/v1beta/models") && method == "GET" {
+        return response;
+    }
+
+    let protocol = protocol_from_path(&path);
     let duration_ms = start.elapsed().as_millis() as i64;
     let status = response.status().as_u16() as i32;
 
