@@ -53,6 +53,10 @@ fn protocol_from_path(path: &str) -> Option<String> {
     }
 }
 
+/// Internal header name for passing account_id from handlers to logging middleware
+/// This header will be stripped before sending response to client
+pub const X_ONEPROXY_ACCOUNT_ID: &str = "x-oneproxy-account-id";
+
 /// Extract model name from request body JSON
 fn extract_model_from_body(body: &[u8]) -> Option<String> {
     let json: serde_json::Value = serde_json::from_slice(body).ok()?;
@@ -216,7 +220,15 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
 
         // Reconstruct the request with the buffered body
         let request = Request::from_parts(parts, Body::from(bytes.to_vec()));
-        let response = next.run(request).await;
+        let mut response = next.run(request).await;
+        
+        // Extract and remove internal account_id header
+        let account_id = response.headers()
+            .get(X_ONEPROXY_ACCOUNT_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        response.headers_mut().remove(X_ONEPROXY_ACCOUNT_ID);
+        
         let response = log_response_if_needed(&method, &path, response, verbose).await;
 
         let protocol = protocol_from_path(&path);
@@ -234,7 +246,7 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
             &method,
             model.as_deref(),
             protocol.as_deref(),
-            None,
+            account_id.as_deref(),
             &path,
             0,
             0,
@@ -248,7 +260,15 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
     if verbose {
         log_request_body(&method, &path, &[]);
     }
-    let response = next.run(request).await;
+    let mut response = next.run(request).await;
+    
+    // Extract and remove internal account_id header
+    let account_id = response.headers()
+        .get(X_ONEPROXY_ACCOUNT_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    response.headers_mut().remove(X_ONEPROXY_ACCOUNT_ID);
+    
     let response = log_response_if_needed(&method, &path, response, verbose).await;
 
     let protocol = protocol_from_path(&path);
@@ -266,7 +286,7 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
         &method,
         None,
         protocol.as_deref(),
-        None,
+        account_id.as_deref(),
         &path,
         0,
         0,
@@ -276,6 +296,7 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
 
     response
 }
+
 
 
 /// API Key authentication middleware

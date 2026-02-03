@@ -283,19 +283,21 @@ export function RequestLogs() {
           <table className="w-full text-sm">
             <thead className="bg-gray-50 dark:bg-gray-700 sticky top-0">
               <tr>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">状态</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">方法</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">模型</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">协议</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">供应商</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">耗时</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">时间</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-16">状态</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-16">方法</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider max-w-48">模型</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-20">协议</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-24">供应商</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider min-w-40">账号</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-16">耗时</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-20">时间</th>
               </tr>
+
             </thead>
             <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
               {logs.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center text-gray-500 dark:text-gray-400">
+                  <td colSpan={8} className="px-4 py-8 text-center text-gray-500 dark:text-gray-400">
                     暂无日志记录
                   </td>
                 </tr>
@@ -313,7 +315,7 @@ export function RequestLogs() {
                         {log.method}
                       </span>
                     </td>
-                    <td className="px-4 py-3 whitespace-nowrap text-gray-600 dark:text-gray-300">
+                    <td className="px-4 py-3 text-gray-600 dark:text-gray-300 max-w-48 truncate" title={log.model || undefined}>
                       {log.model || "-"}
                     </td>
                     <td className="px-4 py-3 whitespace-nowrap text-gray-600 dark:text-gray-300">
@@ -321,6 +323,9 @@ export function RequestLogs() {
                     </td>
                     <td className="px-4 py-3 whitespace-nowrap text-gray-600 dark:text-gray-300">
                       {getProviderFromModel(log.model)}
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap text-gray-600 dark:text-gray-300 min-w-40" title={log.account_id || undefined}>
+                      {log.account_id ? (log.account_id.length > 24 ? log.account_id.slice(0, 24) + "..." : log.account_id) : "-"}
                     </td>
                     <td className="px-4 py-3 whitespace-nowrap text-gray-600 dark:text-gray-300">
                       {formatDuration(log.duration_ms)}

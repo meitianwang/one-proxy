@@ -30,16 +30,60 @@ use std::io::Read;
 struct GeminiAuth {
     access_token: String,
     project_id: Option<String>,
+    account_id: String,
 }
 
 #[derive(Debug, Clone)]
 struct AntigravityAuth {
     access_token: String,
     project_id: Option<String>,
+    account_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeAuth {
+    access_token: String,
+    account_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct CodexAuth {
+    access_token: String,
+    account_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct KimiAuth {
+    api_key: String,
+    account_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct GlmAuth {
+    api_key: String,
+    account_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct KiroAuthWithAccount {
+    auth: kiro::KiroAuth,
+    account_id: String,
 }
 
 const KIMI_ANTHROPIC_BASE: &str = "https://api.kimi.com/coding/v1";
+
 const GLM_ANTHROPIC_BASE: &str = "https://open.bigmodel.cn/api/anthropic/v1";
+
+
+/// Helper function to add account_id header to a response for logging
+fn with_account_id<T: IntoResponse>(response: T, account_id: &str) -> Response {
+    let mut resp = response.into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(account_id) {
+        resp.headers_mut().insert(super::X_ONEPROXY_ACCOUNT_ID, value);
+    }
+    resp
+}
+
 
 // Root endpoint
 pub async fn root() -> Json<Value> {
@@ -161,8 +205,9 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
 
     // Add Kiro models if available
     if has_kiro {
-        if let Some(auth) = get_kiro_auth("auto").await {
-            if kiro::ensure_model_cache(&auth).await.is_ok() {
+        if let Some(auth_with_account) = get_kiro_auth("auto").await {
+            if kiro::ensure_model_cache(&auth_with_account.auth).await.is_ok() {
+
                 let model_ids = kiro::available_models();
                 if !model_ids.is_empty() {
                     let created = chrono::Utc::now().timestamp();
@@ -555,7 +600,7 @@ fn convert_gemini_to_messages(request: &Value) -> Vec<Value> {
 async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::response::Response {
     let model = payload.get("model").and_then(|m| m.as_str()).unwrap_or("claude-sonnet-4");
     
-    let auth = match get_kiro_auth(model).await {
+    let kiro_auth = match get_kiro_auth(model).await {
         Some(a) => a,
         None => {
             return Json(json!({
@@ -568,6 +613,9 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
             .into_response();
         }
     };
+    
+    let auth = &kiro_auth.auth;
+    let account_id = &kiro_auth.account_id;
     
     // Build Kiro payload from OpenAI-style messages
     let resolution = kiro::resolve_model(model);
@@ -593,7 +641,7 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
     };
     
     // Send request to Kiro
-    let response = match kiro::send_kiro_request(&auth, &kiro_payload, true).await {
+    let response = match kiro::send_kiro_request(auth, &kiro_payload, true).await {
         Ok(r) => r,
         Err(e) => {
             return Json(json!({
@@ -622,7 +670,7 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
             }
         });
         let stream = stream.map(|payload| Ok::<Event, Infallible>(Event::default().data(payload)));
-        return Sse::new(stream).into_response();
+        return with_account_id(Sse::new(stream), account_id);
     } else {
         let messages_for_stream = payload.get("messages").cloned();
         match kiro::collect_stream_response(
@@ -631,7 +679,7 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
             messages_for_stream,
             None, // request_tools
         ).await {
-            Ok(json_response) => Json(json_response).into_response(),
+            Ok(json_response) => with_account_id(Json(json_response), account_id),
             Err(e) => Json(json!({
                 "error": {
                     "message": format!("Kiro API error: {}", e),
@@ -643,6 +691,8 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
         }
     }
 }
+
+
 
 /// Handle native Claude request (converted from Gemini format)
 async fn handle_native_claude_request(payload: Value, is_stream: bool, model: &str) -> axum::response::Response {
@@ -665,8 +715,8 @@ async fn handle_native_claude_request(payload: Value, is_stream: bool, model: &s
 
 /// Handle Codex OpenAI request (converted from Gemini format)
 async fn handle_codex_openai_request(payload: Value, is_stream: bool, model: &str) -> axum::response::Response {
-    let token = match get_codex_token(model).await {
-        Some(t) => t,
+    let auth = match get_codex_auth(model).await {
+        Some(a) => a,
         None => {
             return Json(json!({
                 "error": {
@@ -679,8 +729,10 @@ async fn handle_codex_openai_request(payload: Value, is_stream: bool, model: &st
         }
     };
     
-    forward_openai_compatible(payload, "https://api.openai.com/v1", &token, is_stream, "Codex").await
+    let resp = forward_openai_compatible(payload, "https://api.openai.com/v1", &auth.access_token, is_stream, "Codex").await;
+    with_account_id(resp, &auth.account_id)
 }
+
 
 fn normalize_provider_prefix(prefix: &str) -> Option<String> {
     let lower = prefix.trim().to_lowercase();
@@ -1816,6 +1868,7 @@ async fn get_gemini_auth(model: &str) -> Option<GeminiAuth> {
             return Some(GeminiAuth {
                 access_token: snapshot.access_token,
                 project_id,
+                account_id: candidate.id.clone(),
             });
         }
 
@@ -1871,6 +1924,7 @@ async fn get_gemini_auth(model: &str) -> Option<GeminiAuth> {
             return Some(GeminiAuth {
                 access_token: new_tokens.access_token,
                 project_id,
+                account_id: candidate.id.clone(),
             });
         }
     }
@@ -1954,7 +2008,7 @@ async fn get_claude_token(model: &str) -> Option<String> {
 }
 
 /// Get a valid Codex access token from stored credentials
-async fn get_codex_token(model: &str) -> Option<String> {
+async fn get_codex_auth(model: &str) -> Option<CodexAuth> {
     let candidates = select_auth_candidates("codex", model);
     for candidate in candidates {
         let content = match std::fs::read_to_string(&candidate.path) {
@@ -1972,7 +2026,10 @@ async fn get_codex_token(model: &str) -> Option<String> {
         };
 
         if !is_expired(snapshot.expires_at) {
-            return Some(snapshot.access_token);
+            return Some(CodexAuth {
+                access_token: snapshot.access_token,
+                account_id: candidate.id.clone(),
+            });
         }
 
         let refresh_token = match snapshot.refresh_token {
@@ -2029,11 +2086,15 @@ async fn get_codex_token(model: &str) -> Option<String> {
                 let _ = std::fs::write(&candidate.path, updated_content);
             }
 
-            return Some(new_tokens.access_token);
+            return Some(CodexAuth {
+                access_token: new_tokens.access_token,
+                account_id: candidate.id.clone(),
+            });
         }
     }
     None
 }
+
 
 fn normalize_antigravity_model(model: &str) -> String {
     let name = model.split('/').last().unwrap_or(model).trim().to_lowercase();
@@ -2140,6 +2201,7 @@ async fn load_antigravity_auth_from_candidate(candidate: &AuthCandidate) -> Opti
         return Some(AntigravityAuth {
             access_token: snapshot.access_token,
             project_id,
+            account_id: candidate.id.clone(),
         });
     }
 
@@ -2205,6 +2267,7 @@ async fn load_antigravity_auth_from_candidate(candidate: &AuthCandidate) -> Opti
     Some(AntigravityAuth {
         access_token: new_tokens.access_token,
         project_id,
+        account_id: candidate.id.clone(),
     })
 }
 
@@ -2239,7 +2302,7 @@ async fn get_antigravity_auths(model: &str) -> Vec<AntigravityAuth> {
 }
 
 /// Get a valid Kiro access token from stored credentials
-async fn get_kiro_auth(model: &str) -> Option<kiro::KiroAuth> {
+async fn get_kiro_auth(model: &str) -> Option<KiroAuthWithAccount> {
     let candidates = select_auth_candidates("kiro", model);
     for candidate in candidates {
         let snapshot = match kiro::load_kiro_auth(&candidate.path).await {
@@ -2247,9 +2310,16 @@ async fn get_kiro_auth(model: &str) -> Option<kiro::KiroAuth> {
             Err(_) => continue,
         };
 
+        // Read email from the auth file for account_id
+        let email = std::fs::read_to_string(&candidate.path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|json| json.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()));
+        let account_id = email.unwrap_or_else(|| candidate.id.clone());
+
         if !is_expired(snapshot.expires_at) && !snapshot.access_token.trim().is_empty() {
             if let Ok(auth) = kiro::snapshot_to_auth(snapshot) {
-                return Some(auth);
+                return Some(KiroAuthWithAccount { auth, account_id });
             }
             continue;
         }
@@ -2260,12 +2330,13 @@ async fn get_kiro_auth(model: &str) -> Option<kiro::KiroAuth> {
 
         if let Ok(updated) = kiro::refresh_kiro_auth(&candidate.path, &snapshot).await {
             if let Ok(auth) = kiro::snapshot_to_auth(updated) {
-                return Some(auth);
+                return Some(KiroAuthWithAccount { auth, account_id });
             }
         }
     }
     None
 }
+
 
 /// Get a Kimi API key from stored credentials
 async fn get_kimi_token(model: &str) -> Option<String> {
@@ -2516,6 +2587,7 @@ pub async fn chat_completions(
             }
         };
 
+        let account_id = auth.account_id.clone();
         let client = GeminiClient::new(auth.access_token);
 
         let mut gemini_request = gemini::openai_to_gemini_cli_request(&raw, &model);
@@ -2527,7 +2599,7 @@ pub async fn chat_completions(
             match client.stream_generate_content(&gemini_request).await {
                 Ok(response) => {
                     let stream = gemini::gemini_cli_stream_to_openai_events(response);
-                    return Sse::new(stream).into_response();
+                    return with_account_id(Sse::new(stream), &account_id);
                 }
                 Err(e) => {
                     tracing::error!("Gemini API error: {}", e);
@@ -2547,7 +2619,7 @@ pub async fn chat_completions(
             Ok(response) => {
                 let openai_response =
                     gemini::gemini_to_openai_response(&response, &model, &request_id);
-                return Json(openai_response).into_response();
+                return with_account_id(Json(openai_response), &account_id);
             }
             Err(e) => {
                 tracing::error!("Gemini API error: {}", e);
@@ -2563,12 +2635,13 @@ pub async fn chat_completions(
         }
     }
 
+
     if provider_override.as_deref() == Some("codex") {
         // Parse reasoning_effort from model name (e.g., "high/gpt-5-codex")
         let (actual_model, reasoning_effort) = parse_codex_model_with_effort(&model);
 
-        let token = match get_codex_token(&actual_model).await {
-            Some(t) => t,
+        let auth = match get_codex_auth(&actual_model).await {
+            Some(a) => a,
             None => {
                 return Json(json!({
                     "error": {
@@ -2587,14 +2660,14 @@ pub async fn chat_completions(
             modified_raw["reasoning_effort"] = json!(effort);
         }
 
-        let client = CodexClient::new(token);
+        let client = CodexClient::new(auth.access_token.clone());
         let codex_request = codex::openai_to_codex_request(&modified_raw, &actual_model, true);
 
         if is_stream {
             match client.stream_responses(&codex_request, true).await {
                 Ok(response) => {
                     let stream = codex::codex_stream_to_openai_events(response, raw.clone());
-                    return Sse::new(stream).into_response();
+                    return with_account_id(Sse::new(stream), &auth.account_id);
                 }
                 Err(e) => {
                     tracing::error!("Codex API error: {}", e);
@@ -2612,7 +2685,7 @@ pub async fn chat_completions(
 
         match client.stream_responses(&codex_request, true).await {
             Ok(response) => match codex::collect_non_stream_response(response, &raw).await {
-                Ok(openai_response) => return Json(openai_response).into_response(),
+                Ok(openai_response) => return with_account_id(Json(openai_response), &auth.account_id),
                 Err(e) => {
                     tracing::error!("Codex API error: {}", e);
                     return Json(json!({
@@ -2638,6 +2711,7 @@ pub async fn chat_completions(
             }
         }
     }
+
 
     if provider_override.as_deref() == Some("antigravity") {
         let (actual_model, reasoning_effort) = parse_antigravity_model_with_effort(&model);
@@ -2680,6 +2754,7 @@ pub async fn chat_completions(
             let AntigravityAuth {
                 access_token,
                 project_id,
+                account_id,
             } = auth;
             let client = AntigravityClient::new(access_token);
             let antigravity_request =
@@ -2689,7 +2764,7 @@ pub async fn chat_completions(
                 match client.stream_generate_content(&antigravity_request, None).await {
                     Ok(response) => {
                         let stream = antigravity::antigravity_stream_to_openai_events(response);
-                        return Sse::new(stream).into_response();
+                        return with_account_id(Sse::new(stream), &account_id);
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -2716,7 +2791,7 @@ pub async fn chat_completions(
                         Ok(payload) => {
                             let openai_response =
                                 gemini::gemini_to_openai_response(&payload, &actual_model, &request_id);
-                            return Json(openai_response).into_response();
+                            return with_account_id(Json(openai_response), &account_id);
                         }
                         Err(e) => {
                             tracing::error!("Antigravity API error: {}", e);
@@ -2753,7 +2828,7 @@ pub async fn chat_completions(
                 Ok(response) => {
                     let openai_response =
                         gemini::gemini_to_openai_response(&response, &actual_model, &request_id);
-                    return Json(openai_response).into_response();
+                    return with_account_id(Json(openai_response), &account_id);
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -2774,6 +2849,7 @@ pub async fn chat_completions(
             }
         }
 
+
         let message = last_error.unwrap_or_else(|| "Antigravity API error".to_string());
         return Json(json!({
             "error": {
@@ -2786,7 +2862,7 @@ pub async fn chat_completions(
     }
 
     if provider_override.as_deref() == Some("kiro") {
-        let auth = match get_kiro_auth(&model).await {
+        let kiro_auth = match get_kiro_auth(&model).await {
             Some(a) => a,
             None => {
                 return Json(json!({
@@ -2800,7 +2876,10 @@ pub async fn chat_completions(
             }
         };
 
-        if kiro::ensure_model_cache(&auth).await.is_err() {
+        let auth = &kiro_auth.auth;
+        let account_id = &kiro_auth.account_id;
+
+        if kiro::ensure_model_cache(auth).await.is_err() {
             return Json(json!({
                 "error": {
                     "message": "Failed to load Kiro models. Please try again.",
@@ -2838,7 +2917,7 @@ pub async fn chat_completions(
             }
         };
 
-        let response = match kiro::send_kiro_request(&auth, &payload, true).await {
+        let response = match kiro::send_kiro_request(auth, &payload, true).await {
             Ok(r) => r,
             Err(e) => {
                 return Json(json!({
@@ -2867,7 +2946,7 @@ pub async fn chat_completions(
             });
             let stream =
                 stream.map(|payload| Ok::<Event, Infallible>(Event::default().data(payload)));
-            return Sse::new(stream).into_response();
+            return with_account_id(Sse::new(stream), account_id);
         }
 
         match kiro::collect_stream_response(
@@ -2878,7 +2957,7 @@ pub async fn chat_completions(
         )
         .await
         {
-            Ok(openai_response) => return Json(openai_response).into_response(),
+            Ok(openai_response) => return with_account_id(Json(openai_response), account_id),
             Err(e) => {
                 return Json(json!({
                     "error": {
@@ -2891,6 +2970,8 @@ pub async fn chat_completions(
             }
         }
     }
+
+
 
     if matches!(provider_override.as_deref(), Some("kimi") | Some("glm")) {
         let request: ChatCompletionRequest = match serde_json::from_value(raw.clone()) {
@@ -3347,8 +3428,8 @@ pub async fn completions(
         // Parse reasoning_effort from model name (e.g., "high/gpt-5-codex")
         let (actual_model, reasoning_effort) = parse_codex_model_with_effort(&model);
 
-        let token = match get_codex_token(&actual_model).await {
-            Some(t) => t,
+        let auth = match get_codex_auth(&actual_model).await {
+            Some(a) => a,
             None => {
                 return Json(json!({
                     "error": {
@@ -3367,7 +3448,7 @@ pub async fn completions(
             modified_request["reasoning_effort"] = json!(effort);
         }
 
-        let client = CodexClient::new(token);
+        let client = CodexClient::new(auth.access_token.clone());
         let codex_request = codex::openai_to_codex_request(&modified_request, &actual_model, true);
 
         if is_stream {
@@ -3387,7 +3468,7 @@ pub async fn completions(
                         }
                         yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
                     };
-                    return Sse::new(stream).into_response();
+                    return with_account_id(Sse::new(stream), &auth.account_id);
                 }
                 Err(e) => {
                     tracing::error!("Codex API error: {}", e);
@@ -3407,7 +3488,7 @@ pub async fn completions(
             Ok(response) => match codex::collect_non_stream_response(response, &chat_request).await {
                 Ok(openai_response) => {
                     let completions_response = convert_chat_response_to_completions(&openai_response);
-                    return Json(completions_response).into_response();
+                    return with_account_id(Json(completions_response), &auth.account_id);
                 }
                 Err(e) => {
                     tracing::error!("Codex API error: {}", e);
@@ -3434,6 +3515,7 @@ pub async fn completions(
             }
         }
     }
+
 
     if provider_override.as_deref() == Some("antigravity") {
         let (actual_model, reasoning_effort) = parse_antigravity_model_with_effort(&model);
@@ -3476,6 +3558,7 @@ pub async fn completions(
             let AntigravityAuth {
                 access_token,
                 project_id,
+                account_id,
             } = auth;
             let client = AntigravityClient::new(access_token);
             let antigravity_request =
@@ -3498,7 +3581,7 @@ pub async fn completions(
                             }
                             yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
                         };
-                        return Sse::new(stream).into_response();
+                        return with_account_id(Sse::new(stream), &account_id);
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -3526,7 +3609,7 @@ pub async fn completions(
                             let openai_response =
                                 gemini::gemini_to_openai_response(&payload, &actual_model, &request_id);
                             let completions_response = convert_chat_response_to_completions(&openai_response);
-                            return Json(completions_response).into_response();
+                            return with_account_id(Json(completions_response), &account_id);
                         }
                         Err(e) => {
                             tracing::error!("Antigravity API error: {}", e);
@@ -3564,7 +3647,7 @@ pub async fn completions(
                     let openai_response =
                         gemini::gemini_to_openai_response(&response, &actual_model, &request_id);
                     let completions_response = convert_chat_response_to_completions(&openai_response);
-                    return Json(completions_response).into_response();
+                    return with_account_id(Json(completions_response), &account_id);
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -3585,6 +3668,7 @@ pub async fn completions(
             }
         }
 
+
         let message = last_error.unwrap_or_else(|| "Antigravity API error".to_string());
         return Json(json!({
             "error": {
@@ -3597,7 +3681,7 @@ pub async fn completions(
     }
 
     if provider_override.as_deref() == Some("kiro") {
-        let auth = match get_kiro_auth(&model).await {
+        let kiro_auth = match get_kiro_auth(&model).await {
             Some(a) => a,
             None => {
                 return Json(json!({
@@ -3611,7 +3695,10 @@ pub async fn completions(
             }
         };
 
-        if kiro::ensure_model_cache(&auth).await.is_err() {
+        let auth = &kiro_auth.auth;
+        let account_id = &kiro_auth.account_id;
+
+        if kiro::ensure_model_cache(auth).await.is_err() {
             return Json(json!({
                 "error": {
                     "message": "Failed to load Kiro models. Please try again.",
@@ -3644,7 +3731,7 @@ pub async fn completions(
             }
         };
 
-        let response = match kiro::send_kiro_request(&auth, &payload, true).await {
+        let response = match kiro::send_kiro_request(auth, &payload, true).await {
             Ok(r) => r,
             Err(e) => {
                 return Json(json!({
@@ -3679,7 +3766,7 @@ pub async fn completions(
             let stream = stream.chain(futures::stream::once(async {
                 Ok(Event::default().data("[DONE]"))
             }));
-            return Sse::new(stream).into_response();
+            return with_account_id(Sse::new(stream), account_id);
         }
 
         match kiro::collect_stream_response(
@@ -3692,7 +3779,7 @@ pub async fn completions(
         {
             Ok(openai_response) => {
                 let completions_response = convert_chat_response_to_completions(&openai_response);
-                return Json(completions_response).into_response();
+                return with_account_id(Json(completions_response), account_id);
             }
             Err(e) => {
                 return Json(json!({
@@ -3706,6 +3793,7 @@ pub async fn completions(
             }
         }
     }
+
 
     if matches!(provider_override.as_deref(), Some("kimi") | Some("glm")) {
         let request: ChatCompletionRequest = match serde_json::from_value(chat_request.clone()) {
@@ -4032,8 +4120,8 @@ pub async fn claude_messages(
         // Parse reasoning_effort from model name (e.g., "high/gpt-5-codex")
         let (actual_model, reasoning_effort) = parse_codex_model_with_effort(&model);
 
-        let token = match get_codex_token(&actual_model).await {
-            Some(t) => t,
+        let auth = match get_codex_auth(&actual_model).await {
+            Some(a) => a,
             None => {
                 return Json(json!({
                     "error": {
@@ -4052,7 +4140,7 @@ pub async fn claude_messages(
             modified_openai_raw["reasoning_effort"] = json!(effort);
         }
 
-        let client = CodexClient::new(token);
+        let client = CodexClient::new(auth.access_token.clone());
         let codex_request = codex::openai_to_codex_request(&modified_openai_raw, &actual_model, true);
 
         if is_stream {
@@ -4060,7 +4148,7 @@ pub async fn claude_messages(
                 Ok(response) => {
                     let upstream = codex::codex_stream_to_openai_chunks(response, modified_openai_raw.clone());
                     let stream = openai_chunks_to_claude_events(upstream, &actual_model);
-                    return Sse::new(stream).into_response();
+                    return with_account_id(Sse::new(stream), &auth.account_id);
                 }
                 Err(e) => {
                     tracing::error!("Codex API error: {}", e);
@@ -4081,7 +4169,7 @@ pub async fn claude_messages(
                 Ok(openai_response) => {
                     let claude_response =
                         claude::openai_to_claude_response(&openai_response, &actual_model, &request_id);
-                    return Json(claude_response).into_response();
+                    return with_account_id(Json(claude_response), &auth.account_id);
                 }
                 Err(e) => {
                     tracing::error!("Codex API error: {}", e);
@@ -4109,8 +4197,9 @@ pub async fn claude_messages(
         }
     }
 
+
     if provider_override.as_deref() == Some("kiro") {
-        let auth = match get_kiro_auth(&model).await {
+        let kiro_auth = match get_kiro_auth(&model).await {
             Some(a) => a,
             None => {
                 return Json(json!({
@@ -4124,7 +4213,10 @@ pub async fn claude_messages(
             }
         };
 
-        if kiro::ensure_model_cache(&auth).await.is_err() {
+        let auth = &kiro_auth.auth;
+        let account_id = &kiro_auth.account_id;
+
+        if kiro::ensure_model_cache(auth).await.is_err() {
             return Json(json!({
                 "error": {
                     "message": "Failed to load Kiro models. Please try again.",
@@ -4162,7 +4254,7 @@ pub async fn claude_messages(
             }
         };
 
-        let response = match kiro::send_kiro_request(&auth, &payload, true).await {
+        let response = match kiro::send_kiro_request(auth, &payload, true).await {
             Ok(r) => r,
             Err(e) => {
                 return Json(json!({
@@ -4190,7 +4282,7 @@ pub async fn claude_messages(
                 }
             });
             let stream = openai_chunks_to_claude_events(stream, &model);
-            return Sse::new(stream).into_response();
+            return with_account_id(Sse::new(stream), account_id);
         }
 
         match kiro::collect_stream_response(
@@ -4204,7 +4296,7 @@ pub async fn claude_messages(
             Ok(openai_response) => {
                 let claude_response =
                     claude::openai_to_claude_response(&openai_response, &model, &request_id);
-                return Json(claude_response).into_response();
+                return with_account_id(Json(claude_response), account_id);
             }
             Err(e) => {
                 return Json(json!({
@@ -4218,6 +4310,8 @@ pub async fn claude_messages(
             }
         }
     }
+
+
 
     if provider_override.as_deref() == Some("antigravity") {
         let (actual_model, reasoning_effort) = parse_antigravity_model_with_effort(&model);
@@ -4264,6 +4358,7 @@ pub async fn claude_messages(
             let AntigravityAuth {
                 access_token,
                 project_id,
+                account_id,
             } = auth;
             let client = AntigravityClient::new(access_token);
             let antigravity_request =
@@ -4278,7 +4373,7 @@ pub async fn claude_messages(
                             &actual_model,
                             reasoning_as_text,
                         );
-                        return Sse::new(stream).into_response();
+                        return with_account_id(Sse::new(stream), &account_id);
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -4311,7 +4406,7 @@ pub async fn claude_messages(
                                 &request_id,
                                 reasoning_as_text,
                             );
-                            return Json(claude_response).into_response();
+                            return with_account_id(Json(claude_response), &account_id);
                         }
                         Err(e) => {
                             tracing::error!("Antigravity API error: {}", e);
@@ -4354,7 +4449,7 @@ pub async fn claude_messages(
                         &request_id,
                         reasoning_as_text,
                     );
-                    return Json(claude_response).into_response();
+                    return with_account_id(Json(claude_response), &account_id);
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -4374,6 +4469,7 @@ pub async fn claude_messages(
                 }
             }
         }
+
 
         let message = last_error.unwrap_or_else(|| "Antigravity API error".to_string());
         return Json(json!({
