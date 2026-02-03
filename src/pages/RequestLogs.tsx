@@ -168,11 +168,10 @@ export function RequestLogs() {
           <button
             key={tab.id}
             onClick={() => setSelectedTab(tab.id)}
-            className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
-              selectedTab === tab.id
+            className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${selectedTab === tab.id
                 ? "bg-gray-800 dark:bg-gray-700 text-white"
                 : "bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600"
-            }`}
+              }`}
           >
             {tab.label}
           </button>
@@ -184,11 +183,10 @@ export function RequestLogs() {
         {/* Pause/Resume */}
         <button
           onClick={() => setPaused(!paused)}
-          className={`px-3 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors ${
-            paused
+          className={`px-3 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors ${paused
               ? "bg-green-600 hover:bg-green-700 text-white"
               : "bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600 text-white"
-          }`}
+            }`}
         >
           {paused ? (
             <>

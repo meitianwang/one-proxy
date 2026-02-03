@@ -281,6 +281,10 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
             })
             .collect();
         
+        // Filter out hidden models (like auto-kiro)
+        let hidden_models = ["auto-kiro", "auto"];
+        aggregated_models.retain(|m| !hidden_models.contains(&m.id.as_str()));
+        
         // Sort models alphabetically
         aggregated_models.sort_by(|a, b| a.id.cmp(&b.id));
         
@@ -520,6 +524,196 @@ fn parse_provider_prefix(model: &str) -> (Option<String>, String) {
         }
     }
     (None, trimmed.to_string())
+}
+
+/// Convert Gemini format contents to OpenAI/Claude messages format
+fn convert_gemini_to_messages(request: &Value) -> Vec<Value> {
+    let mut messages = Vec::new();
+    
+    if let Some(contents) = request.get("contents").and_then(|c| c.as_array()) {
+        for content in contents {
+            let role = content.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            // Convert Gemini role to OpenAI/Claude role
+            let normalized_role = match role {
+                "model" => "assistant",
+                _ => role,
+            };
+            
+            // Extract text from parts
+            let mut text_content = String::new();
+            if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                        if !text_content.is_empty() {
+                            text_content.push('\n');
+                        }
+                        text_content.push_str(text);
+                    }
+                }
+            }
+            
+            if !text_content.is_empty() {
+                messages.push(json!({
+                    "role": normalized_role,
+                    "content": text_content
+                }));
+            }
+        }
+    }
+    
+    // If systemInstruction is present, add it as a system message at the beginning
+    if let Some(sys) = request.get("systemInstruction") {
+        if let Some(parts) = sys.get("parts").and_then(|p| p.as_array()) {
+            let mut sys_text = String::new();
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    if !sys_text.is_empty() {
+                        sys_text.push('\n');
+                    }
+                    sys_text.push_str(text);
+                }
+            }
+            if !sys_text.is_empty() {
+                messages.insert(0, json!({
+                    "role": "system",
+                    "content": sys_text
+                }));
+            }
+        }
+    }
+    
+    messages
+}
+
+/// Handle Kiro Claude request (converted from Gemini format)
+async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::response::Response {
+    let model = payload.get("model").and_then(|m| m.as_str()).unwrap_or("claude-sonnet-4");
+    
+    let auth = match get_kiro_auth(model).await {
+        Some(a) => a,
+        None => {
+            return Json(json!({
+                "error": {
+                    "message": "No valid Kiro credentials found. Please login first.",
+                    "type": "authentication_error",
+                    "code": 401
+                }
+            }))
+            .into_response();
+        }
+    };
+    
+    // Build Kiro payload from OpenAI-style messages
+    let resolution = kiro::resolve_model(model);
+    let conversation_id = kiro::generate_conversation_id(payload.get("messages"));
+    let profile_arn = if matches!(auth.auth_type, kiro::KiroAuthType::KiroDesktop) {
+        auth.profile_arn.clone()
+    } else {
+        None
+    };
+    
+    let kiro_payload = match kiro::build_kiro_payload_from_openai(&payload, &resolution.internal_id, conversation_id, profile_arn) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(json!({
+                "error": {
+                    "message": format!("Failed to build Kiro payload: {}", e),
+                    "type": "invalid_request_error",
+                    "code": 400
+                }
+            }))
+            .into_response();
+        }
+    };
+    
+    // Send request to Kiro
+    let response = match kiro::send_kiro_request(&auth, &kiro_payload, true).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(json!({
+                "error": {
+                    "message": format!("Kiro API error: {}", e),
+                    "type": "api_error",
+                    "code": 500
+                }
+            }))
+            .into_response();
+        }
+    };
+    
+    if is_stream {
+        let messages_for_stream = payload.get("messages").cloned();
+        let upstream = kiro::stream_kiro_to_openai(
+            response,
+            model.to_string(),
+            messages_for_stream,
+            None, // request_tools
+        );
+        let stream = upstream.filter_map(|chunk| async move {
+            match chunk {
+                Ok(data) => strip_sse_data_line(&data),
+                Err(_) => None,
+            }
+        });
+        let stream = stream.map(|payload| Ok::<Event, Infallible>(Event::default().data(payload)));
+        return Sse::new(stream).into_response();
+    } else {
+        let messages_for_stream = payload.get("messages").cloned();
+        match kiro::collect_stream_response(
+            response,
+            model.to_string(),
+            messages_for_stream,
+            None, // request_tools
+        ).await {
+            Ok(json_response) => Json(json_response).into_response(),
+            Err(e) => Json(json!({
+                "error": {
+                    "message": format!("Kiro API error: {}", e),
+                    "type": "api_error",
+                    "code": 500
+                }
+            }))
+            .into_response(),
+        }
+    }
+}
+
+/// Handle native Claude request (converted from Gemini format)
+async fn handle_native_claude_request(payload: Value, is_stream: bool, model: &str) -> axum::response::Response {
+    let token = match get_claude_token(model).await {
+        Some(t) => t,
+        None => {
+            return Json(json!({
+                "error": {
+                    "message": "No valid Claude credentials found. Please login first.",
+                    "type": "authentication_error",
+                    "code": 401
+                }
+            }))
+            .into_response();
+        }
+    };
+    
+    forward_claude_compatible(payload, "https://api.anthropic.com/v1", &token, is_stream, "Claude").await
+}
+
+/// Handle Codex OpenAI request (converted from Gemini format)
+async fn handle_codex_openai_request(payload: Value, is_stream: bool, model: &str) -> axum::response::Response {
+    let token = match get_codex_token(model).await {
+        Some(t) => t,
+        None => {
+            return Json(json!({
+                "error": {
+                    "message": "No valid Codex credentials found. Please login first.",
+                    "type": "authentication_error",
+                    "code": 401
+                }
+            }))
+            .into_response();
+        }
+    };
+    
+    forward_openai_compatible(payload, "https://api.openai.com/v1", &token, is_stream, "Codex").await
 }
 
 fn normalize_provider_prefix(prefix: &str) -> Option<String> {
@@ -1256,18 +1450,7 @@ where
 /// Get static Antigravity model definitions
 fn get_antigravity_models() -> Vec<ModelInfo> {
     vec![
-        ModelInfo {
-            id: "gemini-2.5-flash".to_string(),
-            object: "model".to_string(),
-            created: 1750118400,
-            owned_by: "antigravity".to_string(),
-        },
-        ModelInfo {
-            id: "gemini-2.5-flash-lite".to_string(),
-            object: "model".to_string(),
-            created: 1753142400,
-            owned_by: "antigravity".to_string(),
-        },
+        // Gemini 3 系列
         ModelInfo {
             id: "gemini-3-pro-high".to_string(),
             object: "model".to_string(),
@@ -1280,6 +1463,7 @@ fn get_antigravity_models() -> Vec<ModelInfo> {
             created: 1765929600,
             owned_by: "antigravity".to_string(),
         },
+        // Claude 系列
         ModelInfo {
             id: "claude-sonnet-4-5-thinking".to_string(),
             object: "model".to_string(),
@@ -1300,6 +1484,7 @@ fn get_antigravity_models() -> Vec<ModelInfo> {
         },
     ]
 }
+
 
 /// Get static Claude model definitions
 fn get_claude_models() -> Vec<ModelInfo> {
@@ -4578,7 +4763,155 @@ pub async fn gemini_handler(
         model_name = stripped.to_string();
     }
 
-    let auth = match get_gemini_auth(&model_name).await {
+    // Check if this is a non-Gemini model in aggregation mode
+    // If so, convert Gemini format to appropriate format and route to correct provider
+    let (provider_override, resolved_model) = parse_provider_prefix(&model_name);
+    
+    // Use model router for aggregation mode
+    let (final_provider, final_model) = if provider_override.is_some() {
+        (provider_override, resolved_model)
+    } else {
+        use super::model_router::{resolve_model, ResolvedModel};
+        match resolve_model(&model_name, None) {
+            ResolvedModel::Explicit { provider, model } => {
+                (Some(provider), model)
+            }
+            ResolvedModel::Aggregated { provider, model, fallbacks: _ } => {
+                tracing::info!("[Gemini->Aggregation] Resolved {} to provider '{}'", model_name, provider);
+                (Some(provider), model)
+            }
+            ResolvedModel::NoProvider { model } => {
+                // Default to gemini if no provider found
+                (Some("gemini".to_string()), model)
+            }
+        }
+    };
+
+    // If provider is not gemini, convert the request and route appropriately
+    if let Some(ref provider) = final_provider {
+        if provider != "gemini" {
+            // Convert Gemini format to OpenAI/Claude format and route
+            let messages = convert_gemini_to_messages(&request);
+            let is_stream = method == "streamGenerateContent";
+            
+            match provider.as_str() {
+                "antigravity" => {
+                    // Route to Antigravity - need to convert Gemini format to Antigravity format
+                    let auth = match get_antigravity_auth(&final_model).await {
+                        Some(a) => a,
+                        None => {
+                            return Json(json!({
+                                "error": {
+                                    "message": "No valid Antigravity credentials found. Please login first.",
+                                    "type": "authentication_error",
+                                    "code": 401
+                                }
+                            }))
+                            .into_response();
+                        }
+                    };
+                    
+                    // First convert Gemini format to OpenAI format
+                    let openai_payload = json!({
+                        "model": final_model,
+                        "messages": messages,
+                        "stream": is_stream
+                    });
+                    
+                    // Then convert OpenAI to Antigravity format
+                    let antigravity_request = antigravity::openai_to_antigravity_request(
+                        &openai_payload,
+                        &final_model,
+                        auth.project_id.clone()
+                    );
+                    
+                    let client = super::antigravity::AntigravityClient::new(auth.access_token.clone());
+                    
+                    if is_stream {
+                        match client.stream_generate_content(&antigravity_request, None).await {
+                            Ok(response) => {
+                                let stream = antigravity::antigravity_stream_to_openai_events(response);
+                                return Sse::new(stream).into_response();
+                            }
+                            Err(e) => {
+                                return Json(json!({
+                                    "error": {
+                                        "message": format!("Antigravity API error: {}", e),
+                                        "type": "api_error",
+                                        "code": 500
+                                    }
+                                }))
+                                .into_response();
+                            }
+                        }
+                    } else {
+                        match client.stream_generate_content(&antigravity_request, None).await {
+                            Ok(response) => {
+                                match antigravity::collect_antigravity_stream(response).await {
+                                    Ok(payload) => {
+                                        // Convert back to Gemini format for response
+                                        return Json(payload).into_response();
+                                    }
+                                    Err(e) => {
+                                        return Json(json!({
+                                            "error": {
+                                                "message": format!("Antigravity API error: {}", e),
+                                                "type": "api_error",
+                                                "code": 500
+                                            }
+                                        }))
+                                        .into_response();
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                return Json(json!({
+                                    "error": {
+                                        "message": format!("Antigravity API error: {}", e),
+                                        "type": "api_error",
+                                        "code": 500
+                                    }
+                                }))
+                                .into_response();
+                            }
+                        }
+                    }
+                }
+                "kiro" | "claude" => {
+                    // Route to Claude/Kiro via Anthropic format
+                    let claude_payload = json!({
+                        "model": final_model,
+                        "max_tokens": request.get("generationConfig")
+                            .and_then(|c| c.get("maxOutputTokens"))
+                            .and_then(|t| t.as_i64())
+                            .unwrap_or(4096),
+                        "messages": messages,
+                        "stream": is_stream
+                    });
+                    
+                    if provider == "kiro" {
+                        return handle_kiro_claude_request(claude_payload, is_stream).await;
+                    } else {
+                        return handle_native_claude_request(claude_payload, is_stream, &final_model).await;
+                    }
+                }
+                "codex" => {
+                    // Route to Codex via OpenAI format
+                    let openai_payload = json!({
+                        "model": final_model,
+                        "messages": messages,
+                        "stream": is_stream
+                    });
+                    return handle_codex_openai_request(openai_payload, is_stream, &final_model).await;
+                }
+                _ => {
+                    // Unknown provider, try gemini anyway
+                }
+            }
+        }
+    }
+
+    let auth = match get_gemini_auth(&final_model).await {
         Some(a) => a,
         None => {
             return Json(json!({
@@ -4593,7 +4926,7 @@ pub async fn gemini_handler(
     };
 
     let mut payload = json!({
-        "model": model_name,
+        "model": final_model,
         "request": request
     });
     if let Some(project_id) = auth.project_id {

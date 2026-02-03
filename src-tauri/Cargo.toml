@@ -70,3 +70,4 @@ flate2 = "1"
 regex = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 http-body-util = "0.1"
+bytes = "1.11.0"

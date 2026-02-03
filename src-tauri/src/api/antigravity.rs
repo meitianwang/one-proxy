@@ -104,6 +104,14 @@ impl AntigravityClient {
 }
 
 pub fn openai_to_antigravity_request(raw: &Value, model: &str, project_id: Option<String>) -> Value {
+    // 尝试解析为 OpenAIRequest 结构体
+    if let Ok(openai_req) = serde_json::from_value::<crate::api::mappers::openai::models::OpenAIRequest>(raw.clone()) {
+        // 使用新的 mapper 模块进行转换
+        let proj_id = project_id.unwrap_or_else(generate_project_id);
+        return crate::api::mappers::openai::request::transform_openai_request(&openai_req, &proj_id, model);
+    }
+    
+    // Fallback: 使用原有的转换逻辑
     let mut payload = gemini::openai_to_gemini_cli_request(raw, model);
 
     if let Some(max_tokens) = raw.get("max_tokens").and_then(|v| v.as_f64()) {

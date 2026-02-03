@@ -28,6 +28,10 @@ mod mime_types;
 pub mod management;
 pub mod streaming;
 pub mod model_router;
+pub mod mappers;
+pub mod common;
+pub mod signature_cache;
+pub mod config;
 
 static SERVER_HANDLE: OnceCell<RwLock<Option<oneshot::Sender<()>>>> = OnceCell::new();
 
@@ -376,9 +380,13 @@ pub async fn start_server(app_handle: tauri::AppHandle) -> Result<()> {
         .route("/v1/completions", post(handlers::completions))
         .route("/v1/messages", post(handlers::claude_messages))
         .route("/v1/messages/count_tokens", post(handlers::claude_count_tokens))
+        // Gemini protocol routes (both with and without /gemini prefix)
         .route("/v1beta/models", get(handlers::gemini_models))
         .route("/v1beta/models/*action", post(handlers::gemini_handler))
         .route("/v1beta/models/*action", get(handlers::gemini_get_handler))
+        .route("/gemini/v1beta/models", get(handlers::gemini_models))
+        .route("/gemini/v1beta/models/*action", post(handlers::gemini_handler))
+        .route("/gemini/v1beta/models/*action", get(handlers::gemini_get_handler))
         .layer(middleware::from_fn(auth_middleware))
         .layer(middleware::from_fn(logging_middleware));
 

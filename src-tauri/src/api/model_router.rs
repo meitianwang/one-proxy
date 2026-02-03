@@ -7,6 +7,10 @@ use std::collections::HashMap;
 /// Known models and which providers support them
 /// Format: (model_pattern, vec![provider_names])
 static MODEL_PROVIDER_MAP: &[(&str, &[&str])] = &[
+    // Antigravity exclusive thinking models (must be before general Claude patterns)
+    ("claude-opus-4-5-thinking", &["antigravity"]),
+    ("claude-sonnet-4-5-thinking", &["antigravity"]),
+    ("claude-sonnet-4-thinking", &["antigravity"]),
     // Claude models
     ("claude-sonnet-4-5", &["kiro", "antigravity", "claude"]),
     ("claude-sonnet-4", &["kiro", "antigravity", "claude"]),
@@ -91,8 +95,11 @@ fn normalize_model_name(name: &str) -> String {
 
 /// Get supported providers for a model name
 pub fn get_providers_for_model(model: &str) -> Vec<String> {
+    // Strip reasoning effort prefix if present (e.g., "high/gemini-3-flash" -> "gemini-3-flash")
+    let model_stripped = strip_reasoning_prefix(model);
+    
     // Normalize the input model name first
-    let model_normalized = normalize_model_name(model);
+    let model_normalized = normalize_model_name(&model_stripped);
     
     // Check exact matches first
     for (pattern, providers) in MODEL_PROVIDER_MAP {
@@ -124,6 +131,21 @@ pub fn get_providers_for_model(model: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// Strip reasoning effort prefix from model name
+/// e.g., "high/gemini-3-flash" -> "gemini-3-flash"
+fn strip_reasoning_prefix(model: &str) -> String {
+    let reasoning_prefixes = ["low/", "medium/", "high/", "xhigh/"];
+    let model_lower = model.to_lowercase();
+    
+    for prefix in &reasoning_prefixes {
+        if model_lower.starts_with(prefix) {
+            return model[prefix.len()..].to_string();
+        }
+    }
+    
+    model.to_string()
+}
+
 /// Get provider priorities from config, sorted by priority (highest first)
 pub fn get_sorted_priorities() -> Vec<ProviderPriority> {
     let config = get_config().unwrap_or_default();
@@ -141,17 +163,41 @@ pub fn is_aggregation_mode() -> bool {
 /// Get the provider-specific model name for a normalized model name
 /// Returns the provider's preferred model name, or the original name if no mapping exists
 pub fn get_provider_model_name(normalized_model: &str, provider: &str) -> String {
-    let normalized = normalize_model_name(normalized_model);
+    // Extract reasoning prefix if present
+    let (reasoning_prefix, base_model) = extract_reasoning_prefix(normalized_model);
+    
+    // Normalize the base model
+    let normalized = normalize_model_name(&base_model);
     
     // Look for an alias
     for (model, prov, actual) in MODEL_NAME_ALIASES {
         if normalize_model_name(model) == normalized && *prov == provider {
-            return actual.to_string();
+            // Reattach reasoning prefix if present
+            return if let Some(prefix) = reasoning_prefix {
+                format!("{}/{}", prefix, actual)
+            } else {
+                actual.to_string()
+            };
         }
     }
     
-    // No alias found, return the original model name
+    // No alias found, return the original model name (with prefix if present)
     normalized_model.to_string()
+}
+
+/// Extract reasoning prefix from model name
+/// Returns (Some(prefix), base_model) or (None, original_model)
+fn extract_reasoning_prefix(model: &str) -> (Option<String>, String) {
+    let reasoning_prefixes = ["low", "medium", "high", "xhigh"];
+    
+    if let Some((prefix, rest)) = model.split_once('/') {
+        let prefix_lower = prefix.to_lowercase();
+        if reasoning_prefixes.contains(&prefix_lower.as_str()) {
+            return (Some(prefix.to_string()), rest.to_string());
+        }
+    }
+    
+    (None, model.to_string())
 }
 
 /// Resolve a model name to provider and model, considering routing mode

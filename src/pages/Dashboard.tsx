@@ -29,7 +29,7 @@ interface DashboardProps {
 export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [loading, setLoading] = useState(true);
-  const [selectedProtocol, setSelectedProtocol] = useState<"openai" | "anthropic">("openai");
+  const [selectedProtocol, setSelectedProtocol] = useState<"openai" | "anthropic" | "gemini">("openai");
   const [selectedModel, setSelectedModel] = useState("gemini-2.5-flash");
   const [models, setModels] = useState<{ id: string; name: string; desc: string }[]>([]);
   const [copied, setCopied] = useState(false);
@@ -62,6 +62,12 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
     "model": "${selectedModel}",
     "max_tokens": 1024,
     "messages": [{"role": "user", "content": "Hello"}]
+  }'`,
+    gemini: `curl -X POST ${baseUrl}/gemini/v1beta/models/${selectedModel}:generateContent \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer ${apiKey}" \\
+  -d '{
+    "contents": [{"role": "user", "parts": [{"text": "Hello"}]}]
   }'`,
   };
 
@@ -229,11 +235,10 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
           </div>
           <button
             onClick={serverStatus.running ? handleStopServer : handleStartServer}
-            className={`px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-colors ${
-              serverStatus.running
-                ? "bg-red-500 hover:bg-red-600 text-white"
-                : "bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600 text-white"
-            }`}
+            className={`px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-colors ${serverStatus.running
+              ? "bg-red-500 hover:bg-red-600 text-white"
+              : "bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600 text-white"
+              }`}
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5.636 18.364a9 9 0 010-12.728m12.728 0a9 9 0 010 12.728m-9.9-2.829a5 5 0 010-7.07m7.072 0a5 5 0 010 7.07M13 12a1 1 0 11-2 0 1 1 0 012 0z" />
@@ -273,14 +278,12 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
               </div>
               <button
                 onClick={toggleLanAccess}
-                className={`relative w-12 h-6 rounded-full transition-colors ${
-                  isLanAccess() ? "bg-gray-800 dark:bg-gray-600" : "bg-gray-300 dark:bg-gray-600"
-                }`}
+                className={`relative w-12 h-6 rounded-full transition-colors ${isLanAccess() ? "bg-gray-800 dark:bg-gray-600" : "bg-gray-300 dark:bg-gray-600"
+                  }`}
               >
                 <span
-                  className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-transform ${
-                    isLanAccess() ? "left-7" : "left-1"
-                  }`}
+                  className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-transform ${isLanAccess() ? "left-7" : "left-1"
+                    }`}
                 />
               </button>
             </div>
@@ -340,21 +343,20 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
           </div>
           <div>
             <h3 className="text-lg font-semibold text-gray-800 dark:text-white">多协议支持</h3>
-            <p className="text-sm text-gray-500 dark:text-gray-400">支持 OpenAI 和 Anthropic 协议</p>
+            <p className="text-sm text-gray-500 dark:text-gray-400">支持 OpenAI、Anthropic 和 Gemini 协议</p>
           </div>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Protocol Selection */}
           <div>
-            <div className="grid grid-cols-2 gap-3 mb-4">
+            <div className="grid grid-cols-3 gap-3 mb-4">
               <button
                 onClick={() => setSelectedProtocol("openai")}
-                className={`p-3 rounded-lg border text-left transition-colors ${
-                  selectedProtocol === "openai"
-                    ? "border-gray-800 bg-gray-100 dark:bg-gray-700 dark:border-gray-500"
-                    : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
-                }`}
+                className={`p-3 rounded-lg border text-left transition-colors ${selectedProtocol === "openai"
+                  ? "border-gray-800 bg-gray-100 dark:bg-gray-700 dark:border-gray-500"
+                  : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
+                  }`}
               >
                 <p className={`text-sm font-medium ${selectedProtocol === "openai" ? "text-gray-800 dark:text-white" : "text-gray-800 dark:text-white"}`}>
                   OpenAI 协议
@@ -363,16 +365,27 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
               </button>
               <button
                 onClick={() => setSelectedProtocol("anthropic")}
-                className={`p-3 rounded-lg border text-left transition-colors ${
-                  selectedProtocol === "anthropic"
-                    ? "border-gray-800 bg-gray-100 dark:bg-gray-700 dark:border-gray-500"
-                    : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
-                }`}
+                className={`p-3 rounded-lg border text-left transition-colors ${selectedProtocol === "anthropic"
+                  ? "border-gray-800 bg-gray-100 dark:bg-gray-700 dark:border-gray-500"
+                  : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
+                  }`}
               >
                 <p className={`text-sm font-medium ${selectedProtocol === "anthropic" ? "text-gray-800 dark:text-white" : "text-gray-800 dark:text-white"}`}>
                   Anthropic 协议
                 </p>
                 <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">/v1/messages</p>
+              </button>
+              <button
+                onClick={() => setSelectedProtocol("gemini")}
+                className={`p-3 rounded-lg border text-left transition-colors ${selectedProtocol === "gemini"
+                  ? "border-gray-800 bg-gray-100 dark:bg-gray-700 dark:border-gray-500"
+                  : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
+                  }`}
+              >
+                <p className={`text-sm font-medium ${selectedProtocol === "gemini" ? "text-gray-800 dark:text-white" : "text-gray-800 dark:text-white"}`}>
+                  Gemini 协议
+                </p>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">/gemini/v1beta</p>
               </button>
             </div>
 
@@ -389,11 +402,10 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
                     <button
                       key={model.id}
                       onClick={() => setSelectedModel(model.id)}
-                      className={`w-full p-2 rounded-lg border text-left text-sm transition-colors ${
-                        selectedModel === model.id
-                          ? "border-gray-800 bg-gray-100 dark:bg-gray-700 dark:border-gray-500"
-                          : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
-                      }`}
+                      className={`w-full p-2 rounded-lg border text-left text-sm transition-colors ${selectedModel === model.id
+                        ? "border-gray-800 bg-gray-100 dark:bg-gray-700 dark:border-gray-500"
+                        : "border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
+                        }`}
                     >
                       <span className={`font-medium ${selectedModel === model.id ? "text-gray-800 dark:text-white" : "text-gray-800 dark:text-white"}`}>
                         {model.name}

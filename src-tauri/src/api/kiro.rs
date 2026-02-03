@@ -71,6 +71,7 @@ static MODEL_ALIASES: Lazy<HashMap<String, String>> = Lazy::new(|| {
 static HIDDEN_FROM_LIST: Lazy<HashSet<String>> = Lazy::new(|| {
     let mut set = HashSet::new();
     set.insert("auto".to_string());
+    set.insert("auto-kiro".to_string());
     set
 });
 
