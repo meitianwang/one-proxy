@@ -4381,6 +4381,7 @@ dependencies = [
  "dirs",
  "flate2",
  "futures",
+ "http-body-util",
  "notify",
  "oauth2",
  "once_cell",

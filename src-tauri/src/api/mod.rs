@@ -2,15 +2,18 @@
 
 use anyhow::Result;
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     http::{header, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
     Router,
 };
+use futures::StreamExt;
+use http_body_util::BodyExt;
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
+use serde_json::Value;
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -51,15 +54,140 @@ fn extract_model_from_body(body: &[u8]) -> Option<String> {
     json.get("model").and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
+fn should_verbose_log() -> bool {
+    if let Some(config) = crate::config::get_config() {
+        if config.debug {
+            return true;
+        }
+    }
+    std::env::var("CLIPROXY_VERBOSE_LOGS")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    matches!(
+        key.trim().to_lowercase().as_str(),
+        "authorization"
+            | "api_key"
+            | "apikey"
+            | "access_token"
+            | "refresh_token"
+            | "client_secret"
+            | "token"
+            | "bearer"
+            | "anthropic_api_key"
+            | "openai_api_key"
+    )
+}
+
+fn redact_json_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                if is_sensitive_key(key) {
+                    *val = Value::String("***".to_string());
+                } else {
+                    redact_json_value(val);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_json_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn format_body_for_log(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "".to_string();
+    }
+    if let Ok(mut json) = serde_json::from_slice::<Value>(bytes) {
+        redact_json_value(&mut json);
+        return json.to_string();
+    }
+    String::from_utf8_lossy(bytes).to_string()
+}
+
+fn log_request_body(method: &str, path: &str, bytes: &[u8]) {
+    let body_text = format_body_for_log(bytes);
+    if body_text.is_empty() {
+        tracing::info!("REQ {} {}", method, path);
+    } else {
+        tracing::info!("REQ {} {} {}", method, path, body_text);
+    }
+}
+
+fn log_response_body(method: &str, path: &str, status: u16, bytes: &[u8]) {
+    let body_text = format_body_for_log(bytes);
+    if body_text.is_empty() {
+        tracing::info!("RESP {} {} {}", status, method, path);
+    } else {
+        tracing::info!("RESP {} {} {} {}", status, method, path, body_text);
+    }
+}
+
+fn log_stream_chunk(method: &str, path: &str, status: u16, bytes: &Bytes) {
+    if bytes.is_empty() {
+        return;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    tracing::info!("RESP-STREAM {} {} {} {}", status, method, path, text);
+}
+
+async fn log_response_if_needed(
+    method: &str,
+    path: &str,
+    response: Response,
+    verbose: bool,
+) -> Response {
+    if !verbose {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let status = parts.status.as_u16();
+    let content_type = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if content_type.starts_with("text/event-stream") {
+        let method = method.to_string();
+        let path = path.to_string();
+        let stream = body.into_data_stream().map(move |chunk| {
+            if let Ok(ref bytes) = chunk {
+                log_stream_chunk(&method, &path, status, bytes);
+            }
+            chunk
+        });
+        let new_body = Body::from_stream(stream);
+        return Response::from_parts(parts, new_body);
+    }
+
+    let bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => Bytes::new(),
+    };
+    log_response_body(method, path, status, &bytes);
+    Response::from_parts(parts, Body::from(bytes))
+}
+
 /// Request logging middleware
 async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
     let start = std::time::Instant::now();
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
+    let verbose = should_verbose_log();
 
     // Skip logging for model list requests early
     if path == "/v1/models" || (path.starts_with("/v1beta/models") && method == "GET") {
-        return next.run(request).await;
+        let response = next.run(request).await;
+        return log_response_if_needed(&method, &path, response, verbose).await;
     }
 
     // Extract model from request body for POST requests
@@ -72,16 +200,20 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
                 // If we can't read the body, just continue without model info
                 let request = Request::from_parts(parts, Body::empty());
                 let response = next.run(request).await;
-                return response;
+                return log_response_if_needed(&method, &path, response, verbose).await;
             }
         };
-        
+
         let model = extract_model_from_body(&bytes);
-        
+        if verbose {
+            log_request_body(&method, &path, &bytes);
+        }
+
         // Reconstruct the request with the buffered body
         let request = Request::from_parts(parts, Body::from(bytes.to_vec()));
         let response = next.run(request).await;
-        
+        let response = log_response_if_needed(&method, &path, response, verbose).await;
+
         let protocol = protocol_from_path(&path);
         let duration_ms = start.elapsed().as_millis() as i64;
         let status = response.status().as_u16() as i32;
@@ -108,7 +240,11 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
         return response;
     }
 
+    if verbose {
+        log_request_body(&method, &path, &[]);
+    }
     let response = next.run(request).await;
+    let response = log_response_if_needed(&method, &path, response, verbose).await;
 
     let protocol = protocol_from_path(&path);
     let duration_ms = start.elapsed().as_millis() as i64;

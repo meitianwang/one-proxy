@@ -572,7 +572,7 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                             Value::String(String::new())
                         };
                         parts.push(json!({
-                            "functionCall": { "name": fname, "args": args_value },
+                            "functionCall": { "id": fid, "name": fname, "args": args_value },
                             "thoughtSignature": GEMINI_CLI_THOUGHT_SIGNATURE
                         }));
                         if !fid.is_empty() {
@@ -595,6 +595,7 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                             };
                             tool_parts.push(json!({
                                 "functionResponse": {
+                                    "id": fid,
                                     "name": name,
                                     "response": { "result": resp_value }
                                 }

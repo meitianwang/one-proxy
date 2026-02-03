@@ -384,6 +384,35 @@ export function Settings() {
           <>
             <div className="space-y-2">
               <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                终端详细日志
+              </label>
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                开启后会在终端输出所有请求与响应内容（含流式片段），便于排查问题。
+              </p>
+              <div className="flex items-center justify-between p-3 border border-gray-300 dark:border-gray-600 rounded-lg">
+                <span className="text-sm text-gray-600 dark:text-gray-300">
+                  {appConfig?.debug ? "已开启" : "已关闭"}
+                </span>
+                <button
+                  onClick={() =>
+                    setAppConfig((prev) =>
+                      prev ? { ...prev, debug: !prev.debug } : prev
+                    )
+                  }
+                  className={`relative w-12 h-6 rounded-full transition-colors ${
+                    appConfig?.debug ? "bg-gray-800 dark:bg-gray-600" : "bg-gray-300 dark:bg-gray-600"
+                  }`}
+                >
+                  <span
+                    className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-transform ${
+                      appConfig?.debug ? "left-7" : "left-1"
+                    }`}
+                  />
+                </button>
+              </div>
+            </div>
+            <div className="space-y-2">
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
                 凭据存储目录
               </label>
               <p className="text-xs text-gray-500 dark:text-gray-400">
