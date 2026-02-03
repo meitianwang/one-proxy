@@ -236,6 +236,60 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
         }
     }
 
+    // In model aggregation mode, aggregate models by base name
+    let config = crate::config::get_config().unwrap_or_default();
+    if config.model_routing.mode == "model" {
+        // Aggregate models: extract base model names and combine providers
+        use std::collections::HashMap;
+        let mut aggregated: HashMap<String, (ModelInfo, Vec<(String, String)>)> = HashMap::new();
+        
+        for model in &models {
+            // Parse provider/model format
+            if let Some((provider, base_model)) = model.id.split_once('/') {
+                // Normalize model name to unify different naming conventions
+                let normalized = normalize_model_name(base_model);
+                let entry = aggregated.entry(normalized.clone()).or_insert_with(|| {
+                    (ModelInfo {
+                        id: normalized.clone(),
+                        object: model.object.clone(),
+                        created: model.created,
+                        owned_by: String::new(),
+                    }, Vec::new())
+                });
+                // Store both provider and original model name for routing
+                entry.1.push((provider.to_string(), base_model.to_string()));
+            }
+        }
+        
+        // Sort providers by priority and build final list
+        let priorities = super::model_router::get_sorted_priorities();
+        let priority_order: HashMap<String, u32> = priorities.iter()
+            .map(|p| (p.provider.clone(), p.priority))
+            .collect();
+        
+        let mut aggregated_models: Vec<ModelInfo> = aggregated.into_iter()
+            .map(|(_base_model, (mut info, mut providers))| {
+                // Sort providers by priority
+                providers.sort_by(|(a, _), (b, _)| {
+                    let pa = priority_order.get(a).copied().unwrap_or(0);
+                    let pb = priority_order.get(b).copied().unwrap_or(0);
+                    pb.cmp(&pa)
+                });
+                // Set owned_by to show which providers support this model
+                info.owned_by = providers.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(", ");
+                info
+            })
+            .collect();
+        
+        // Sort models alphabetically
+        aggregated_models.sort_by(|a, b| a.id.cmp(&b.id));
+        
+        return Json(ModelsResponse {
+            object: "list".to_string(),
+            data: aggregated_models,
+        });
+    }
+
     Json(ModelsResponse {
         object: "list".to_string(),
         data: models,
@@ -251,6 +305,31 @@ fn build_prefixed_models(prefix: &str, base: &[ModelInfo]) -> Vec<ModelInfo> {
             owned_by: m.owned_by.clone(),
         })
         .collect()
+}
+
+/// Normalize model names to unify different naming conventions
+/// e.g., "claude-sonnet-4.5" and "claude-sonnet-4-5" are the same model
+fn normalize_model_name(name: &str) -> String {
+    let normalized = name.to_lowercase();
+    
+    // Normalize version separators: 4.5 -> 4-5, 4_5 -> 4-5
+    let normalized = normalized
+        .replace(".", "-")
+        .replace("_", "-");
+    
+    // Common model name mappings
+    let normalized = match normalized.as_str() {
+        // Claude models - normalize variations
+        "claude-sonnet-4-5" => "claude-sonnet-4-5".to_string(),
+        "claude-4-5-sonnet" => "claude-sonnet-4-5".to_string(),
+        "claude-opus-4-5" => "claude-opus-4-5".to_string(),
+        "claude-4-5-opus" => "claude-opus-4-5".to_string(),
+        "claude-haiku-4-5" => "claude-haiku-4-5".to_string(),
+        "claude-4-5-haiku" => "claude-haiku-4-5".to_string(),
+        _ => normalized,
+    };
+    
+    normalized
 }
 
 /// Build Codex models with reasoning_effort variants
@@ -2234,6 +2313,36 @@ pub async fn chat_completions(
     let is_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let (provider_override, model) = parse_provider_prefix(&raw_model);
 
+    // Use model router to resolve provider in aggregation mode
+    let (resolved_provider, resolved_model, fallback_providers) = if provider_override.is_some() {
+        (provider_override, model, Vec::new())
+    } else {
+        use super::model_router::{resolve_model, ResolvedModel};
+        match resolve_model(&raw_model, None) {
+            ResolvedModel::Explicit { provider, model } => {
+                (Some(provider), model, Vec::new())
+            }
+            ResolvedModel::Aggregated { provider, model, fallbacks } => {
+                tracing::info!("[ModelAggregation] Resolved {} to provider '{}' with fallbacks: {:?}", raw_model, provider, fallbacks);
+                (Some(provider), model, fallbacks)
+            }
+            ResolvedModel::NoProvider { model } => {
+                return Json(json!({
+                    "error": {
+                        "message": "Model must include provider prefix (e.g. 'gemini/...', 'claude/...', 'codex/...', 'antigravity/...', 'kimi/...', 'glm/...', 'kiro/...'). Or enable Model Aggregation Mode in settings to use models without prefix.",
+                        "type": "invalid_request_error",
+                        "code": 400
+                    }
+                }))
+                .into_response();
+            }
+        }
+    };
+
+    let provider_override = resolved_provider;
+    let model = resolved_model;
+    // Note: fallback_providers can be used for automatic retry on quota exhaustion in future enhancement
+
     if provider_override.is_none() {
         return Json(json!({
             "error": {
@@ -2973,6 +3082,35 @@ pub async fn completions(
     let raw_model = chat_request.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let (provider_override, model) = parse_provider_prefix(&raw_model);
 
+    // Use model router to resolve provider in aggregation mode
+    let (resolved_provider, resolved_model, _fallback_providers) = if provider_override.is_some() {
+        (provider_override, model, Vec::new())
+    } else {
+        use super::model_router::{resolve_model, ResolvedModel};
+        match resolve_model(&raw_model, None) {
+            ResolvedModel::Explicit { provider, model } => {
+                (Some(provider), model, Vec::new())
+            }
+            ResolvedModel::Aggregated { provider, model, fallbacks } => {
+                tracing::info!("[ModelAggregation] Resolved {} to provider '{}' with fallbacks: {:?}", raw_model, provider, fallbacks);
+                (Some(provider), model, fallbacks)
+            }
+            ResolvedModel::NoProvider { model } => {
+                return Json(json!({
+                    "error": {
+                        "message": "Model must include provider prefix (e.g. 'gemini/...', 'claude/...', 'codex/...', 'antigravity/...', 'kimi/...', 'glm/...', 'kiro/...'). Or enable Model Aggregation Mode in settings.",
+                        "type": "invalid_request_error",
+                        "code": 400
+                    }
+                }))
+                .into_response();
+            }
+        }
+    };
+
+    let provider_override = resolved_provider;
+    let model = resolved_model;
+
     if provider_override.is_none() {
         return Json(json!({
             "error": {
@@ -3568,6 +3706,35 @@ pub async fn claude_messages(
     let raw_model = raw.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let (provider_override, model) = parse_provider_prefix(&raw_model);
     let is_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Use model router to resolve provider in aggregation mode
+    let (resolved_provider, resolved_model, _fallback_providers) = if provider_override.is_some() {
+        (provider_override, model, Vec::new())
+    } else {
+        use super::model_router::{resolve_model, ResolvedModel};
+        match resolve_model(&raw_model, None) {
+            ResolvedModel::Explicit { provider, model } => {
+                (Some(provider), model, Vec::new())
+            }
+            ResolvedModel::Aggregated { provider, model, fallbacks } => {
+                tracing::info!("[ModelAggregation] Resolved {} to provider '{}' with fallbacks: {:?}", raw_model, provider, fallbacks);
+                (Some(provider), model, fallbacks)
+            }
+            ResolvedModel::NoProvider { model } => {
+                return Json(json!({
+                    "error": {
+                        "message": "Model must include provider prefix (e.g. 'gemini/...', 'claude/...', 'codex/...', 'antigravity/...', 'kimi/...', 'glm/...', 'kiro/...'). Or enable Model Aggregation Mode in settings.",
+                        "type": "invalid_request_error",
+                        "code": 400
+                    }
+                }))
+                .into_response();
+            }
+        }
+    };
+
+    let provider_override = resolved_provider;
+    let model = resolved_model;
 
     if provider_override.is_none() {
         return Json(json!({

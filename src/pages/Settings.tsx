@@ -2,8 +2,16 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
+interface ProviderPriorityData {
+  provider: string;
+  priority: number;
+  enabled: boolean;
+}
+
 interface SettingsData {
   quota_refresh_interval: number;
+  model_routing_mode: string;
+  provider_priorities: ProviderPriorityData[];
 }
 
 interface AppConfig {
@@ -53,6 +61,8 @@ const EMPTY_PROVIDER: CustomProviderEntry = {
 export function Settings() {
   const [settings, setSettings] = useState<SettingsData>({
     quota_refresh_interval: 5,
+    model_routing_mode: "provider",
+    provider_priorities: [],
   });
   const [appConfig, setAppConfig] = useState<AppConfig | null>(null);
   const [customProviders, setCustomProviders] = useState<CustomProvidersData>({
@@ -115,7 +125,8 @@ export function Settings() {
     setSaving(true);
     setSaved(false);
     try {
-      await invoke("save_settings", { settings });
+      // Important: Save appConfig first, then settings
+      // This ensures model_routing settings are not overwritten by appConfig
       if (appConfig) {
         await invoke("save_config", { config: appConfig });
       }
@@ -131,6 +142,8 @@ export function Settings() {
           claude_code_compatibility: cleanProviders(customProviders.claude_code_compatibility),
         },
       });
+      // Save settings last to ensure model_routing is preserved
+      await invoke("save_settings", { settings });
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (error) {
@@ -337,21 +350,19 @@ export function Settings() {
         <nav className="flex gap-4">
           <button
             onClick={() => setActiveTab("general")}
-            className={`py-2 px-1 border-b-2 text-sm font-medium ${
-              activeTab === "general"
-                ? "border-gray-800 dark:border-white text-gray-800 dark:text-white"
-                : "border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300"
-            }`}
+            className={`py-2 px-1 border-b-2 text-sm font-medium ${activeTab === "general"
+              ? "border-gray-800 dark:border-white text-gray-800 dark:text-white"
+              : "border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300"
+              }`}
           >
             通用设置
           </button>
           <button
             onClick={() => setActiveTab("openai")}
-            className={`py-2 px-1 border-b-2 text-sm font-medium ${
-              activeTab === "openai"
-                ? "border-gray-800 dark:border-white text-gray-800 dark:text-white"
-                : "border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300"
-            }`}
+            className={`py-2 px-1 border-b-2 text-sm font-medium ${activeTab === "openai"
+              ? "border-gray-800 dark:border-white text-gray-800 dark:text-white"
+              : "border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300"
+              }`}
           >
             OpenAI 兼容
             {customProviders.openai_compatibility.length > 0 && (
@@ -362,11 +373,10 @@ export function Settings() {
           </button>
           <button
             onClick={() => setActiveTab("claude")}
-            className={`py-2 px-1 border-b-2 text-sm font-medium ${
-              activeTab === "claude"
-                ? "border-gray-800 dark:border-white text-gray-800 dark:text-white"
-                : "border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300"
-            }`}
+            className={`py-2 px-1 border-b-2 text-sm font-medium ${activeTab === "claude"
+              ? "border-gray-800 dark:border-white text-gray-800 dark:text-white"
+              : "border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300"
+              }`}
           >
             Claude Code 兼容
             {customProviders.claude_code_compatibility.length > 0 && (
@@ -399,14 +409,12 @@ export function Settings() {
                       prev ? { ...prev, debug: !prev.debug } : prev
                     )
                   }
-                  className={`relative w-12 h-6 rounded-full transition-colors ${
-                    appConfig?.debug ? "bg-gray-800 dark:bg-gray-600" : "bg-gray-300 dark:bg-gray-600"
-                  }`}
+                  className={`relative w-12 h-6 rounded-full transition-colors ${appConfig?.debug ? "bg-gray-800 dark:bg-gray-600" : "bg-gray-300 dark:bg-gray-600"
+                    }`}
                 >
                   <span
-                    className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-transform ${
-                      appConfig?.debug ? "left-7" : "left-1"
-                    }`}
+                    className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-transform ${appConfig?.debug ? "left-7" : "left-1"
+                      }`}
                   />
                 </button>
               </div>
@@ -475,6 +483,112 @@ export function Settings() {
                 ))}
               </select>
             </div>
+
+            {/* Model Routing Mode */}
+            <div className="space-y-2">
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                模型路由模式
+              </label>
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                选择模型请求的路由方式
+              </p>
+              <div className="space-y-3">
+                <label className="flex items-start gap-3 p-3 border border-gray-300 dark:border-gray-600 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700">
+                  <input
+                    type="radio"
+                    name="routing_mode"
+                    value="provider"
+                    checked={settings.model_routing_mode === "provider"}
+                    onChange={(e) => setSettings({ ...settings, model_routing_mode: e.target.value })}
+                    className="mt-1"
+                  />
+                  <div>
+                    <div className="text-sm font-medium text-gray-800 dark:text-white">供应商模式</div>
+                    <div className="text-xs text-gray-500 dark:text-gray-400">
+                      需要指定供应商前缀，如 <code className="bg-gray-100 dark:bg-gray-600 px-1 rounded">kiro/claude-sonnet-4-5</code>
+                    </div>
+                  </div>
+                </label>
+                <label className="flex items-start gap-3 p-3 border border-gray-300 dark:border-gray-600 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700">
+                  <input
+                    type="radio"
+                    name="routing_mode"
+                    value="model"
+                    checked={settings.model_routing_mode === "model"}
+                    onChange={(e) => setSettings({ ...settings, model_routing_mode: e.target.value })}
+                    className="mt-1"
+                  />
+                  <div>
+                    <div className="text-sm font-medium text-gray-800 dark:text-white">模型聚合模式</div>
+                    <div className="text-xs text-gray-500 dark:text-gray-400">
+                      按模型名称自动选择有额度的供应商，如直接使用 <code className="bg-gray-100 dark:bg-gray-600 px-1 rounded">claude-sonnet-4-5</code>
+                    </div>
+                  </div>
+                </label>
+              </div>
+            </div>
+
+            {/* Provider Priorities */}
+            {settings.model_routing_mode === "model" && settings.provider_priorities.length > 0 && (
+              <div className="space-y-2">
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                  供应商优先级
+                </label>
+                <p className="text-xs text-gray-500 dark:text-gray-400">
+                  拖动调整优先级顺序，优先级高的供应商会先尝试（数字越大优先级越高）
+                </p>
+                <div className="space-y-2">
+                  {settings.provider_priorities
+                    .sort((a, b) => b.priority - a.priority)
+                    .map((provider) => (
+                      <div
+                        key={provider.provider}
+                        className="flex items-center gap-3 p-3 border border-gray-300 dark:border-gray-600 rounded-lg"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={provider.enabled}
+                          onChange={(e) => {
+                            const newPriorities = settings.provider_priorities.map(p =>
+                              p.provider === provider.provider ? { ...p, enabled: e.target.checked } : p
+                            );
+                            setSettings({ ...settings, provider_priorities: newPriorities });
+                          }}
+                          className="w-4 h-4"
+                        />
+                        <span className={`flex-1 text-sm ${provider.enabled ? 'text-gray-800 dark:text-white' : 'text-gray-400 dark:text-gray-500'}`}>
+                          {provider.provider.charAt(0).toUpperCase() + provider.provider.slice(1)}
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => {
+                              const newPriorities = settings.provider_priorities.map(p =>
+                                p.provider === provider.provider ? { ...p, priority: Math.min(p.priority + 10, 200) } : p
+                              );
+                              setSettings({ ...settings, provider_priorities: newPriorities });
+                            }}
+                            className="px-2 py-1 text-xs bg-gray-100 dark:bg-gray-700 rounded hover:bg-gray-200 dark:hover:bg-gray-600"
+                          >
+                            ↑
+                          </button>
+                          <span className="text-xs text-gray-500 w-8 text-center">{provider.priority}</span>
+                          <button
+                            onClick={() => {
+                              const newPriorities = settings.provider_priorities.map(p =>
+                                p.provider === provider.provider ? { ...p, priority: Math.max(p.priority - 10, 0) } : p
+                              );
+                              setSettings({ ...settings, provider_priorities: newPriorities });
+                            }}
+                            className="px-2 py-1 text-xs bg-gray-100 dark:bg-gray-700 rounded hover:bg-gray-200 dark:hover:bg-gray-600"
+                          >
+                            ↓
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            )}
           </>
         )}
 

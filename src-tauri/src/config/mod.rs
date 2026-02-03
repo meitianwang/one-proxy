@@ -66,6 +66,9 @@ pub struct AppConfig {
 
     #[serde(default = "default_quota_refresh_interval")]
     pub quota_refresh_interval: u32,
+
+    #[serde(default)]
+    pub model_routing: ModelRoutingConfig,
 }
 
 fn default_port() -> u16 {
@@ -132,6 +135,81 @@ pub struct RoutingConfig {
 
 fn default_strategy() -> String {
     "round-robin".to_string()
+}
+
+/// Model routing configuration for aggregation mode
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ModelRoutingConfig {
+    /// Routing mode: "provider" (default, require provider prefix) or "model" (aggregate by model name)
+    #[serde(default = "default_routing_mode")]
+    pub mode: String,
+
+    /// Provider priority order for model aggregation mode
+    /// Higher priority providers are tried first
+    #[serde(default = "default_provider_priorities")]
+    pub provider_priorities: Vec<ProviderPriority>,
+}
+
+impl Default for ModelRoutingConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_routing_mode(),
+            provider_priorities: default_provider_priorities(),
+        }
+    }
+}
+
+/// Provider priority configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ProviderPriority {
+    /// Provider name: "kiro", "antigravity", "gemini", "codex", "claude"
+    pub provider: String,
+    /// Priority weight (higher = tried first)
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    /// Whether this provider is enabled for aggregation
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_routing_mode() -> String {
+    "provider".to_string()
+}
+
+fn default_priority() -> u32 {
+    100
+}
+
+fn default_provider_priorities() -> Vec<ProviderPriority> {
+    vec![
+        ProviderPriority {
+            provider: "kiro".to_string(),
+            priority: 100,
+            enabled: true,
+        },
+        ProviderPriority {
+            provider: "antigravity".to_string(),
+            priority: 90,
+            enabled: true,
+        },
+        ProviderPriority {
+            provider: "gemini".to_string(),
+            priority: 80,
+            enabled: true,
+        },
+        ProviderPriority {
+            provider: "codex".to_string(),
+            priority: 70,
+            enabled: true,
+        },
+        ProviderPriority {
+            provider: "claude".to_string(),
+            priority: 60,
+            enabled: true,
+        },
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

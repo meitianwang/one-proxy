@@ -194,6 +194,15 @@ pub async fn get_cached_quotas() -> Result<HashMap<String, crate::db::CachedQuot
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettingsData {
     pub quota_refresh_interval: u32,
+    pub model_routing_mode: String,
+    pub provider_priorities: Vec<ProviderPriorityData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderPriorityData {
+    pub provider: String,
+    pub priority: u32,
+    pub enabled: bool,
 }
 
 #[tauri::command]
@@ -201,6 +210,14 @@ pub async fn get_settings() -> Result<SettingsData, String> {
     let config = config::get_config().ok_or_else(|| "Config not initialized".to_string())?;
     Ok(SettingsData {
         quota_refresh_interval: config.quota_refresh_interval,
+        model_routing_mode: config.model_routing.mode.clone(),
+        provider_priorities: config.model_routing.provider_priorities.iter().map(|p| {
+            ProviderPriorityData {
+                provider: p.provider.clone(),
+                priority: p.priority,
+                enabled: p.enabled,
+            }
+        }).collect(),
     })
 }
 
@@ -208,6 +225,14 @@ pub async fn get_settings() -> Result<SettingsData, String> {
 pub async fn save_settings(settings: SettingsData) -> Result<(), String> {
     let mut config = config::get_config().ok_or_else(|| "Config not initialized".to_string())?;
     config.quota_refresh_interval = settings.quota_refresh_interval;
+    config.model_routing.mode = settings.model_routing_mode;
+    config.model_routing.provider_priorities = settings.provider_priorities.iter().map(|p| {
+        config::ProviderPriority {
+            provider: p.provider.clone(),
+            priority: p.priority,
+            enabled: p.enabled,
+        }
+    }).collect();
     config::update_config(config).map_err(|e| e.to_string())
 }
 

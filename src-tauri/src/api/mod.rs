@@ -27,6 +27,7 @@ pub mod gemini;
 mod mime_types;
 pub mod management;
 pub mod streaming;
+pub mod model_router;
 
 static SERVER_HANDLE: OnceCell<RwLock<Option<oneshot::Sender<()>>>> = OnceCell::new();
 
