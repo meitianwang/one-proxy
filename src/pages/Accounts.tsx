@@ -117,6 +117,7 @@ export function Accounts() {
   const [apiKeyLabel, setApiKeyLabel] = useState("");
   const [apiKeySaving, setApiKeySaving] = useState(false);
   const [viewMode, setViewMode] = useState<"list" | "card">("card");
+  const [providerFilter, setProviderFilter] = useState<string>("all");
   const [quotaData, setQuotaData] = useState<Record<string, QuotaData>>({});
   const [quotaLoading, setQuotaLoading] = useState<Record<string, boolean>>({});
   const [codexQuotaData, setCodexQuotaData] = useState<Record<string, CodexQuotaData>>({});
@@ -641,7 +642,22 @@ export function Accounts() {
   }
 
   const apiKeyProviderInfo = apiKeyProvider ? getProviderInfo(apiKeyProvider) : null;
-  const filteredAccounts = accounts;
+
+  // Provider 筛选逻辑
+  const filteredAccounts = accounts.filter((account) => {
+    if (providerFilter === "all") return true;
+    const normalizedProvider = PROVIDER_ALIASES[account.provider] || account.provider;
+    return normalizedProvider === providerFilter;
+  });
+
+  // 计算各 provider 的账号数量
+  const providerCounts = PROVIDERS.reduce((acc, provider) => {
+    acc[provider.id] = accounts.filter((account) => {
+      const normalizedProvider = PROVIDER_ALIASES[account.provider] || account.provider;
+      return normalizedProvider === provider.id;
+    }).length;
+    return acc;
+  }, {} as Record<string, number>);
 
   const allSelected = filteredAccounts.length > 0 && filteredAccounts.every((a) => selectedIds.has(a.id));
 
@@ -785,6 +801,52 @@ export function Accounts() {
               />
               <span className="text-sm text-gray-600 dark:text-gray-400">全选</span>
             </label>
+
+            {/* Provider 筛选按钮组 */}
+            <div className="flex items-center gap-1 bg-gray-100 dark:bg-gray-700 p-1 rounded-lg">
+              <button
+                onClick={() => setProviderFilter("all")}
+                className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors flex items-center gap-2 ${
+                  providerFilter === "all"
+                    ? "bg-white dark:bg-gray-600 text-blue-600 dark:text-blue-400 shadow-sm"
+                    : "text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
+                }`}
+              >
+                全部
+                <span className={`px-1.5 py-0.5 text-xs rounded ${
+                  providerFilter === "all"
+                    ? "bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400"
+                    : "bg-gray-200 dark:bg-gray-600 text-gray-500 dark:text-gray-400"
+                }`}>
+                  {accounts.length}
+                </span>
+              </button>
+              {PROVIDERS.map((provider) => {
+                const count = providerCounts[provider.id] || 0;
+                if (count === 0) return null;
+                return (
+                  <button
+                    key={provider.id}
+                    onClick={() => setProviderFilter(provider.id)}
+                    className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors flex items-center gap-2 ${
+                      providerFilter === provider.id
+                        ? "bg-white dark:bg-gray-600 text-blue-600 dark:text-blue-400 shadow-sm"
+                        : "text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
+                    }`}
+                  >
+                    {provider.label}
+                    <span className={`px-1.5 py-0.5 text-xs rounded ${
+                      providerFilter === provider.id
+                        ? "bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400"
+                        : "bg-gray-200 dark:bg-gray-600 text-gray-500 dark:text-gray-400"
+                    }`}>
+                      {count}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
             {selectedIds.size > 0 && (
               <div className="flex items-center gap-2">
                 <button

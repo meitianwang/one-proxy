@@ -94,6 +94,48 @@ fn with_log_info<T: IntoResponse>(response: T, provider: &str, account_id: &str,
     resp
 }
 
+/// Helper function to create an error response with proper HTTP status code and logging info
+fn error_response(
+    status_code: u16,
+    message: &str,
+    error_type: &str,
+    provider: &str,
+    account_id: &str,
+    model: &str,
+) -> Response {
+    let http_status = match status_code {
+        400 => StatusCode::BAD_REQUEST,
+        401 => StatusCode::UNAUTHORIZED,
+        403 => StatusCode::FORBIDDEN,
+        404 => StatusCode::NOT_FOUND,
+        429 => StatusCode::TOO_MANY_REQUESTS,
+        500 => StatusCode::INTERNAL_SERVER_ERROR,
+        502 => StatusCode::BAD_GATEWAY,
+        503 => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    
+    let json_body = Json(json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "code": status_code
+        }
+    }));
+    
+    let mut resp = (http_status, json_body).into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(account_id) {
+        resp.headers_mut().insert(super::X_ONEPROXY_ACCOUNT_ID, value);
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(provider) {
+        resp.headers_mut().insert(super::X_ONEPROXY_PROVIDER, value);
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(model) {
+        resp.headers_mut().insert(super::X_ONEPROXY_MODEL, value);
+    }
+    resp
+}
+
 
 // Root endpoint
 pub async fn root() -> Json<Value> {
@@ -2812,14 +2854,14 @@ pub async fn chat_completions(
                         if should_rotate_antigravity_error(&msg) && idx + 1 < total {
                             continue;
                         }
-                        return Json(json!({
-                            "error": {
-                                "message": format!("Antigravity API error: {}", msg),
-                                "type": "api_error",
-                                "code": 500
-                            }
-                        }))
-                        .into_response();
+                        return error_response(
+                            500,
+                            &format!("Antigravity API error: {}", msg),
+                            "api_error",
+                            &provider,
+                            &account_id,
+                            &actual_model,
+                        );
                     }
                 }
             }
@@ -2834,14 +2876,14 @@ pub async fn chat_completions(
                         }
                         Err(e) => {
                             tracing::error!("Antigravity API error: {}", e);
-                            return Json(json!({
-                                "error": {
-                                    "message": format!("Antigravity API error: {}", e),
-                                    "type": "api_error",
-                                    "code": 500
-                                }
-                            }))
-                            .into_response();
+                            return error_response(
+                                500,
+                                &format!("Antigravity API error: {}", e),
+                                "api_error",
+                                &provider,
+                                &account_id,
+                                &actual_model,
+                            );
                         }
                     },
                     Err(e) => {
@@ -2851,14 +2893,14 @@ pub async fn chat_completions(
                         if should_rotate_antigravity_error(&msg) && idx + 1 < total {
                             continue;
                         }
-                        return Json(json!({
-                            "error": {
-                                "message": format!("Antigravity API error: {}", msg),
-                                "type": "api_error",
-                                "code": 500
-                            }
-                        }))
-                        .into_response();
+                        return error_response(
+                            500,
+                            &format!("Antigravity API error: {}", msg),
+                            "api_error",
+                            &provider,
+                            &account_id,
+                            &actual_model,
+                        );
                     }
                 }
             }
@@ -2876,14 +2918,14 @@ pub async fn chat_completions(
                     if should_rotate_antigravity_error(&msg) && idx + 1 < total {
                         continue;
                     }
-                    return Json(json!({
-                        "error": {
-                            "message": format!("Antigravity API error: {}", msg),
-                            "type": "api_error",
-                            "code": 500
-                        }
-                    }))
-                    .into_response();
+                    return error_response(
+                        500,
+                        &format!("Antigravity API error: {}", msg),
+                        "api_error",
+                        &provider,
+                        &account_id,
+                        &actual_model,
+                    );
                 }
             }
         }
@@ -4426,14 +4468,13 @@ pub async fn claude_messages(
                         if should_rotate_antigravity_error(&msg) && idx + 1 < total {
                             continue;
                         }
-                        return Json(json!({
+                        return with_log_info(Json(json!({
                             "error": {
                                 "message": format!("Antigravity API error: {}", msg),
                                 "type": "api_error",
                                 "code": 500
                             }
-                        }))
-                        .into_response();
+                        })), &provider, &account_id, &actual_model);
                     }
                 }
             }
@@ -4454,14 +4495,13 @@ pub async fn claude_messages(
                         }
                         Err(e) => {
                             tracing::error!("Antigravity API error: {}", e);
-                            return Json(json!({
+                            return with_log_info(Json(json!({
                                 "error": {
                                     "message": format!("Antigravity API error: {}", e),
                                     "type": "api_error",
                                     "code": 500
                                 }
-                            }))
-                            .into_response();
+                            })), &provider, &account_id, &actual_model);
                         }
                     },
                     Err(e) => {
@@ -4471,14 +4511,13 @@ pub async fn claude_messages(
                         if should_rotate_antigravity_error(&msg) && idx + 1 < total {
                             continue;
                         }
-                        return Json(json!({
+                        return with_log_info(Json(json!({
                             "error": {
                                 "message": format!("Antigravity API error: {}", msg),
                                 "type": "api_error",
                                 "code": 500
                             }
-                        }))
-                        .into_response();
+                        })), &provider, &account_id, &actual_model);
                     }
                 }
             }
@@ -4502,14 +4541,13 @@ pub async fn claude_messages(
                     if should_rotate_antigravity_error(&msg) && idx + 1 < total {
                         continue;
                     }
-                    return Json(json!({
+                    return with_log_info(Json(json!({
                         "error": {
                             "message": format!("Antigravity API error: {}", msg),
                             "type": "api_error",
                             "code": 500
                         }
-                    }))
-                    .into_response();
+                    })), &provider, &account_id, &actual_model);
                 }
             }
         }

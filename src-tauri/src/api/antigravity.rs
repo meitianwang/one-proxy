@@ -53,8 +53,7 @@ impl AntigravityClient {
             ANTIGRAVITY_GENERATE_PATH
         };
 
-        let mut last_status = None;
-        let mut last_body = None;
+        let mut last_error: Option<String> = None;
 
         for base in base_urls {
             let mut url = format!("{}{}", base.trim_end_matches('/'), path);
@@ -84,21 +83,33 @@ impl AntigravityClient {
                 req.header("Accept", "application/json")
             };
 
-            let response = req.send().await?;
+            // Handle both network errors and HTTP errors
+            let response = match req.send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    // Network error - log it and try next URL
+                    let err_msg = format!("Network error for {}: {}", url, e);
+                    tracing::warn!("{}", err_msg);
+                    last_error = Some(err_msg);
+                    continue;
+                }
+            };
+            
             if response.status().is_success() {
                 return Ok(response);
             }
 
-            last_status = Some(response.status());
-            last_body = Some(response.text().await.unwrap_or_default());
+            // HTTP error - log it and try next URL
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let err_msg = format!("HTTP {} from {}: {}", status, url, body);
+            tracing::warn!("{}", err_msg);
+            last_error = Some(err_msg);
         }
 
         Err(anyhow!(
-            "Antigravity request failed: {} {}",
-            last_status
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
-            last_body.unwrap_or_default()
+            "Antigravity request failed: {}",
+            last_error.unwrap_or_else(|| "unknown error".to_string())
         ))
     }
 }
