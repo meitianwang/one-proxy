@@ -46,22 +46,55 @@ fn protocol_from_path(path: &str) -> Option<String> {
         Some("openai".to_string())
     } else if path.starts_with("/v1/messages") {
         Some("anthropic".to_string())
-    } else if path.starts_with("/v1beta/models") {
+    } else if path.starts_with("/v1beta/models") || path.starts_with("/gemini/v1beta/models") {
         Some("gemini".to_string())
     } else {
         None
     }
 }
 
+
 /// Internal header name for passing account_id from handlers to logging middleware
 /// This header will be stripped before sending response to client
 pub const X_ONEPROXY_ACCOUNT_ID: &str = "x-oneproxy-account-id";
+
+/// Internal header name for passing provider from handlers to logging middleware
+/// This header will be stripped before sending response to client
+pub const X_ONEPROXY_PROVIDER: &str = "x-oneproxy-provider";
+
+/// Internal header name for passing actual model from handlers to logging middleware
+/// This header will be stripped before sending response to client
+pub const X_ONEPROXY_MODEL: &str = "x-oneproxy-model";
+
 
 /// Extract model name from request body JSON
 fn extract_model_from_body(body: &[u8]) -> Option<String> {
     let json: serde_json::Value = serde_json::from_slice(body).ok()?;
     json.get("model").and_then(|v| v.as_str()).map(|s| s.to_string())
 }
+
+/// Extract model name from Gemini URL path
+/// e.g., "/gemini/v1beta/models/gemini-3-flash-preview:generateContent" -> "gemini-3-flash-preview"
+fn extract_model_from_gemini_path(path: &str) -> Option<String> {
+    // Match patterns like /gemini/v1beta/models/{model}:action or /v1beta/models/{model}:action
+    let models_prefix = if path.contains("/gemini/v1beta/models/") {
+        "/gemini/v1beta/models/"
+    } else if path.contains("/v1beta/models/") {
+        "/v1beta/models/"
+    } else {
+        return None;
+    };
+    
+    let after_models = path.split(models_prefix).nth(1)?;
+    // Remove the action suffix like ":generateContent" or ":streamGenerateContent"
+    let model = after_models.split(':').next()?;
+    if model.is_empty() {
+        None
+    } else {
+        Some(model.to_string())
+    }
+}
+
 
 fn should_verbose_log() -> bool {
     if let Some(config) = crate::config::get_config() {
@@ -213,7 +246,9 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
             }
         };
 
-        let model = extract_model_from_body(&bytes);
+        let model = extract_model_from_body(&bytes)
+            .or_else(|| extract_model_from_gemini_path(&path));
+
         if verbose {
             log_request_body(&method, &path, &bytes);
         }
@@ -228,6 +263,23 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         response.headers_mut().remove(X_ONEPROXY_ACCOUNT_ID);
+        
+        // Extract and remove internal provider header
+        let provider = response.headers()
+            .get(X_ONEPROXY_PROVIDER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        response.headers_mut().remove(X_ONEPROXY_PROVIDER);
+        
+        // Extract and remove internal model header (prefer this over request body model)
+        let handler_model = response.headers()
+            .get(X_ONEPROXY_MODEL)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        response.headers_mut().remove(X_ONEPROXY_MODEL);
+        
+        // Use handler-provided model if available, otherwise fall back to request body
+        let final_model = handler_model.or(model);
         
         let response = log_response_if_needed(&method, &path, response, verbose).await;
 
@@ -244,8 +296,9 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
         let _ = crate::db::save_request_log(
             status,
             &method,
-            model.as_deref(),
+            final_model.as_deref(),
             protocol.as_deref(),
+            provider.as_deref(),
             account_id.as_deref(),
             &path,
             0,
@@ -269,6 +322,13 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
         .map(|s| s.to_string());
     response.headers_mut().remove(X_ONEPROXY_ACCOUNT_ID);
     
+    // Extract and remove internal provider header
+    let provider = response.headers()
+        .get(X_ONEPROXY_PROVIDER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    response.headers_mut().remove(X_ONEPROXY_PROVIDER);
+    
     let response = log_response_if_needed(&method, &path, response, verbose).await;
 
     let protocol = protocol_from_path(&path);
@@ -286,6 +346,7 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
         &method,
         None,
         protocol.as_deref(),
+        provider.as_deref(),
         account_id.as_deref(),
         &path,
         0,
@@ -296,6 +357,7 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
 
     response
 }
+
 
 
 

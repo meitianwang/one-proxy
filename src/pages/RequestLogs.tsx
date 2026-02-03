@@ -7,6 +7,7 @@ interface RequestLogEntry {
   method: string;
   model: string | null;
   protocol: string | null;
+  provider: string | null;
   account_id: string | null;
   path: string;
   input_tokens: number;
@@ -15,6 +16,7 @@ interface RequestLogEntry {
   timestamp: number;
   error_message: string | null;
 }
+
 
 interface LogFilter {
   errors_only: boolean;
@@ -134,12 +136,20 @@ export function RequestLogs() {
     }
   }
 
-  function getProviderFromModel(model: string | null): string {
+  function getProviderDisplay(provider: string | null, model: string | null): string {
+    // Use backend-provided provider if available
+    if (provider) {
+      // Capitalize first letter
+      return provider.charAt(0).toUpperCase() + provider.slice(1);
+    }
+
+    // Fallback: infer from model name if no provider from backend
     if (!model) return "-";
-    // Extract provider from model prefix (e.g., "antigravity/gemini-3-pro" -> "Antigravity")
+
+    // Check if model has explicit provider prefix (e.g., "antigravity/gemini-3-pro")
     if (model.includes("/")) {
-      const provider = model.split("/")[0].toLowerCase();
-      switch (provider) {
+      const prov = model.split("/")[0].toLowerCase();
+      switch (prov) {
         case "antigravity":
           return "Antigravity";
         case "codex":
@@ -158,10 +168,11 @@ export function RequestLogs() {
         case "zhipu":
           return "GLM";
         default:
-          return provider.charAt(0).toUpperCase() + provider.slice(1);
+          return prov.charAt(0).toUpperCase() + prov.slice(1);
       }
     }
-    // Infer from model name
+
+    // Fallback: infer from model name
     const modelLower = model.toLowerCase();
     if (modelLower.startsWith("gemini")) return "Antigravity";
     if (modelLower.startsWith("claude")) return "Kiro";
@@ -171,6 +182,8 @@ export function RequestLogs() {
     if (modelLower.includes("kimi")) return "Kimi";
     return "-";
   }
+
+
 
   if (loading) {
     return (
@@ -322,7 +335,7 @@ export function RequestLogs() {
                       {getProtocolLabel(log.protocol)}
                     </td>
                     <td className="px-4 py-3 whitespace-nowrap text-gray-600 dark:text-gray-300">
-                      {getProviderFromModel(log.model)}
+                      {getProviderDisplay(log.provider, log.model)}
                     </td>
                     <td className="px-4 py-3 whitespace-nowrap text-gray-600 dark:text-gray-300 min-w-40" title={log.account_id || undefined}>
                       {log.account_id ? (log.account_id.length > 24 ? log.account_id.slice(0, 24) + "..." : log.account_id) : "-"}

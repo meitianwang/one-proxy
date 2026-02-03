@@ -25,6 +25,7 @@ pub struct RequestLogEntry {
     pub method: String,
     pub model: Option<String>,
     pub protocol: Option<String>,
+    pub provider: Option<String>,
     pub account_id: Option<String>,
     pub path: String,
     pub input_tokens: i32,
@@ -69,6 +70,7 @@ pub fn init_db(app_data_dir: PathBuf) -> Result<()> {
             method TEXT NOT NULL,
             model TEXT,
             protocol TEXT,
+            provider TEXT,
             account_id TEXT,
             path TEXT NOT NULL,
             input_tokens INTEGER DEFAULT 0,
@@ -79,6 +81,9 @@ pub fn init_db(app_data_dir: PathBuf) -> Result<()> {
         )",
         [],
     )?;
+    
+    // Add provider column if it doesn't exist (migration for existing databases)
+    let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN provider TEXT", []);
 
     // Create index for faster queries
     conn.execute(
@@ -197,6 +202,7 @@ pub fn save_request_log(
     method: &str,
     model: Option<&str>,
     protocol: Option<&str>,
+    provider: Option<&str>,
     account_id: Option<&str>,
     path: &str,
     input_tokens: i32,
@@ -212,14 +218,15 @@ pub fn save_request_log(
     let now = chrono::Utc::now().timestamp_millis();
 
     conn.execute(
-        "INSERT INTO request_logs (status, method, model, protocol, account_id, path, input_tokens, output_tokens, duration_ms, timestamp, error_message)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        rusqlite::params![status, method, model, protocol, account_id, path, input_tokens, output_tokens, duration_ms, now, error_message],
+        "INSERT INTO request_logs (status, method, model, protocol, provider, account_id, path, input_tokens, output_tokens, duration_ms, timestamp, error_message)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        rusqlite::params![status, method, model, protocol, provider, account_id, path, input_tokens, output_tokens, duration_ms, now, error_message],
     )?;
 
     tracing::debug!("Saved request log: {} {} -> {}", method, path, status);
     Ok(())
 }
+
 
 /// Get request logs with optional filtering
 pub fn get_request_logs(limit: u32, offset: u32, filter: Option<LogFilter>) -> Result<Vec<RequestLogEntry>> {
@@ -231,7 +238,7 @@ pub fn get_request_logs(limit: u32, offset: u32, filter: Option<LogFilter>) -> R
     let filter = filter.unwrap_or_default();
 
     let mut sql = String::from(
-        "SELECT id, status, method, model, protocol, account_id, path, input_tokens, output_tokens, duration_ms, timestamp, error_message
+        "SELECT id, status, method, model, protocol, provider, account_id, path, input_tokens, output_tokens, duration_ms, timestamp, error_message
          FROM request_logs WHERE 1=1"
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -272,13 +279,14 @@ pub fn get_request_logs(limit: u32, offset: u32, filter: Option<LogFilter>) -> R
             method: row.get(2)?,
             model: row.get(3)?,
             protocol: row.get(4)?,
-            account_id: row.get(5)?,
-            path: row.get(6)?,
-            input_tokens: row.get(7)?,
-            output_tokens: row.get(8)?,
-            duration_ms: row.get(9)?,
-            timestamp: row.get(10)?,
-            error_message: row.get(11)?,
+            provider: row.get(5)?,
+            account_id: row.get(6)?,
+            path: row.get(7)?,
+            input_tokens: row.get(8)?,
+            output_tokens: row.get(9)?,
+            duration_ms: row.get(10)?,
+            timestamp: row.get(11)?,
+            error_message: row.get(12)?,
         })
     })?;
 
@@ -289,6 +297,7 @@ pub fn get_request_logs(limit: u32, offset: u32, filter: Option<LogFilter>) -> R
 
     Ok(result)
 }
+
 
 /// Get count of request logs with optional filtering
 pub fn get_request_logs_count(filter: Option<LogFilter>) -> Result<i64> {

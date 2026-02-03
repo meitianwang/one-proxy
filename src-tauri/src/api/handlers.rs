@@ -31,6 +31,7 @@ struct GeminiAuth {
     access_token: String,
     project_id: Option<String>,
     account_id: String,
+    provider: String,
 }
 
 #[derive(Debug, Clone)]
@@ -38,18 +39,21 @@ struct AntigravityAuth {
     access_token: String,
     project_id: Option<String>,
     account_id: String,
+    provider: String,
 }
 
 #[derive(Debug, Clone)]
 struct ClaudeAuth {
     access_token: String,
     account_id: String,
+    provider: String,
 }
 
 #[derive(Debug, Clone)]
 struct CodexAuth {
     access_token: String,
     account_id: String,
+    provider: String,
 }
 
 #[derive(Debug, Clone)]
@@ -68,14 +72,29 @@ struct GlmAuth {
 struct KiroAuthWithAccount {
     auth: kiro::KiroAuth,
     account_id: String,
+    provider: String,
 }
 
 const KIMI_ANTHROPIC_BASE: &str = "https://api.kimi.com/coding/v1";
 
 const GLM_ANTHROPIC_BASE: &str = "https://open.bigmodel.cn/api/anthropic/v1";
 
+/// Helper function to add account_id, provider, and model headers to a response for logging
+fn with_log_info<T: IntoResponse>(response: T, provider: &str, account_id: &str, model: &str) -> Response {
+    let mut resp = response.into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(account_id) {
+        resp.headers_mut().insert(super::X_ONEPROXY_ACCOUNT_ID, value);
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(provider) {
+        resp.headers_mut().insert(super::X_ONEPROXY_PROVIDER, value);
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(model) {
+        resp.headers_mut().insert(super::X_ONEPROXY_MODEL, value);
+    }
+    resp
+}
 
-/// Helper function to add account_id header to a response for logging
+/// Helper function to add account_id header to a response for logging (legacy, use with_log_info instead)
 fn with_account_id<T: IntoResponse>(response: T, account_id: &str) -> Response {
     let mut resp = response.into_response();
     if let Ok(value) = axum::http::HeaderValue::from_str(account_id) {
@@ -1606,6 +1625,7 @@ struct AuthCandidate {
     id: String,
     path: PathBuf,
     priority: i32,
+    provider: String,
 }
 
 static AUTH_SELECTOR: Lazy<Mutex<HashMap<String, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -1668,6 +1688,7 @@ fn candidate_from_path(
         id,
         path: path.to_path_buf(),
         priority,
+        provider: json_provider,
     })
 }
 
@@ -1869,6 +1890,7 @@ async fn get_gemini_auth(model: &str) -> Option<GeminiAuth> {
                 access_token: snapshot.access_token,
                 project_id,
                 account_id: candidate.id.clone(),
+                provider: candidate.provider.clone(),
             });
         }
 
@@ -1925,6 +1947,7 @@ async fn get_gemini_auth(model: &str) -> Option<GeminiAuth> {
                 access_token: new_tokens.access_token,
                 project_id,
                 account_id: candidate.id.clone(),
+                provider: candidate.provider.clone(),
             });
         }
     }
@@ -2029,6 +2052,7 @@ async fn get_codex_auth(model: &str) -> Option<CodexAuth> {
             return Some(CodexAuth {
                 access_token: snapshot.access_token,
                 account_id: candidate.id.clone(),
+                provider: candidate.provider.clone(),
             });
         }
 
@@ -2089,6 +2113,7 @@ async fn get_codex_auth(model: &str) -> Option<CodexAuth> {
             return Some(CodexAuth {
                 access_token: new_tokens.access_token,
                 account_id: candidate.id.clone(),
+                provider: candidate.provider.clone(),
             });
         }
     }
@@ -2202,11 +2227,22 @@ async fn load_antigravity_auth_from_candidate(candidate: &AuthCandidate) -> Opti
             access_token: snapshot.access_token,
             project_id,
             account_id: candidate.id.clone(),
+            provider: candidate.provider.clone(),
         });
     }
 
     let refresh_token = snapshot.refresh_token?;
-    let new_tokens = antigravity_oauth::refresh_token(&refresh_token).await.ok()?;
+    let new_tokens = match antigravity_oauth::refresh_token(&refresh_token).await {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to refresh Antigravity token for {}: {}",
+                candidate.id,
+                e
+            );
+            return None;
+        }
+    };
     let new_expiry = new_tokens.expires_in.map(|secs| {
         (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
     });
@@ -2268,6 +2304,7 @@ async fn load_antigravity_auth_from_candidate(candidate: &AuthCandidate) -> Opti
         access_token: new_tokens.access_token,
         project_id,
         account_id: candidate.id.clone(),
+        provider: candidate.provider.clone(),
     })
 }
 
@@ -2319,7 +2356,11 @@ async fn get_kiro_auth(model: &str) -> Option<KiroAuthWithAccount> {
 
         if !is_expired(snapshot.expires_at) && !snapshot.access_token.trim().is_empty() {
             if let Ok(auth) = kiro::snapshot_to_auth(snapshot) {
-                return Some(KiroAuthWithAccount { auth, account_id });
+                return Some(KiroAuthWithAccount { 
+                    auth, 
+                    account_id,
+                    provider: candidate.provider.clone(),
+                });
             }
             continue;
         }
@@ -2330,7 +2371,11 @@ async fn get_kiro_auth(model: &str) -> Option<KiroAuthWithAccount> {
 
         if let Ok(updated) = kiro::refresh_kiro_auth(&candidate.path, &snapshot).await {
             if let Ok(auth) = kiro::snapshot_to_auth(updated) {
-                return Some(KiroAuthWithAccount { auth, account_id });
+                return Some(KiroAuthWithAccount { 
+                    auth, 
+                    account_id,
+                    provider: candidate.provider.clone(),
+                });
             }
         }
     }
@@ -2755,6 +2800,7 @@ pub async fn chat_completions(
                 access_token,
                 project_id,
                 account_id,
+                provider,
             } = auth;
             let client = AntigravityClient::new(access_token);
             let antigravity_request =
@@ -2764,7 +2810,7 @@ pub async fn chat_completions(
                 match client.stream_generate_content(&antigravity_request, None).await {
                     Ok(response) => {
                         let stream = antigravity::antigravity_stream_to_openai_events(response);
-                        return with_account_id(Sse::new(stream), &account_id);
+                        return with_log_info(Sse::new(stream), &provider, &account_id, &actual_model);
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -2791,7 +2837,7 @@ pub async fn chat_completions(
                         Ok(payload) => {
                             let openai_response =
                                 gemini::gemini_to_openai_response(&payload, &actual_model, &request_id);
-                            return with_account_id(Json(openai_response), &account_id);
+                            return with_log_info(Json(openai_response), &provider, &account_id, &actual_model);
                         }
                         Err(e) => {
                             tracing::error!("Antigravity API error: {}", e);
@@ -3559,6 +3605,7 @@ pub async fn completions(
                 access_token,
                 project_id,
                 account_id,
+                provider,
             } = auth;
             let client = AntigravityClient::new(access_token);
             let antigravity_request =
@@ -3581,7 +3628,7 @@ pub async fn completions(
                             }
                             yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
                         };
-                        return with_account_id(Sse::new(stream), &account_id);
+                        return with_log_info(Sse::new(stream), &provider, &account_id, &actual_model);
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -3609,7 +3656,7 @@ pub async fn completions(
                             let openai_response =
                                 gemini::gemini_to_openai_response(&payload, &actual_model, &request_id);
                             let completions_response = convert_chat_response_to_completions(&openai_response);
-                            return with_account_id(Json(completions_response), &account_id);
+                            return with_log_info(Json(completions_response), &provider, &account_id, &actual_model);
                         }
                         Err(e) => {
                             tracing::error!("Antigravity API error: {}", e);
@@ -3647,7 +3694,7 @@ pub async fn completions(
                     let openai_response =
                         gemini::gemini_to_openai_response(&response, &actual_model, &request_id);
                     let completions_response = convert_chat_response_to_completions(&openai_response);
-                    return with_account_id(Json(completions_response), &account_id);
+                    return with_log_info(Json(completions_response), &provider, &account_id, &actual_model);
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -4359,6 +4406,7 @@ pub async fn claude_messages(
                 access_token,
                 project_id,
                 account_id,
+                provider,
             } = auth;
             let client = AntigravityClient::new(access_token);
             let antigravity_request =
@@ -4373,7 +4421,7 @@ pub async fn claude_messages(
                             &actual_model,
                             reasoning_as_text,
                         );
-                        return with_account_id(Sse::new(stream), &account_id);
+                        return with_log_info(Sse::new(stream), &provider, &account_id, &actual_model);
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -4406,7 +4454,7 @@ pub async fn claude_messages(
                                 &request_id,
                                 reasoning_as_text,
                             );
-                            return with_account_id(Json(claude_response), &account_id);
+                            return with_log_info(Json(claude_response), &provider, &account_id, &actual_model);
                         }
                         Err(e) => {
                             tracing::error!("Antigravity API error: {}", e);
@@ -4449,7 +4497,7 @@ pub async fn claude_messages(
                         &request_id,
                         reasoning_as_text,
                     );
-                    return with_account_id(Json(claude_response), &account_id);
+                    return with_log_info(Json(claude_response), &provider, &account_id, &actual_model);
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -4868,6 +4916,9 @@ pub async fn gemini_handler(
                         }
                     };
                     
+                    let account_id = auth.account_id.clone();
+                    let auth_provider = auth.provider.clone();
+                    
                     // First convert Gemini format to OpenAI format
                     let openai_payload = json!({
                         "model": final_model,
@@ -4888,7 +4939,7 @@ pub async fn gemini_handler(
                         match client.stream_generate_content(&antigravity_request, None).await {
                             Ok(response) => {
                                 let stream = antigravity::antigravity_stream_to_openai_events(response);
-                                return Sse::new(stream).into_response();
+                                return with_log_info(Sse::new(stream), &auth_provider, &account_id, &final_model);
                             }
                             Err(e) => {
                                 return Json(json!({
@@ -4907,7 +4958,7 @@ pub async fn gemini_handler(
                                 match antigravity::collect_antigravity_stream(response).await {
                                     Ok(payload) => {
                                         // Convert back to Gemini format for response
-                                        return Json(payload).into_response();
+                                        return with_log_info(Json(payload), &auth_provider, &account_id, &final_model);
                                     }
                                     Err(e) => {
                                         return Json(json!({
@@ -4934,6 +4985,7 @@ pub async fn gemini_handler(
                         }
                     }
                 }
+
                 "kiro" | "claude" => {
                     // Route to Claude/Kiro via Anthropic format
                     let claude_payload = json!({
@@ -4982,6 +5034,9 @@ pub async fn gemini_handler(
         }
     };
 
+    let account_id = auth.account_id.clone();
+    let provider = auth.provider.clone();
+    
     let mut payload = json!({
         "model": final_model,
         "request": request
@@ -4993,7 +5048,7 @@ pub async fn gemini_handler(
     let client = GeminiClient::new(auth.access_token);
     match method {
         "generateContent" => match client.generate_content(&payload).await {
-            Ok(response) => Json(response).into_response(),
+            Ok(response) => with_log_info(Json(response), &provider, &account_id, &final_model),
             Err(e) => Json(json!({
                 "error": {
                     "message": format!("Gemini API error: {}", e),
@@ -5021,6 +5076,16 @@ pub async fn gemini_handler(
                         header::CONTENT_TYPE,
                         HeaderValue::from_static(content_type),
                     );
+                    // Add logging headers
+                    if let Ok(header_value) = HeaderValue::from_str(&account_id) {
+                        resp.headers_mut().insert(super::X_ONEPROXY_ACCOUNT_ID, header_value);
+                    }
+                    if let Ok(header_value) = HeaderValue::from_str(&provider) {
+                        resp.headers_mut().insert(super::X_ONEPROXY_PROVIDER, header_value);
+                    }
+                    if let Ok(header_value) = HeaderValue::from_str(&final_model) {
+                        resp.headers_mut().insert(super::X_ONEPROXY_MODEL, header_value);
+                    }
                     resp.into_response()
                 }
                 Err(e) => Json(json!({
@@ -5039,7 +5104,7 @@ pub async fn gemini_handler(
                 obj.remove("model");
             }
             match client.count_tokens(&payload).await {
-                Ok(response) => Json(response).into_response(),
+                Ok(response) => with_log_info(Json(response), &provider, &account_id, &final_model),
                 Err(e) => Json(json!({
                     "error": {
                         "message": format!("Gemini API error: {}", e),
@@ -5058,8 +5123,10 @@ pub async fn gemini_handler(
             }
         }))
         .into_response(),
+
     }
 }
+
 
 // OAuth callback handlers
 const OAUTH_SUCCESS_HTML: &str = r#"
