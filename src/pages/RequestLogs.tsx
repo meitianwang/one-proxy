@@ -175,6 +175,8 @@ export function RequestLogs() {
     // Fallback: infer from model name
     const modelLower = model.toLowerCase();
     if (modelLower.startsWith("gemini")) return "Antigravity";
+    // Claude thinking models are only supported by Antigravity
+    if (modelLower.includes("claude") && modelLower.includes("-thinking")) return "Antigravity";
     if (modelLower.startsWith("claude")) return "Kiro";
     if (modelLower.startsWith("gpt")) return "Codex";
     if (modelLower.includes("deepseek")) return "DeepSeek";

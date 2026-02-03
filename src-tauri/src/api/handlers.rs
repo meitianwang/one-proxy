@@ -94,15 +94,6 @@ fn with_log_info<T: IntoResponse>(response: T, provider: &str, account_id: &str,
     resp
 }
 
-/// Helper function to add account_id header to a response for logging (legacy, use with_log_info instead)
-fn with_account_id<T: IntoResponse>(response: T, account_id: &str) -> Response {
-    let mut resp = response.into_response();
-    if let Ok(value) = axum::http::HeaderValue::from_str(account_id) {
-        resp.headers_mut().insert(super::X_ONEPROXY_ACCOUNT_ID, value);
-    }
-    resp
-}
-
 
 // Root endpoint
 pub async fn root() -> Json<Value> {
@@ -635,6 +626,7 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
     
     let auth = &kiro_auth.auth;
     let account_id = &kiro_auth.account_id;
+    let provider = &kiro_auth.provider;
     
     // Build Kiro payload from OpenAI-style messages
     let resolution = kiro::resolve_model(model);
@@ -689,7 +681,7 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
             }
         });
         let stream = stream.map(|payload| Ok::<Event, Infallible>(Event::default().data(payload)));
-        return with_account_id(Sse::new(stream), account_id);
+        return with_log_info(Sse::new(stream), provider, account_id, model);
     } else {
         let messages_for_stream = payload.get("messages").cloned();
         match kiro::collect_stream_response(
@@ -698,7 +690,7 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
             messages_for_stream,
             None, // request_tools
         ).await {
-            Ok(json_response) => with_account_id(Json(json_response), account_id),
+            Ok(json_response) => with_log_info(Json(json_response), provider, account_id, model),
             Err(e) => Json(json!({
                 "error": {
                     "message": format!("Kiro API error: {}", e),
@@ -749,7 +741,7 @@ async fn handle_codex_openai_request(payload: Value, is_stream: bool, model: &st
     };
     
     let resp = forward_openai_compatible(payload, "https://api.openai.com/v1", &auth.access_token, is_stream, "Codex").await;
-    with_account_id(resp, &auth.account_id)
+    with_log_info(resp, &auth.provider, &auth.account_id, model)
 }
 
 
@@ -2633,6 +2625,7 @@ pub async fn chat_completions(
         };
 
         let account_id = auth.account_id.clone();
+        let provider = auth.provider.clone();
         let client = GeminiClient::new(auth.access_token);
 
         let mut gemini_request = gemini::openai_to_gemini_cli_request(&raw, &model);
@@ -2644,7 +2637,7 @@ pub async fn chat_completions(
             match client.stream_generate_content(&gemini_request).await {
                 Ok(response) => {
                     let stream = gemini::gemini_cli_stream_to_openai_events(response);
-                    return with_account_id(Sse::new(stream), &account_id);
+                    return with_log_info(Sse::new(stream), &provider, &account_id, &model);
                 }
                 Err(e) => {
                     tracing::error!("Gemini API error: {}", e);
@@ -2664,7 +2657,7 @@ pub async fn chat_completions(
             Ok(response) => {
                 let openai_response =
                     gemini::gemini_to_openai_response(&response, &model, &request_id);
-                return with_account_id(Json(openai_response), &account_id);
+                return with_log_info(Json(openai_response), &provider, &account_id, &model);
             }
             Err(e) => {
                 tracing::error!("Gemini API error: {}", e);
@@ -2712,7 +2705,7 @@ pub async fn chat_completions(
             match client.stream_responses(&codex_request, true).await {
                 Ok(response) => {
                     let stream = codex::codex_stream_to_openai_events(response, raw.clone());
-                    return with_account_id(Sse::new(stream), &auth.account_id);
+                    return with_log_info(Sse::new(stream), &auth.provider, &auth.account_id, &actual_model);
                 }
                 Err(e) => {
                     tracing::error!("Codex API error: {}", e);
@@ -2730,7 +2723,7 @@ pub async fn chat_completions(
 
         match client.stream_responses(&codex_request, true).await {
             Ok(response) => match codex::collect_non_stream_response(response, &raw).await {
-                Ok(openai_response) => return with_account_id(Json(openai_response), &auth.account_id),
+                Ok(openai_response) => return with_log_info(Json(openai_response), &auth.provider, &auth.account_id, &actual_model),
                 Err(e) => {
                     tracing::error!("Codex API error: {}", e);
                     return Json(json!({
@@ -2874,7 +2867,7 @@ pub async fn chat_completions(
                 Ok(response) => {
                     let openai_response =
                         gemini::gemini_to_openai_response(&response, &actual_model, &request_id);
-                    return with_account_id(Json(openai_response), &account_id);
+                    return with_log_info(Json(openai_response), &provider, &account_id, &actual_model);
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -2924,6 +2917,7 @@ pub async fn chat_completions(
 
         let auth = &kiro_auth.auth;
         let account_id = &kiro_auth.account_id;
+        let provider = &kiro_auth.provider;
 
         if kiro::ensure_model_cache(auth).await.is_err() {
             return Json(json!({
@@ -2992,7 +2986,7 @@ pub async fn chat_completions(
             });
             let stream =
                 stream.map(|payload| Ok::<Event, Infallible>(Event::default().data(payload)));
-            return with_account_id(Sse::new(stream), account_id);
+            return with_log_info(Sse::new(stream), provider, account_id, &model);
         }
 
         match kiro::collect_stream_response(
@@ -3003,7 +2997,7 @@ pub async fn chat_completions(
         )
         .await
         {
-            Ok(openai_response) => return with_account_id(Json(openai_response), account_id),
+            Ok(openai_response) => return with_log_info(Json(openai_response), provider, account_id, &model),
             Err(e) => {
                 return Json(json!({
                     "error": {
@@ -3514,7 +3508,7 @@ pub async fn completions(
                         }
                         yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
                     };
-                    return with_account_id(Sse::new(stream), &auth.account_id);
+                    return with_log_info(Sse::new(stream), &auth.provider, &auth.account_id, &actual_model);
                 }
                 Err(e) => {
                     tracing::error!("Codex API error: {}", e);
@@ -3534,7 +3528,7 @@ pub async fn completions(
             Ok(response) => match codex::collect_non_stream_response(response, &chat_request).await {
                 Ok(openai_response) => {
                     let completions_response = convert_chat_response_to_completions(&openai_response);
-                    return with_account_id(Json(completions_response), &auth.account_id);
+                    return with_log_info(Json(completions_response), &auth.provider, &auth.account_id, &actual_model);
                 }
                 Err(e) => {
                     tracing::error!("Codex API error: {}", e);
@@ -3744,6 +3738,7 @@ pub async fn completions(
 
         let auth = &kiro_auth.auth;
         let account_id = &kiro_auth.account_id;
+        let provider = &kiro_auth.provider;
 
         if kiro::ensure_model_cache(auth).await.is_err() {
             return Json(json!({
@@ -3813,7 +3808,7 @@ pub async fn completions(
             let stream = stream.chain(futures::stream::once(async {
                 Ok(Event::default().data("[DONE]"))
             }));
-            return with_account_id(Sse::new(stream), account_id);
+            return with_log_info(Sse::new(stream), provider, account_id, &model);
         }
 
         match kiro::collect_stream_response(
@@ -3826,7 +3821,7 @@ pub async fn completions(
         {
             Ok(openai_response) => {
                 let completions_response = convert_chat_response_to_completions(&openai_response);
-                return with_account_id(Json(completions_response), account_id);
+                return with_log_info(Json(completions_response), provider, account_id, &model);
             }
             Err(e) => {
                 return Json(json!({
@@ -4195,7 +4190,7 @@ pub async fn claude_messages(
                 Ok(response) => {
                     let upstream = codex::codex_stream_to_openai_chunks(response, modified_openai_raw.clone());
                     let stream = openai_chunks_to_claude_events(upstream, &actual_model);
-                    return with_account_id(Sse::new(stream), &auth.account_id);
+                    return with_log_info(Sse::new(stream), &auth.provider, &auth.account_id, &actual_model);
                 }
                 Err(e) => {
                     tracing::error!("Codex API error: {}", e);
@@ -4216,7 +4211,7 @@ pub async fn claude_messages(
                 Ok(openai_response) => {
                     let claude_response =
                         claude::openai_to_claude_response(&openai_response, &actual_model, &request_id);
-                    return with_account_id(Json(claude_response), &auth.account_id);
+                    return with_log_info(Json(claude_response), &auth.provider, &auth.account_id, &actual_model);
                 }
                 Err(e) => {
                     tracing::error!("Codex API error: {}", e);
@@ -4262,6 +4257,7 @@ pub async fn claude_messages(
 
         let auth = &kiro_auth.auth;
         let account_id = &kiro_auth.account_id;
+        let provider = &kiro_auth.provider;
 
         if kiro::ensure_model_cache(auth).await.is_err() {
             return Json(json!({
@@ -4329,7 +4325,7 @@ pub async fn claude_messages(
                 }
             });
             let stream = openai_chunks_to_claude_events(stream, &model);
-            return with_account_id(Sse::new(stream), account_id);
+            return with_log_info(Sse::new(stream), provider, account_id, &model);
         }
 
         match kiro::collect_stream_response(
@@ -4343,7 +4339,7 @@ pub async fn claude_messages(
             Ok(openai_response) => {
                 let claude_response =
                     claude::openai_to_claude_response(&openai_response, &model, &request_id);
-                return with_account_id(Json(claude_response), account_id);
+                return with_log_info(Json(claude_response), provider, account_id, &model);
             }
             Err(e) => {
                 return Json(json!({

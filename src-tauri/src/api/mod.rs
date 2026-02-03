@@ -73,6 +73,30 @@ fn extract_model_from_body(body: &[u8]) -> Option<String> {
     json.get("model").and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
+/// Normalize model name by removing provider prefix (e.g., "antigravity/claude-3.5" -> "claude-3.5")
+/// This ensures consistent model names in logs regardless of how the request was made
+fn normalize_model_name(model: &str) -> String {
+    // Known provider prefixes that should be stripped
+    const PREFIXES: &[&str] = &[
+        "antigravity/",
+        "gemini/",
+        "claude/",
+        "codex/",
+        "kiro/",
+        "kimi/",
+        "glm/",
+        "deepseek/",
+    ];
+    
+    let lower = model.to_lowercase();
+    for prefix in PREFIXES {
+        if lower.starts_with(prefix) {
+            return model[prefix.len()..].to_string();
+        }
+    }
+    model.to_string()
+}
+
 /// Extract model name from Gemini URL path
 /// e.g., "/gemini/v1beta/models/gemini-3-flash-preview:generateContent" -> "gemini-3-flash-preview"
 fn extract_model_from_gemini_path(path: &str) -> Option<String> {
@@ -280,6 +304,8 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
         
         // Use handler-provided model if available, otherwise fall back to request body
         let final_model = handler_model.or(model);
+        // Normalize model name (remove provider prefix) for consistent logging
+        let normalized_model = final_model.map(|m| normalize_model_name(&m));
         
         let response = log_response_if_needed(&method, &path, response, verbose).await;
 
@@ -296,7 +322,7 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
         let _ = crate::db::save_request_log(
             status,
             &method,
-            final_model.as_deref(),
+            normalized_model.as_deref(),
             protocol.as_deref(),
             provider.as_deref(),
             account_id.as_deref(),

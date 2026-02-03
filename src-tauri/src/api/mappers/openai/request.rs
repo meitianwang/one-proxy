@@ -172,8 +172,12 @@ pub fn transform_openai_request(
             let mut parts = Vec::new();
 
             // Handle reasoning_content (thinking)
+            // [FIX] Only include reasoning_content when:
+            // 1. actual_include_thinking is true, OR
+            // 2. We have a global signature to attach
+            // This prevents 400 errors when Claude requires signature but we don't have one
             if let Some(reasoning) = &msg.reasoning_content {
-                if !reasoning.is_empty() {
+                if !reasoning.is_empty() && (actual_include_thinking || global_thought_sig.is_some()) {
                     let mut thought_part = json!({
                         "text": reasoning,
                         "thought": true,
@@ -182,6 +186,12 @@ pub fn transform_openai_request(
                         thought_part["thoughtSignature"] = json!(sig);
                     }
                     parts.push(thought_part);
+                } else if !reasoning.is_empty() {
+                    // When thinking is disabled and no signature, log and skip the reasoning content
+                    tracing::debug!(
+                        "[OpenAI-Thinking] Skipping reasoning_content without signature (length: {})",
+                        reasoning.len()
+                    );
                 }
             } else if actual_include_thinking && role == "model" {
                 // [FIX] 解决 Claude 3.7 Thinking 模型的强制性校验:
