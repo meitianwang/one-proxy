@@ -175,9 +175,27 @@ pub fn transform_openai_request(
             // [FIX] Only include reasoning_content when:
             // 1. actual_include_thinking is true, OR
             // 2. We have a global signature to attach
-            // This prevents 400 errors when Claude requires signature but we don't have one
+            // [FIX #2] For Claude thinking models, signature is REQUIRED and if missing/invalid,
+            // we must skip the thinking content entirely to avoid 400 "Invalid signature" errors
             if let Some(reasoning) = &msg.reasoning_content {
-                if !reasoning.is_empty() && (actual_include_thinking || global_thought_sig.is_some()) {
+                let should_include = if is_claude_thinking {
+                    // Claude requires a VALID signature for each thinking block
+                    // Skip if no global signature available (prevents Invalid signature errors)
+                    if global_thought_sig.is_some() {
+                        true
+                    } else {
+                        tracing::warn!(
+                            "[OpenAI-Thinking] Skipping Claude thinking content without valid signature (length: {})",
+                            reasoning.len()
+                        );
+                        false
+                    }
+                } else {
+                    // For other thinking models (Gemini), we can include without signature
+                    !reasoning.is_empty() && (actual_include_thinking || global_thought_sig.is_some())
+                };
+
+                if should_include && !reasoning.is_empty() {
                     let mut thought_part = json!({
                         "text": reasoning,
                         "thought": true,
@@ -186,7 +204,7 @@ pub fn transform_openai_request(
                         thought_part["thoughtSignature"] = json!(sig);
                     }
                     parts.push(thought_part);
-                } else if !reasoning.is_empty() {
+                } else if !reasoning.is_empty() && !is_claude_thinking {
                     // When thinking is disabled and no signature, log and skip the reasoning content
                     tracing::debug!(
                         "[OpenAI-Thinking] Skipping reasoning_content without signature (length: {})",
