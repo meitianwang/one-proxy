@@ -460,42 +460,7 @@ fn get_gemini_models() -> Vec<ModelInfo> {
 /// Get static Codex/OpenAI model definitions
 fn get_codex_models() -> Vec<ModelInfo> {
     vec![
-        ModelInfo {
-            id: "gpt-5".to_string(),
-            object: "model".to_string(),
-            created: 1754524800,
-            owned_by: "openai".to_string(),
-        },
-        ModelInfo {
-            id: "gpt-5-codex".to_string(),
-            object: "model".to_string(),
-            created: 1757894400,
-            owned_by: "openai".to_string(),
-        },
-        ModelInfo {
-            id: "gpt-5-codex-mini".to_string(),
-            object: "model".to_string(),
-            created: 1762473600,
-            owned_by: "openai".to_string(),
-        },
-        ModelInfo {
-            id: "gpt-5.1".to_string(),
-            object: "model".to_string(),
-            created: 1762905600,
-            owned_by: "openai".to_string(),
-        },
-        ModelInfo {
-            id: "gpt-5.1-codex".to_string(),
-            object: "model".to_string(),
-            created: 1762905600,
-            owned_by: "openai".to_string(),
-        },
-        ModelInfo {
-            id: "gpt-5.1-codex-mini".to_string(),
-            object: "model".to_string(),
-            created: 1762905600,
-            owned_by: "openai".to_string(),
-        },
+        // GPT-5.2 系列
         ModelInfo {
             id: "gpt-5.2".to_string(),
             object: "model".to_string(),
@@ -510,6 +475,7 @@ fn get_codex_models() -> Vec<ModelInfo> {
         },
     ]
 }
+
 
 fn parse_provider_prefix(model: &str) -> (Option<String>, String) {
     let trimmed = model.trim();
