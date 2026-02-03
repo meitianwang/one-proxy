@@ -1664,6 +1664,171 @@ struct AuthCandidate {
 
 static AUTH_SELECTOR: Lazy<Mutex<HashMap<String, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Tracks exhausted accounts per provider: key = provider, value = set of exhausted account IDs
+/// Accounts are marked exhausted when they hit quota/rate limit errors.
+/// Accounts are cleared from this set when:
+/// 1. A successful request is made with that account
+/// 2. All accounts for a provider are exhausted (triggers reset)
+/// 3. Quota check shows the account has available quota again
+static EXHAUSTED_ACCOUNTS: Lazy<Mutex<HashMap<String, std::collections::HashSet<String>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Mark an account as exhausted (quota depleted or persistent error)
+pub fn mark_account_exhausted(provider: &str, account_id: &str) {
+    let provider_key = provider.trim().to_lowercase();
+    let mut exhausted = EXHAUSTED_ACCOUNTS.lock().unwrap();
+    let set = exhausted.entry(provider_key.clone()).or_default();
+    if set.insert(account_id.to_string()) {
+        tracing::warn!(
+            "Account marked as exhausted: {}:{} (will retry when quota recovers or all exhausted)",
+            provider_key,
+            account_id
+        );
+    }
+}
+
+/// Check if an account is currently marked as exhausted
+fn is_account_exhausted(provider: &str, account_id: &str) -> bool {
+    let provider_key = provider.trim().to_lowercase();
+    let exhausted = EXHAUSTED_ACCOUNTS.lock().unwrap();
+    exhausted
+        .get(&provider_key)
+        .map(|set| set.contains(account_id))
+        .unwrap_or(false)
+}
+
+/// Clear exhausted status for an account (e.g., after successful request or quota recovery)
+fn clear_account_exhausted(provider: &str, account_id: &str) {
+    let provider_key = provider.trim().to_lowercase();
+    let mut exhausted = EXHAUSTED_ACCOUNTS.lock().unwrap();
+    if let Some(set) = exhausted.get_mut(&provider_key) {
+        if set.remove(account_id) {
+            tracing::info!(
+                "Account exhausted status cleared: {}:{}",
+                provider_key,
+                account_id
+            );
+        }
+    }
+}
+
+/// Clear all exhausted accounts for a provider (called when all accounts are exhausted and we need to retry)
+fn reset_provider_exhausted(provider: &str) {
+    let provider_key = provider.trim().to_lowercase();
+    let mut exhausted = EXHAUSTED_ACCOUNTS.lock().unwrap();
+    if let Some(set) = exhausted.get_mut(&provider_key) {
+        if !set.is_empty() {
+            tracing::info!(
+                "Resetting all exhausted accounts for {} ({} accounts)",
+                provider_key,
+                set.len()
+            );
+            set.clear();
+        }
+    }
+}
+
+/// Check if a provider has any non-exhausted accounts
+fn provider_has_available_accounts(provider: &str, account_ids: &[String]) -> bool {
+    let provider_key = provider.trim().to_lowercase();
+    let exhausted = EXHAUSTED_ACCOUNTS.lock().unwrap();
+
+    let set = match exhausted.get(&provider_key) {
+        Some(s) => s,
+        None => return !account_ids.is_empty(), // No exhausted records, all available
+    };
+
+    // Check if any account is not in the exhausted set
+    for account_id in account_ids {
+        if !set.contains(account_id) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Get account IDs for a provider (used for cross-provider availability checking)
+fn get_provider_account_ids(provider: &str) -> Vec<String> {
+    let auth_dir = crate::config::resolve_auth_dir();
+    if !auth_dir.exists() {
+        return Vec::new();
+    }
+
+    let mut files = Vec::new();
+    collect_json_files(&auth_dir, &mut files);
+
+    let mut account_ids = Vec::new();
+    for path in files {
+        if let Some(candidate) = candidate_from_path(provider, &auth_dir, &path) {
+            account_ids.push(candidate.id);
+        }
+    }
+    account_ids.sort();
+    account_ids
+}
+
+/// Select the best provider in aggregation mode.
+/// 
+/// This function checks providers in priority order and returns the first one that has
+/// available (non-exhausted) accounts. It always checks higher-priority providers first
+/// to ensure that if they have available accounts, they are used instead of lower-priority ones.
+/// 
+/// Returns: (selected_provider, remaining_fallbacks)
+pub fn select_best_provider_for_aggregation(
+    primary_provider: &str,
+    fallback_providers: &[String],
+) -> (String, Vec<String>) {
+    let all_providers: Vec<String> = std::iter::once(primary_provider.to_string())
+        .chain(fallback_providers.iter().cloned())
+        .collect();
+
+    // Check each provider in order
+    for (idx, provider) in all_providers.iter().enumerate() {
+        let account_ids = get_provider_account_ids(provider);
+        if account_ids.is_empty() {
+            continue;
+        }
+
+        // Check if this provider has any available (non-exhausted or recovered) accounts
+        if provider_has_available_accounts(provider, &account_ids) {
+            // This provider has available accounts
+            // But first, check if any higher-priority provider has recovered
+            for higher_provider in &all_providers[..idx] {
+                let higher_account_ids = get_provider_account_ids(higher_provider);
+                if higher_account_ids.is_empty() {
+                    continue;
+                }
+                if provider_has_available_accounts(higher_provider, &higher_account_ids) {
+                    tracing::info!(
+                        "[Aggregation] Higher priority provider '{}' has recovered, using it instead of '{}'",
+                        higher_provider,
+                        provider
+                    );
+                    let remaining: Vec<String> = all_providers
+                        .iter()
+                        .filter(|p| *p != higher_provider)
+                        .cloned()
+                        .collect();
+                    return (higher_provider.clone(), remaining);
+                }
+            }
+            
+            // No higher priority provider has recovered, use this one
+            let remaining: Vec<String> = all_providers[idx + 1..].to_vec();
+            return (provider.clone(), remaining);
+        }
+    }
+
+    // All providers exhausted, reset the primary and return it
+    tracing::warn!(
+        "[Aggregation] All providers exhausted, resetting primary provider '{}'",
+        primary_provider
+    );
+    reset_provider_exhausted(primary_provider);
+    let remaining = fallback_providers.to_vec();
+    (primary_provider.to_string(), remaining)
+}
+
 fn collect_json_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -1759,25 +1924,65 @@ fn select_auth_candidates(provider: &str, model: &str) -> Vec<AuthCandidate> {
 
     let strategy = crate::config::get_config()
         .map(|c| c.routing.strategy)
-        .unwrap_or_else(|| "round-robin".to_string());
+        .unwrap_or_else(|| "stick-until-exhausted".to_string());
     let strategy = strategy.trim().to_lowercase();
-    let use_round_robin = strategy.is_empty()
-        || matches!(strategy.as_str(), "round-robin" | "roundrobin" | "rr");
-    if !use_round_robin {
-        return available;
+
+    match strategy.as_str() {
+        "round-robin" | "roundrobin" | "rr" => {
+            // Round-robin: rotate through accounts on each request
+            let key = format!("{}:{}", provider.trim().to_lowercase(), model.trim());
+            let start = {
+                let mut cursor = AUTH_SELECTOR.lock().unwrap();
+                let entry = cursor.entry(key).or_insert(0);
+                let idx = *entry % available.len();
+                *entry = entry.wrapping_add(1);
+                idx
+            };
+            available.rotate_left(start);
+            available
+        }
+        "stick-until-exhausted" | "sticky" | "exhaust" | _ => {
+            // Stick-until-exhausted: use accounts in order, only move to next when current is exhausted.
+            // When all accounts are exhausted, reset and start over.
+            let provider_lower = provider.trim().to_lowercase();
+            let total = available.len();
+
+            // Count how many accounts are exhausted
+            let exhausted_count = available
+                .iter()
+                .filter(|c| is_account_exhausted(&provider_lower, &c.id))
+                .count();
+
+            // If all accounts are exhausted, reset the exhausted list and start fresh
+            if exhausted_count >= total {
+                tracing::warn!(
+                    "All {} accounts for {} are exhausted, resetting to retry from beginning",
+                    total,
+                    provider_lower
+                );
+                reset_provider_exhausted(&provider_lower);
+                // After reset, all accounts are available again, return in original order
+                return available;
+            }
+
+            // Find the first non-exhausted account (in sorted order)
+            // This ensures we stick to the same account until it's exhausted
+            let mut result = Vec::with_capacity(total);
+            let mut exhausted_accounts = Vec::new();
+
+            for candidate in available {
+                if is_account_exhausted(&provider_lower, &candidate.id) {
+                    exhausted_accounts.push(candidate);
+                } else {
+                    result.push(candidate);
+                }
+            }
+
+            // Put exhausted accounts at the end as fallback
+            result.extend(exhausted_accounts);
+            result
+        }
     }
-
-    let key = format!("{}:{}", provider.trim().to_lowercase(), model.trim());
-    let start = {
-        let mut cursor = AUTH_SELECTOR.lock().unwrap();
-        let entry = cursor.entry(key).or_insert(0);
-        let idx = *entry % available.len();
-        *entry = entry.wrapping_add(1);
-        idx
-    };
-
-    available.rotate_left(start);
-    available
 }
 
 #[derive(Clone, Copy)]
@@ -2228,6 +2433,19 @@ fn should_rotate_antigravity_error(message: &str) -> bool {
     }
 }
 
+/// Check if an error indicates the account is exhausted and should be marked
+fn should_mark_account_exhausted(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    // Quota exhausted errors
+    lower.contains("quota_exhausted")
+        || lower.contains("resource_exhausted")
+        || lower.contains("rate_limit_exceeded")
+        || lower.contains("quota exceeded")
+        || lower.contains("rate limit")
+        // 429 Too Many Requests typically means quota/rate limit
+        || parse_antigravity_status(message) == Some(429)
+}
+
 /// Get a valid Antigravity access token from stored credentials
 async fn get_antigravity_auth(model: &str) -> Option<AntigravityAuth> {
     get_antigravity_auths(model).await.into_iter().next()
@@ -2613,14 +2831,27 @@ pub async fn chat_completions(
     let (resolved_provider, resolved_model, fallback_providers) = if provider_override.is_some() {
         (provider_override, model, Vec::new())
     } else {
-        use super::model_router::{resolve_model, ResolvedModel};
+        use super::model_router::{resolve_model, ResolvedModel, get_provider_model_name};
         match resolve_model(&raw_model, None) {
             ResolvedModel::Explicit { provider, model } => {
                 (Some(provider), model, Vec::new())
             }
             ResolvedModel::Aggregated { provider, model, fallbacks } => {
-                tracing::info!("[ModelAggregation] Resolved {} to provider '{}' with fallbacks: {:?}", raw_model, provider, fallbacks);
-                (Some(provider), model, fallbacks)
+                // Use smart provider selection that checks for recovered high-priority providers
+                let (selected_provider, remaining_fallbacks) = 
+                    select_best_provider_for_aggregation(&provider, &fallbacks);
+                
+                // Convert model name to the selected provider's format
+                let actual_model = get_provider_model_name(&raw_model, &selected_provider);
+                
+                tracing::info!(
+                    "[ModelAggregation] Selected provider '{}' for model '{}' (original: '{}', fallbacks: {:?})",
+                    selected_provider,
+                    actual_model,
+                    raw_model,
+                    remaining_fallbacks
+                );
+                (Some(selected_provider), actual_model, remaining_fallbacks)
             }
             ResolvedModel::NoProvider { model } => {
                 return Json(json!({
@@ -2637,7 +2868,7 @@ pub async fn chat_completions(
 
     let provider_override = resolved_provider;
     let model = resolved_model;
-    // Note: fallback_providers can be used for automatic retry on quota exhaustion in future enhancement
+    let _fallback_providers = fallback_providers; // Available for future per-request fallback
 
     if provider_override.is_none() {
         return Json(json!({
@@ -2844,6 +3075,7 @@ pub async fn chat_completions(
             if is_stream {
                 match client.stream_generate_content(&antigravity_request, None).await {
                     Ok(response) => {
+                        clear_account_exhausted(&provider, &account_id);
                         let stream = antigravity::antigravity_stream_to_openai_events(response);
                         return with_log_info(Sse::new(stream), &provider, &account_id, &actual_model);
                     }
@@ -2852,6 +3084,9 @@ pub async fn chat_completions(
                         tracing::error!("Antigravity API error: {}", msg);
                         last_error = Some(msg.clone());
                         if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                            if should_mark_account_exhausted(&msg) {
+                                mark_account_exhausted(&provider, &account_id);
+                            }
                             continue;
                         }
                         return error_response(
@@ -2870,6 +3105,7 @@ pub async fn chat_completions(
                 match client.stream_generate_content(&antigravity_request, None).await {
                     Ok(response) => match antigravity::collect_antigravity_stream(response).await {
                         Ok(payload) => {
+                            clear_account_exhausted(&provider, &account_id);
                             let openai_response =
                                 gemini::gemini_to_openai_response(&payload, &actual_model, &request_id);
                             return with_log_info(Json(openai_response), &provider, &account_id, &actual_model);
@@ -2891,6 +3127,9 @@ pub async fn chat_completions(
                         tracing::error!("Antigravity API error: {}", msg);
                         last_error = Some(msg.clone());
                         if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                            if should_mark_account_exhausted(&msg) {
+                                mark_account_exhausted(&provider, &account_id);
+                            }
                             continue;
                         }
                         return error_response(
@@ -2907,6 +3146,7 @@ pub async fn chat_completions(
 
             match client.generate_content(&antigravity_request, None).await {
                 Ok(response) => {
+                    clear_account_exhausted(&provider, &account_id);
                     let openai_response =
                         gemini::gemini_to_openai_response(&response, &actual_model, &request_id);
                     return with_log_info(Json(openai_response), &provider, &account_id, &actual_model);
@@ -2916,6 +3156,9 @@ pub async fn chat_completions(
                     tracing::error!("Antigravity API error: {}", msg);
                     last_error = Some(msg.clone());
                     if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(&provider, &account_id);
+                        }
                         continue;
                     }
                     return error_response(
@@ -3395,14 +3638,26 @@ pub async fn completions(
     let (resolved_provider, resolved_model, _fallback_providers) = if provider_override.is_some() {
         (provider_override, model, Vec::new())
     } else {
-        use super::model_router::{resolve_model, ResolvedModel};
+        use super::model_router::{resolve_model, ResolvedModel, get_provider_model_name};
         match resolve_model(&raw_model, None) {
             ResolvedModel::Explicit { provider, model } => {
                 (Some(provider), model, Vec::new())
             }
-            ResolvedModel::Aggregated { provider, model, fallbacks } => {
-                tracing::info!("[ModelAggregation] Resolved {} to provider '{}' with fallbacks: {:?}", raw_model, provider, fallbacks);
-                (Some(provider), model, fallbacks)
+            ResolvedModel::Aggregated { provider, model: _, fallbacks } => {
+                // Use smart provider selection that checks for recovered high-priority providers
+                let (selected_provider, remaining_fallbacks) = 
+                    select_best_provider_for_aggregation(&provider, &fallbacks);
+                
+                // Convert model name to the selected provider's format
+                let actual_model = get_provider_model_name(&raw_model, &selected_provider);
+                
+                tracing::info!(
+                    "[ModelAggregation/completions] Selected provider '{}' for model '{}' (fallbacks: {:?})",
+                    selected_provider,
+                    actual_model,
+                    remaining_fallbacks
+                );
+                (Some(selected_provider), actual_model, remaining_fallbacks)
             }
             ResolvedModel::NoProvider { model } => {
                 return Json(json!({
@@ -3650,6 +3905,7 @@ pub async fn completions(
             if is_stream {
                 match client.stream_generate_content(&antigravity_request, None).await {
                     Ok(response) => {
+                        clear_account_exhausted(&provider, &account_id);
                         let upstream = antigravity::antigravity_stream_to_openai_chunks(response);
                         let stream = async_stream::stream! {
                             futures::pin_mut!(upstream);
@@ -3671,6 +3927,9 @@ pub async fn completions(
                         tracing::error!("Antigravity API error: {}", msg);
                         last_error = Some(msg.clone());
                         if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                            if should_mark_account_exhausted(&msg) {
+                                mark_account_exhausted(&provider, &account_id);
+                            }
                             continue;
                         }
                         return Json(json!({
@@ -3689,6 +3948,7 @@ pub async fn completions(
                 match client.stream_generate_content(&antigravity_request, None).await {
                     Ok(response) => match antigravity::collect_antigravity_stream(response).await {
                         Ok(payload) => {
+                            clear_account_exhausted(&provider, &account_id);
                             let openai_response =
                                 gemini::gemini_to_openai_response(&payload, &actual_model, &request_id);
                             let completions_response = convert_chat_response_to_completions(&openai_response);
@@ -3711,6 +3971,9 @@ pub async fn completions(
                         tracing::error!("Antigravity API error: {}", msg);
                         last_error = Some(msg.clone());
                         if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                            if should_mark_account_exhausted(&msg) {
+                                mark_account_exhausted(&provider, &account_id);
+                            }
                             continue;
                         }
                         return Json(json!({
@@ -3727,6 +3990,7 @@ pub async fn completions(
 
             match client.generate_content(&antigravity_request, None).await {
                 Ok(response) => {
+                    clear_account_exhausted(&provider, &account_id);
                     let openai_response =
                         gemini::gemini_to_openai_response(&response, &actual_model, &request_id);
                     let completions_response = convert_chat_response_to_completions(&openai_response);
@@ -3737,6 +4001,9 @@ pub async fn completions(
                     tracing::error!("Antigravity API error: {}", msg);
                     last_error = Some(msg.clone());
                     if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(&provider, &account_id);
+                        }
                         continue;
                     }
                     return Json(json!({
@@ -4029,14 +4296,26 @@ pub async fn claude_messages(
     let (resolved_provider, resolved_model, _fallback_providers) = if provider_override.is_some() {
         (provider_override, model, Vec::new())
     } else {
-        use super::model_router::{resolve_model, ResolvedModel};
+        use super::model_router::{resolve_model, ResolvedModel, get_provider_model_name};
         match resolve_model(&raw_model, None) {
             ResolvedModel::Explicit { provider, model } => {
                 (Some(provider), model, Vec::new())
             }
-            ResolvedModel::Aggregated { provider, model, fallbacks } => {
-                tracing::info!("[ModelAggregation] Resolved {} to provider '{}' with fallbacks: {:?}", raw_model, provider, fallbacks);
-                (Some(provider), model, fallbacks)
+            ResolvedModel::Aggregated { provider, model: _, fallbacks } => {
+                // Use smart provider selection that checks for recovered high-priority providers
+                let (selected_provider, remaining_fallbacks) = 
+                    select_best_provider_for_aggregation(&provider, &fallbacks);
+                
+                // Convert model name to the selected provider's format
+                let actual_model = get_provider_model_name(&raw_model, &selected_provider);
+                
+                tracing::info!(
+                    "[ModelAggregation/claude_messages] Selected provider '{}' for model '{}' (fallbacks: {:?})",
+                    selected_provider,
+                    actual_model,
+                    remaining_fallbacks
+                );
+                (Some(selected_provider), actual_model, remaining_fallbacks)
             }
             ResolvedModel::NoProvider { model } => {
                 return Json(json!({
@@ -4453,6 +4732,7 @@ pub async fn claude_messages(
             if is_stream {
                 match client.stream_generate_content(&antigravity_request, None).await {
                     Ok(response) => {
+                        clear_account_exhausted(&provider, &account_id);
                         let upstream = antigravity::antigravity_stream_to_openai_chunks(response);
                         let stream = openai_chunks_to_claude_events_with_options(
                             upstream,
@@ -4466,6 +4746,9 @@ pub async fn claude_messages(
                         tracing::error!("Antigravity API error: {}", msg);
                         last_error = Some(msg.clone());
                         if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                            if should_mark_account_exhausted(&msg) {
+                                mark_account_exhausted(&provider, &account_id);
+                            }
                             continue;
                         }
                         return with_log_info(Json(json!({
@@ -4483,6 +4766,7 @@ pub async fn claude_messages(
                 match client.stream_generate_content(&antigravity_request, None).await {
                     Ok(response) => match antigravity::collect_antigravity_stream(response).await {
                         Ok(payload) => {
+                            clear_account_exhausted(&provider, &account_id);
                             let openai_response =
                                 gemini::gemini_to_openai_response(&payload, &actual_model, &request_id);
                             let claude_response = claude::openai_to_claude_response_with_options(
@@ -4509,6 +4793,9 @@ pub async fn claude_messages(
                         tracing::error!("Antigravity API error: {}", msg);
                         last_error = Some(msg.clone());
                         if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                            if should_mark_account_exhausted(&msg) {
+                                mark_account_exhausted(&provider, &account_id);
+                            }
                             continue;
                         }
                         return with_log_info(Json(json!({
@@ -4524,6 +4811,7 @@ pub async fn claude_messages(
 
             match client.generate_content(&antigravity_request, None).await {
                 Ok(response) => {
+                    clear_account_exhausted(&provider, &account_id);
                     let openai_response =
                         gemini::gemini_to_openai_response(&response, &actual_model, &request_id);
                     let claude_response = claude::openai_to_claude_response_with_options(
@@ -4539,6 +4827,9 @@ pub async fn claude_messages(
                     tracing::error!("Antigravity API error: {}", msg);
                     last_error = Some(msg.clone());
                     if should_rotate_antigravity_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(&provider, &account_id);
+                        }
                         continue;
                     }
                     return with_log_info(Json(json!({

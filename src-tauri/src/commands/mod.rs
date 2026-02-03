@@ -196,6 +196,8 @@ pub struct SettingsData {
     pub quota_refresh_interval: u32,
     pub model_routing_mode: String,
     pub provider_priorities: Vec<ProviderPriorityData>,
+    /// Account selection strategy: "round-robin" | "stick-until-exhausted"
+    pub account_routing_strategy: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +220,7 @@ pub async fn get_settings() -> Result<SettingsData, String> {
                 enabled: p.enabled,
             }
         }).collect(),
+        account_routing_strategy: config.routing.strategy.clone(),
     })
 }
 
@@ -233,6 +236,7 @@ pub async fn save_settings(settings: SettingsData) -> Result<(), String> {
             enabled: p.enabled,
         }
     }).collect();
+    config.routing.strategy = settings.account_routing_strategy;
     config::update_config(config).map_err(|e| e.to_string())
 }
 

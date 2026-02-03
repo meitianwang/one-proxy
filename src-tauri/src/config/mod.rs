@@ -129,12 +129,13 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct RoutingConfig {
+    /// Account selection strategy: "round-robin" | "stick-until-exhausted"
     #[serde(default = "default_strategy")]
     pub strategy: String,
 }
 
 fn default_strategy() -> String {
-    "round-robin".to_string()
+    "stick-until-exhausted".to_string()
 }
 
 /// Model routing configuration for aggregation mode

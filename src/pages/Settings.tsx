@@ -12,6 +12,7 @@ interface SettingsData {
   quota_refresh_interval: number;
   model_routing_mode: string;
   provider_priorities: ProviderPriorityData[];
+  account_routing_strategy: string;
 }
 
 interface AppConfig {
@@ -63,6 +64,7 @@ export function Settings() {
     quota_refresh_interval: 5,
     model_routing_mode: "provider",
     provider_priorities: [],
+    account_routing_strategy: "stick-until-exhausted",
   });
   const [appConfig, setAppConfig] = useState<AppConfig | null>(null);
   const [customProviders, setCustomProviders] = useState<CustomProvidersData>({
@@ -482,6 +484,50 @@ export function Settings() {
                   </option>
                 ))}
               </select>
+            </div>
+
+            {/* Account Routing Strategy */}
+            <div className="space-y-2">
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                账号轮换策略
+              </label>
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                选择同一供应商有多个账号时的使用策略
+              </p>
+              <div className="space-y-3">
+                <label className="flex items-start gap-3 p-3 border border-gray-300 dark:border-gray-600 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700">
+                  <input
+                    type="radio"
+                    name="account_routing"
+                    value="stick-until-exhausted"
+                    checked={settings.account_routing_strategy === "stick-until-exhausted"}
+                    onChange={(e) => setSettings({ ...settings, account_routing_strategy: e.target.value })}
+                    className="mt-1"
+                  />
+                  <div>
+                    <div className="text-sm font-medium text-gray-800 dark:text-white">用完再换</div>
+                    <div className="text-xs text-gray-500 dark:text-gray-400">
+                      优先使用第一个账号，直到额度耗尽或出错后自动切换到下一个账号（推荐）
+                    </div>
+                  </div>
+                </label>
+                <label className="flex items-start gap-3 p-3 border border-gray-300 dark:border-gray-600 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700">
+                  <input
+                    type="radio"
+                    name="account_routing"
+                    value="round-robin"
+                    checked={settings.account_routing_strategy === "round-robin"}
+                    onChange={(e) => setSettings({ ...settings, account_routing_strategy: e.target.value })}
+                    className="mt-1"
+                  />
+                  <div>
+                    <div className="text-sm font-medium text-gray-800 dark:text-white">轮询模式</div>
+                    <div className="text-xs text-gray-500 dark:text-gray-400">
+                      每次请求轮换一个账号，均匀分配请求到所有账号
+                    </div>
+                  </div>
+                </label>
+              </div>
             </div>
 
             {/* Model Routing Mode */}
