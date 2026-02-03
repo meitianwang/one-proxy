@@ -33,6 +33,7 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
   const [selectedModel, setSelectedModel] = useState("gemini-2.5-flash");
   const [models, setModels] = useState<{ id: string; name: string; desc: string }[]>([]);
   const [copied, setCopied] = useState(false);
+  const [serverLoading, setServerLoading] = useState<'starting' | 'stopping' | null>(null);
 
   // Claude Code config state
   const [claudeConfig, setClaudeConfig] = useState<ClaudeCodeConfig>({
@@ -81,6 +82,11 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
       fetchModels();
     }
   }, [serverStatus.running, config]);
+
+  // Auto-reset loading state when server status changes
+  useEffect(() => {
+    setServerLoading(null);
+  }, [serverStatus.running]);
 
   async function fetchModels() {
     try {
@@ -158,24 +164,29 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
   }
 
   async function handleStartServer() {
+    setServerLoading('starting');
     try {
       await invoke("start_server");
       onStatusChange();
     } catch (error) {
       console.error("Failed to start server:", error);
       alert(`启动服务器失败: ${error}`);
+      setServerLoading(null);
     }
   }
 
   async function handleStopServer() {
+    setServerLoading('stopping');
     try {
       await invoke("stop_server");
       onStatusChange();
     } catch (error) {
       console.error("Failed to stop server:", error);
       alert(`停止服务器失败: ${error}`);
+      setServerLoading(null);
     }
   }
+
 
   async function handleGenerateApiKey() {
     if (!config) return;
@@ -235,15 +246,27 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
           </div>
           <button
             onClick={serverStatus.running ? handleStopServer : handleStartServer}
+            disabled={serverLoading !== null}
             className={`px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-colors ${serverStatus.running
               ? "bg-red-500 hover:bg-red-600 text-white"
               : "bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600 text-white"
-              }`}
+              } ${serverLoading ? "opacity-70 cursor-not-allowed" : ""}`}
           >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5.636 18.364a9 9 0 010-12.728m12.728 0a9 9 0 010 12.728m-9.9-2.829a5 5 0 010-7.07m7.072 0a5 5 0 010 7.07M13 12a1 1 0 11-2 0 1 1 0 012 0z" />
-            </svg>
-            {serverStatus.running ? "停止服务" : "启动服务"}
+            {serverLoading ? (
+              <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+            ) : (
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5.636 18.364a9 9 0 010-12.728m12.728 0a9 9 0 010 12.728m-9.9-2.829a5 5 0 010-7.07m7.072 0a5 5 0 010 7.07M13 12a1 1 0 11-2 0 1 1 0 012 0z" />
+              </svg>
+            )}
+            {serverLoading === 'starting'
+              ? "启动中..."
+              : serverLoading === 'stopping'
+                ? "停止中..."
+                : (serverStatus.running ? "停止服务" : "启动服务")}
           </button>
         </div>
 
