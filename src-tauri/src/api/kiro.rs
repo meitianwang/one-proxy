@@ -72,8 +72,10 @@ static HIDDEN_FROM_LIST: Lazy<HashSet<String>> = Lazy::new(|| {
     let mut set = HashSet::new();
     set.insert("auto".to_string());
     set.insert("auto-kiro".to_string());
+    set.insert("claude-3.7-sonnet".to_string());
     set
 });
+
 
 static FALLBACK_MODELS: Lazy<Vec<Value>> = Lazy::new(|| {
     vec![

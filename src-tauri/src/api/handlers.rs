@@ -1486,12 +1486,6 @@ fn get_claude_models() -> Vec<ModelInfo> {
             owned_by: "anthropic".to_string(),
         },
         ModelInfo {
-            id: "claude-3-7-sonnet-20250219".to_string(),
-            object: "model".to_string(),
-            created: 1708300800,
-            owned_by: "anthropic".to_string(),
-        },
-        ModelInfo {
             id: "claude-3-5-haiku-20241022".to_string(),
             object: "model".to_string(),
             created: 1729555200,
@@ -1499,6 +1493,7 @@ fn get_claude_models() -> Vec<ModelInfo> {
         },
     ]
 }
+
 
 /// Get static Kimi model definitions
 fn get_kimi_models() -> Vec<ModelInfo> {

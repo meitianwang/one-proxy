@@ -134,6 +134,44 @@ export function RequestLogs() {
     }
   }
 
+  function getProviderFromModel(model: string | null): string {
+    if (!model) return "-";
+    // Extract provider from model prefix (e.g., "antigravity/gemini-3-pro" -> "Antigravity")
+    if (model.includes("/")) {
+      const provider = model.split("/")[0].toLowerCase();
+      switch (provider) {
+        case "antigravity":
+          return "Antigravity";
+        case "codex":
+          return "Codex";
+        case "kiro":
+          return "Kiro";
+        case "gemini":
+          return "Gemini";
+        case "claude":
+          return "Claude";
+        case "deepseek":
+          return "DeepSeek";
+        case "kimi":
+          return "Kimi";
+        case "glm":
+        case "zhipu":
+          return "GLM";
+        default:
+          return provider.charAt(0).toUpperCase() + provider.slice(1);
+      }
+    }
+    // Infer from model name
+    const modelLower = model.toLowerCase();
+    if (modelLower.startsWith("gemini")) return "Antigravity";
+    if (modelLower.startsWith("claude")) return "Kiro";
+    if (modelLower.startsWith("gpt")) return "Codex";
+    if (modelLower.includes("deepseek")) return "DeepSeek";
+    if (modelLower.includes("glm")) return "GLM";
+    if (modelLower.includes("kimi")) return "Kimi";
+    return "-";
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -169,8 +207,8 @@ export function RequestLogs() {
             key={tab.id}
             onClick={() => setSelectedTab(tab.id)}
             className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${selectedTab === tab.id
-                ? "bg-gray-800 dark:bg-gray-700 text-white"
-                : "bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600"
+              ? "bg-gray-800 dark:bg-gray-700 text-white"
+              : "bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600"
               }`}
           >
             {tab.label}
@@ -184,8 +222,8 @@ export function RequestLogs() {
         <button
           onClick={() => setPaused(!paused)}
           className={`px-3 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors ${paused
-              ? "bg-green-600 hover:bg-green-700 text-white"
-              : "bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600 text-white"
+            ? "bg-green-600 hover:bg-green-700 text-white"
+            : "bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600 text-white"
             }`}
         >
           {paused ? (
@@ -249,7 +287,7 @@ export function RequestLogs() {
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">方法</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">模型</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">协议</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Token</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">供应商</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">耗时</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">时间</th>
               </tr>
@@ -282,9 +320,7 @@ export function RequestLogs() {
                       {getProtocolLabel(log.protocol)}
                     </td>
                     <td className="px-4 py-3 whitespace-nowrap text-gray-600 dark:text-gray-300">
-                      {log.input_tokens > 0 || log.output_tokens > 0
-                        ? `${log.input_tokens}/${log.output_tokens}`
-                        : "-"}
+                      {getProviderFromModel(log.model)}
                     </td>
                     <td className="px-4 py-3 whitespace-nowrap text-gray-600 dark:text-gray-300">
                       {formatDuration(log.duration_ms)}
