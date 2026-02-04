@@ -1071,6 +1071,19 @@ pub async fn ensure_model_cache(auth: &KiroAuth) -> Result<()> {
         }
     }
 
+    // Ensure claude-opus-4.5 is always available (Enterprise accounts can use it)
+    if !cache.models.contains_key("claude-opus-4.5") {
+        cache.models.insert(
+            "claude-opus-4.5".to_string(),
+            json!({
+                "modelId": "claude-opus-4.5",
+                "modelName": "Claude Opus 4.5",
+                "description": "Claude Opus 4.5 - Premium model for Enterprise accounts",
+                "tokenLimits": {"maxInputTokens": DEFAULT_MAX_INPUT_TOKENS}
+            }),
+        );
+    }
+
     Ok(())
 }
 

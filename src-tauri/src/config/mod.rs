@@ -76,7 +76,7 @@ fn default_port() -> u16 {
 }
 
 fn default_auth_dir() -> String {
-    "~/.cli-proxy-api".to_string()
+    "~/.oneproxy".to_string()
 }
 
 fn default_request_retry() -> u32 {
