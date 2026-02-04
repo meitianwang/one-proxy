@@ -97,6 +97,27 @@ const PROVIDER_ALIASES: Record<string, string> = {
   "codex": "openai",
 };
 
+// Subscription tier options for each provider
+const PROVIDER_TIERS: Record<string, { id: string; label: string }[]> = {
+  antigravity: [
+    { id: "all", label: "全部" },
+    { id: "free-tier", label: "FREE" },
+    { id: "pro-tier", label: "PRO" },
+  ],
+  kiro: [
+    { id: "all", label: "全部" },
+    { id: "free", label: "Free" },
+    { id: "pro", label: "Pro" },
+    { id: "enterprise", label: "Enterprise" },
+  ],
+  openai: [
+    { id: "all", label: "全部" },
+    { id: "free", label: "Free" },
+    { id: "plus", label: "Plus" },
+    { id: "pro", label: "Pro" },
+  ],
+};
+
 function getProviderInfo(provider: string) {
   const normalizedProvider = PROVIDER_ALIASES[provider] || provider;
   return PROVIDERS.find((p) => p.id === normalizedProvider) || { label: provider, color: "bg-gray-100 text-gray-700" };
@@ -118,6 +139,7 @@ export function Accounts() {
   const [apiKeySaving, setApiKeySaving] = useState(false);
   const [viewMode, setViewMode] = useState<"list" | "card">("card");
   const [providerFilter, setProviderFilter] = useState<string>("all");
+  const [tierFilter, setTierFilter] = useState<string>("all");
   const [quotaData, setQuotaData] = useState<Record<string, QuotaData>>({});
   const [quotaLoading, setQuotaLoading] = useState<Record<string, boolean>>({});
   const [codexQuotaData, setCodexQuotaData] = useState<Record<string, CodexQuotaData>>({});
@@ -643,11 +665,58 @@ export function Accounts() {
 
   const apiKeyProviderInfo = apiKeyProvider ? getProviderInfo(apiKeyProvider) : null;
 
+  // Helper function to get account subscription tier
+  function getAccountTier(account: AuthAccount): string | null {
+    const normalizedProvider = PROVIDER_ALIASES[account.provider] || account.provider;
+
+    if (normalizedProvider === "antigravity") {
+      const quota = quotaData[account.id];
+      if (!quota?.subscription_tier) return null;
+      // Map subscription_tier to filter tier ID (use same logic as display)
+      const tier = quota.subscription_tier.toLowerCase();
+      if (tier.includes("pro")) return "pro-tier";
+      if (tier.includes("free") || tier.includes("legacy")) return "free-tier";
+      return "free-tier";  // Default to free for unknown tiers
+    } else if (normalizedProvider === "openai") {
+      const quota = codexQuotaData[account.id];
+      if (!quota) return null;
+      // Map Codex plan types to tier ids
+      const planType = quota.plan_type?.toLowerCase();
+      if (planType?.includes("pro")) return "pro";
+      if (planType?.includes("plus")) return "plus";
+      return "free";
+    } else if (normalizedProvider === "kiro") {
+      const quota = kiroQuotaData[account.id];
+      if (!quota) return null;
+      // Use subscription_title as primary source (same as card display)
+      // subscription_title is like "KIRO FREE", "KIRO PRO", etc.
+      const title = quota.subscription_title?.toLowerCase() || "";
+      const subType = quota.subscription_type?.toLowerCase() || "";
+
+      if (title.includes("enterprise") || subType.includes("enterprise")) return "enterprise";
+      if (title.includes("pro") || subType.includes("pro")) return "pro";
+      return "free";  // Default includes "FREE" in title
+    }
+    return null;
+  }
+
   // Provider 筛选逻辑
   const filteredAccounts = accounts.filter((account) => {
-    if (providerFilter === "all") return true;
+    // First filter by provider
     const normalizedProvider = PROVIDER_ALIASES[account.provider] || account.provider;
-    return normalizedProvider === providerFilter;
+    if (providerFilter !== "all" && normalizedProvider !== providerFilter) {
+      return false;
+    }
+
+    // Then filter by subscription tier (if applicable)
+    if (tierFilter !== "all" && providerFilter !== "all") {
+      const accountTier = getAccountTier(account);
+      // If tier data not available yet, show the account
+      if (accountTier === null) return true;
+      return accountTier === tierFilter;
+    }
+
+    return true;
   });
 
   // 计算各 provider 的账号数量
@@ -658,6 +727,25 @@ export function Accounts() {
     }).length;
     return acc;
   }, {} as Record<string, number>);
+
+  // 计算当前供应商下各订阅等级的账号数量
+  const tierCounts = providerFilter !== "all" && PROVIDER_TIERS[providerFilter]
+    ? PROVIDER_TIERS[providerFilter].reduce((acc, tier) => {
+      if (tier.id === "all") {
+        acc[tier.id] = accounts.filter(account => {
+          const normalizedProvider = PROVIDER_ALIASES[account.provider] || account.provider;
+          return normalizedProvider === providerFilter;
+        }).length;
+      } else {
+        acc[tier.id] = accounts.filter(account => {
+          const normalizedProvider = PROVIDER_ALIASES[account.provider] || account.provider;
+          if (normalizedProvider !== providerFilter) return false;
+          return getAccountTier(account) === tier.id;
+        }).length;
+      }
+      return acc;
+    }, {} as Record<string, number>)
+    : {};
 
   const allSelected = filteredAccounts.length > 0 && filteredAccounts.every((a) => selectedIds.has(a.id));
 
@@ -805,19 +893,17 @@ export function Accounts() {
             {/* Provider 筛选按钮组 */}
             <div className="flex items-center gap-1 bg-gray-100 dark:bg-gray-700 p-1 rounded-lg">
               <button
-                onClick={() => setProviderFilter("all")}
-                className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors flex items-center gap-2 ${
-                  providerFilter === "all"
-                    ? "bg-white dark:bg-gray-600 text-blue-600 dark:text-blue-400 shadow-sm"
-                    : "text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
-                }`}
+                onClick={() => { setProviderFilter("all"); setTierFilter("all"); }}
+                className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors flex items-center gap-2 ${providerFilter === "all"
+                  ? "bg-white dark:bg-gray-600 text-blue-600 dark:text-blue-400 shadow-sm"
+                  : "text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
+                  }`}
               >
                 全部
-                <span className={`px-1.5 py-0.5 text-xs rounded ${
-                  providerFilter === "all"
-                    ? "bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400"
-                    : "bg-gray-200 dark:bg-gray-600 text-gray-500 dark:text-gray-400"
-                }`}>
+                <span className={`px-1.5 py-0.5 text-xs rounded ${providerFilter === "all"
+                  ? "bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400"
+                  : "bg-gray-200 dark:bg-gray-600 text-gray-500 dark:text-gray-400"
+                  }`}>
                   {accounts.length}
                 </span>
               </button>
@@ -827,25 +913,50 @@ export function Accounts() {
                 return (
                   <button
                     key={provider.id}
-                    onClick={() => setProviderFilter(provider.id)}
-                    className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors flex items-center gap-2 ${
-                      providerFilter === provider.id
-                        ? "bg-white dark:bg-gray-600 text-blue-600 dark:text-blue-400 shadow-sm"
-                        : "text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
-                    }`}
+                    onClick={() => { setProviderFilter(provider.id); setTierFilter("all"); }}
+                    className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors flex items-center gap-2 ${providerFilter === provider.id
+                      ? "bg-white dark:bg-gray-600 text-blue-600 dark:text-blue-400 shadow-sm"
+                      : "text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
+                      }`}
                   >
                     {provider.label}
-                    <span className={`px-1.5 py-0.5 text-xs rounded ${
-                      providerFilter === provider.id
-                        ? "bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400"
-                        : "bg-gray-200 dark:bg-gray-600 text-gray-500 dark:text-gray-400"
-                    }`}>
+                    <span className={`px-1.5 py-0.5 text-xs rounded ${providerFilter === provider.id
+                      ? "bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400"
+                      : "bg-gray-200 dark:bg-gray-600 text-gray-500 dark:text-gray-400"
+                      }`}>
                       {count}
                     </span>
                   </button>
                 );
               })}
             </div>
+
+            {/* 二级订阅等级筛选按钮组 - 仅当选中特定供应商时显示 */}
+            {providerFilter !== "all" && PROVIDER_TIERS[providerFilter] && (
+              <div className="flex items-center gap-1 bg-gray-50 dark:bg-gray-800 p-1 rounded-lg border border-gray-200 dark:border-gray-600">
+                {PROVIDER_TIERS[providerFilter].map((tier) => {
+                  const count = tierCounts[tier.id] || 0;
+                  return (
+                    <button
+                      key={tier.id}
+                      onClick={() => setTierFilter(tier.id)}
+                      className={`px-2 py-1 text-xs font-medium rounded transition-colors flex items-center gap-1.5 ${tierFilter === tier.id
+                        ? "bg-white dark:bg-gray-600 text-blue-600 dark:text-blue-400 shadow-sm"
+                        : "text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
+                        }`}
+                    >
+                      {tier.label}
+                      <span className={`px-1 py-0.5 text-[10px] rounded ${tierFilter === tier.id
+                        ? "bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400"
+                        : "bg-gray-200 dark:bg-gray-600 text-gray-500 dark:text-gray-400"
+                        }`}>
+                        {count}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
 
             {selectedIds.size > 0 && (
               <div className="flex items-center gap-2">
@@ -929,32 +1040,29 @@ export function Accounts() {
                               {providerInfo.label}
                             </span>
                             {isAntigravity && quota?.subscription_tier && (
-                              <span className={`inline-block px-1.5 py-0.5 text-[10px] rounded font-medium flex-shrink-0 ${
-                                quota.subscription_tier.toLowerCase().includes("pro")
-                                  ? "bg-blue-500 text-white"
-                                  : quota.subscription_tier.toLowerCase().includes("ultra")
+                              <span className={`inline-block px-1.5 py-0.5 text-[10px] rounded font-medium flex-shrink-0 ${quota.subscription_tier.toLowerCase().includes("pro")
+                                ? "bg-blue-500 text-white"
+                                : quota.subscription_tier.toLowerCase().includes("ultra")
                                   ? "bg-purple-500 text-white"
                                   : "bg-gray-400 text-white"
-                              }`}>
+                                }`}>
                                 {quota.subscription_tier.toLowerCase().includes("pro") ? "PRO" :
-                                 quota.subscription_tier.toLowerCase().includes("ultra") ? "ULTRA" : "FREE"}
+                                  quota.subscription_tier.toLowerCase().includes("ultra") ? "ULTRA" : "FREE"}
                               </span>
                             )}
                             {isCodex && codexQuota && !codexQuota.is_error && (
-                              <span className={`inline-block px-1.5 py-0.5 text-[10px] rounded font-medium flex-shrink-0 ${
-                                codexQuota.plan_type.toLowerCase().includes("plus")
-                                  ? "bg-green-500 text-white"
-                                  : "bg-gray-400 text-white"
-                              }`}>
+                              <span className={`inline-block px-1.5 py-0.5 text-[10px] rounded font-medium flex-shrink-0 ${codexQuota.plan_type.toLowerCase().includes("plus")
+                                ? "bg-green-500 text-white"
+                                : "bg-gray-400 text-white"
+                                }`}>
                                 {codexQuota.plan_type.toUpperCase()}
                               </span>
                             )}
                             {isKiro && kiroQuota && !kiroQuota.is_error && kiroQuota.subscription_title && (
-                              <span className={`inline-block px-1.5 py-0.5 text-[10px] rounded font-medium flex-shrink-0 ${
-                                kiroQuota.subscription_title.toLowerCase().includes("pro")
-                                  ? "bg-purple-500 text-white"
-                                  : "bg-gray-400 text-white"
-                              }`}>
+                              <span className={`inline-block px-1.5 py-0.5 text-[10px] rounded font-medium flex-shrink-0 ${kiroQuota.subscription_title.toLowerCase().includes("pro")
+                                ? "bg-purple-500 text-white"
+                                : "bg-gray-400 text-white"
+                                }`}>
                                 {kiroQuota.subscription_title.replace("KIRO ", "")}
                               </span>
                             )}
@@ -1085,11 +1193,10 @@ export function Accounts() {
                           )}
                         </td>
                         <td className="px-3 py-3">
-                          <span className={`inline-block px-2 py-1 text-xs rounded ${
-                            account.enabled
-                              ? "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300"
-                              : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
-                          }`}>
+                          <span className={`inline-block px-2 py-1 text-xs rounded ${account.enabled
+                            ? "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300"
+                            : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
+                            }`}>
                             {account.enabled ? "正常" : "禁用"}
                           </span>
                         </td>
@@ -1145,11 +1252,10 @@ export function Accounts() {
                             )}
                             <button
                               onClick={() => handleToggleEnabled(account.id, !account.enabled)}
-                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${
-                                account.enabled
-                                  ? "text-gray-400 hover:text-orange-500"
-                                  : "text-blue-500 hover:text-blue-600"
-                              }`}
+                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${account.enabled
+                                ? "text-gray-400 hover:text-orange-500"
+                                : "text-blue-500 hover:text-blue-600"
+                                }`}
                               title={account.enabled ? "禁用账号" : "启用账号"}
                             >
                               {account.enabled ? (
@@ -1210,11 +1316,10 @@ export function Accounts() {
                   return (
                     <div
                       key={account.id}
-                      className={`bg-white dark:bg-gray-800 rounded-lg shadow p-4 border-2 transition-colors ${
-                        selectedIds.has(account.id)
-                          ? "border-blue-500"
-                          : "border-transparent hover:border-gray-200 dark:hover:border-gray-700"
-                      }`}
+                      className={`bg-white dark:bg-gray-800 rounded-lg shadow p-4 border-2 transition-colors ${selectedIds.has(account.id)
+                        ? "border-blue-500"
+                        : "border-transparent hover:border-gray-200 dark:hover:border-gray-700"
+                        }`}
                     >
                       <div className="flex items-start justify-between">
                         <div className="flex items-center gap-3">
@@ -1227,32 +1332,29 @@ export function Accounts() {
                         </div>
                         <div className="flex items-center gap-2">
                           {isAntigravity && quota?.subscription_tier && (
-                            <span className={`inline-block px-2 py-1 text-xs rounded font-medium ${
-                              quota.subscription_tier.toLowerCase().includes("pro")
-                                ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400"
-                                : quota.subscription_tier.toLowerCase().includes("ultra")
+                            <span className={`inline-block px-2 py-1 text-xs rounded font-medium ${quota.subscription_tier.toLowerCase().includes("pro")
+                              ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400"
+                              : quota.subscription_tier.toLowerCase().includes("ultra")
                                 ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
                                 : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
-                            }`}>
+                              }`}>
                               {quota.subscription_tier.toLowerCase().includes("pro") ? "PRO" :
-                               quota.subscription_tier.toLowerCase().includes("ultra") ? "ULTRA" : "FREE"}
+                                quota.subscription_tier.toLowerCase().includes("ultra") ? "ULTRA" : "FREE"}
                             </span>
                           )}
                           {isCodex && codexQuota && !codexQuota.is_error && (
-                            <span className={`inline-block px-2 py-1 text-xs rounded font-medium ${
-                              codexQuota.plan_type.toLowerCase().includes("plus")
-                                ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
-                                : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
-                            }`}>
+                            <span className={`inline-block px-2 py-1 text-xs rounded font-medium ${codexQuota.plan_type.toLowerCase().includes("plus")
+                              ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
+                              : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
+                              }`}>
                               {codexQuota.plan_type.toUpperCase()}
                             </span>
                           )}
                           {isKiro && kiroQuota && !kiroQuota.is_error && kiroQuota.subscription_title && (
-                            <span className={`inline-block px-2 py-1 text-xs rounded font-medium ${
-                              kiroQuota.subscription_title.toLowerCase().includes("pro")
-                                ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400"
-                                : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
-                            }`}>
+                            <span className={`inline-block px-2 py-1 text-xs rounded font-medium ${kiroQuota.subscription_title.toLowerCase().includes("pro")
+                              ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400"
+                              : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
+                              }`}>
                               {kiroQuota.subscription_title.replace("KIRO ", "")}
                             </span>
                           )}
@@ -1483,11 +1585,10 @@ export function Accounts() {
                       )}
 
                       <div className="mt-4 flex items-center justify-between">
-                        <span className={`inline-block px-2 py-1 text-xs rounded ${
-                          account.enabled
-                            ? "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300"
-                            : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
-                        }`}>
+                        <span className={`inline-block px-2 py-1 text-xs rounded ${account.enabled
+                          ? "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300"
+                          : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
+                          }`}>
                           {account.enabled ? "正常" : "禁用"}
                         </span>
                         <div className="flex items-center gap-1">
@@ -1541,11 +1642,10 @@ export function Accounts() {
                           )}
                           <button
                             onClick={() => handleToggleEnabled(account.id, !account.enabled)}
-                            className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${
-                              account.enabled
-                                ? "text-gray-400 hover:text-orange-500"
-                                : "text-blue-500 hover:text-blue-600"
-                            }`}
+                            className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${account.enabled
+                              ? "text-gray-400 hover:text-orange-500"
+                              : "text-blue-500 hover:text-blue-600"
+                              }`}
                             title={account.enabled ? "禁用账号" : "启用账号"}
                           >
                             {account.enabled ? (
@@ -1656,9 +1756,8 @@ export function Accounts() {
               <button
                 onClick={handleSaveApiKey}
                 disabled={apiKeySaving}
-                className={`px-4 py-2 rounded-lg text-white ${
-                  apiKeySaving ? "bg-gray-400" : "bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600"
-                }`}
+                className={`px-4 py-2 rounded-lg text-white ${apiKeySaving ? "bg-gray-400" : "bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600"
+                  }`}
               >
                 {apiKeySaving ? "保存中..." : "保存"}
               </button>
