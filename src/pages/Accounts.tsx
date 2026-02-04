@@ -1170,6 +1170,16 @@ export function Accounts() {
                             ) : kiroQuota ? (
                               (() => {
                                 const baseLimit = kiroQuota.usage_limit ?? 0;
+                                // usage_limit = -1 indicates unlimited (Enterprise accounts)
+                                if (baseLimit === -1) {
+                                  return (
+                                    <div className="h-10 flex items-center gap-2 text-xs">
+                                      <span className="font-medium text-purple-600 dark:text-purple-400">
+                                        ∞ 无限额度
+                                      </span>
+                                    </div>
+                                  );
+                                }
                                 const baseUsage = kiroQuota.current_usage ?? 0;
                                 const trialLimit = kiroQuota.free_trial_limit ?? 0;
                                 const trialUsage = kiroQuota.free_trial_usage ?? 0;
@@ -1548,6 +1558,21 @@ export function Accounts() {
                                   {(() => {
                                     // Combine base quota + free trial quota like kiro-account-manager
                                     const baseLimit = kiroQuota.usage_limit ?? 0;
+
+                                    // usage_limit = -1 indicates unlimited (Enterprise accounts)
+                                    if (baseLimit === -1) {
+                                      return (
+                                        <div className="flex items-center gap-2">
+                                          <span className="text-xl font-medium text-purple-600 dark:text-purple-400">
+                                            ∞
+                                          </span>
+                                          <span className="text-sm text-gray-600 dark:text-gray-400">
+                                            无限额度
+                                          </span>
+                                        </div>
+                                      );
+                                    }
+
                                     const baseUsage = kiroQuota.current_usage ?? 0;
                                     const trialLimit = kiroQuota.free_trial_limit ?? 0;
                                     const trialUsage = kiroQuota.free_trial_usage ?? 0;

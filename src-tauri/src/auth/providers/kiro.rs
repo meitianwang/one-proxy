@@ -593,6 +593,33 @@ pub async fn fetch_quota(account_id: &str) -> Result<KiroQuotaData> {
     let is_idc = auth_method.as_deref() == Some("IdC");
     println!("[Kiro fetch_quota] auth_method: {:?}, is_idc: {}", auth_method, is_idc);
 
+    // Check if this is an Enterprise account by kiro_provider field
+    let kiro_provider = json.get("kiro_provider")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    
+    let is_enterprise = kiro_provider.as_ref().map_or(false, |p| p == "Enterprise");
+    println!("[Kiro fetch_quota] kiro_provider: {:?}, is_enterprise: {}", kiro_provider, is_enterprise);
+    
+    // For Enterprise accounts, skip usage limits API as it returns 403 FEATURE_NOT_SUPPORTED
+    // Enterprise accounts have unlimited quota
+    if is_enterprise {
+        println!("[Kiro fetch_quota] Enterprise account detected, returning unlimited quota");
+        
+        return Ok(KiroQuotaData {
+            subscription_title: Some("KIRO ENTERPRISE".to_string()),
+            subscription_type: Some("ENTERPRISE".to_string()),
+            usage_limit: Some(-1),  // -1 indicates unlimited
+            current_usage: Some(0),
+            days_until_reset: None,
+            free_trial_limit: None,
+            free_trial_usage: None,
+            last_updated: chrono::Utc::now().timestamp(),
+            is_error: false,
+            error_message: None,
+        });
+    }
+
     // Try to refresh token and get fresh quota data
     if let Some(ref rt) = refresh_token {
         let refresh_result: Result<(String, String)> = if is_idc {
