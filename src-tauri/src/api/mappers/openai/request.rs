@@ -215,21 +215,32 @@ pub fn transform_openai_request(
                 // [FIX] 解决 Claude 3.7 Thinking 模型的强制性校验:
                 // "Expected thinking... but found tool_use/text"
                 // 如果是思维模型且缺失 reasoning_content, 则注入占位符
-                tracing::debug!("[OpenAI-Thinking] Injecting placeholder thinking block for assistant message");
-                let mut thought_part = json!({
-                    "text": "Applying tool decisions and generating response...",
-                    "thought": true,
-                });
-                
-                // [NEW] 优先使用全局存储的思维签名 (如果可用)
-                if let Some(ref sig) = global_thought_sig {
-                    thought_part["thoughtSignature"] = json!(sig);
-                } else if !mapped_model.starts_with("projects/") && mapped_model.contains("gemini") {
-                    // [FIX] 仅针对 Gemini 思维模型注入跳过标签, Claude 不识别此标签
-                    thought_part["thoughtSignature"] = json!("skip_thought_signature_validator");
+                // [FIX #2] For Claude, we can only inject placeholder if we have a valid signature
+                let should_inject_placeholder = if is_claude_thinking {
+                    global_thought_sig.is_some()  // Claude requires valid signature
+                } else {
+                    true  // Gemini can use skip_thought_signature_validator
+                };
+
+                if should_inject_placeholder {
+                    tracing::debug!("[OpenAI-Thinking] Injecting placeholder thinking block for assistant message");
+                    let mut thought_part = json!({
+                        "text": "Applying tool decisions and generating response...",
+                        "thought": true,
+                    });
+                    
+                    // [NEW] 优先使用全局存储的思维签名 (如果可用)
+                    if let Some(ref sig) = global_thought_sig {
+                        thought_part["thoughtSignature"] = json!(sig);
+                    } else if is_gemini_3_thinking {
+                        // [FIX] 仅针对 Gemini 思维模型注入跳过标签, Claude 不识别此标签
+                        thought_part["thoughtSignature"] = json!("skip_thought_signature_validator");
+                    }
+                    
+                    parts.push(thought_part);
+                } else {
+                    tracing::warn!("[OpenAI-Thinking] Skipping placeholder for Claude thinking model without valid signature");
                 }
-                
-                parts.push(thought_part);
             }
 
             // Handle content (multimodal or text)
@@ -346,12 +357,24 @@ pub fn transform_openai_request(
                     crate::api::common::json_schema::clean_json_schema(&mut func_call_part);
 
                     // [修复] 为该消息内的所有工具调用注入 thoughtSignature
+                    // Antigravity API requires thought_signature for ALL Gemini models (not just thinking models)
+                    // Claude requires VALID signature - skip_thought_signature_validator does NOT work for Claude
+                    let is_gemini_model = mapped_model_lower.contains("gemini") && !mapped_model_lower.contains("claude");
+                    
                     if let Some(ref sig) = global_thought_sig {
                         func_call_part["thoughtSignature"] = json!(sig);
-                    } else if is_thinking_model && !mapped_model.starts_with("projects/") {
-                        // [NEW] Handle missing signature for Gemini thinking models
+                    } else if is_gemini_model {
+                        // [FIX] Antigravity API requires signature for ALL Gemini models (including gemini-3-pro-high)
+                        // skip_thought_signature_validator works for Gemini but NOT for Claude
                         tracing::debug!("[OpenAI-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", tc.id);
                         func_call_part["thoughtSignature"] = json!("skip_thought_signature_validator");
+                    } else if is_claude_thinking {
+                        // Claude requires valid signature - if we don't have one, log warning
+                        // The request may fail with 400, but that's better than sending invalid skip token
+                        tracing::warn!(
+                            "[OpenAI-Signature] Claude thinking model without signature for tool_call: {} - request may fail",
+                            tc.id
+                        );
                     }
 
                     parts.push(func_call_part);
