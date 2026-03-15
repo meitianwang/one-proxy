@@ -15,16 +15,30 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
 const OPENAI_AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+fn get_client_id() -> String {
+    std::env::var("OPENAI_OAUTH_CLIENT_ID")
+        .unwrap_or_else(|_| include_str!("../../../credentials/openai.txt").lines().next().unwrap_or_default().to_string())
+}
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const OAUTH_CALLBACK_PORT: u16 = 1455;
+const CODEX_DEVICE_USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+const CODEX_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+const CODEX_DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
+const CODEX_DEVICE_TOKEN_EXCHANGE_REDIRECT_URI: &str =
+    "https://auth.openai.com/deviceauth/callback";
+const CODEX_DEVICE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const CODEX_DEVICE_DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Store pending OAuth sessions (state -> PKCE verifier)
 static PENDING_OAUTH: Lazy<RwLock<HashMap<String, String>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+static PENDING_DEVICE_OAUTH: Lazy<RwLock<HashMap<String, PendingDeviceFlow>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// PKCE codes for OAuth flow
@@ -78,12 +92,76 @@ pub struct JwtClaims {
     pub sub: Option<String>,
     pub email: Option<String>,
     #[serde(rename = "https://api.openai.com/auth", default)]
-    pub auth_info: Option<AuthInfo>,
+    pub auth_info: Option<CodexAuthInfo>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AuthInfo {
+pub struct CodexAuthInfo {
+    #[serde(default)]
+    pub chatgpt_account_id: Option<String>,
+    #[serde(default)]
+    pub chatgpt_plan_type: Option<String>,
+    #[serde(default)]
     pub user_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexIdentity {
+    pub email: Option<String>,
+    pub account_id: Option<String>,
+    pub plan_type: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingDeviceFlow {
+    device_auth_id: String,
+    user_code: String,
+    poll_interval: Duration,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceOAuthStart {
+    pub session_id: String,
+    pub verification_url: String,
+    pub user_code: String,
+    pub interval_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeviceUserCodeRequest {
+    client_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DeviceUserCodeResponse {
+    device_auth_id: String,
+    #[serde(default)]
+    user_code: Option<String>,
+    #[serde(default)]
+    usercode: Option<String>,
+    #[serde(default)]
+    interval: Option<ValueOrStringNumber>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeviceTokenRequest {
+    device_auth_id: String,
+    user_code: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DeviceTokenResponse {
+    authorization_code: String,
+    code_verifier: String,
+    #[allow(dead_code)]
+    code_challenge: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ValueOrStringNumber {
+    String(String),
+    Number(u64),
 }
 
 /// Parse JWT token to extract claims (without verification)
@@ -95,6 +173,43 @@ fn parse_jwt_claims(token: &str) -> Option<JwtClaims> {
 
     let payload = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
     serde_json::from_slice(&payload).ok()
+}
+
+pub fn extract_codex_identity_from_id_token(id_token: Option<&str>) -> CodexIdentity {
+    let Some(id_token) = id_token else {
+        return CodexIdentity {
+            email: None,
+            account_id: None,
+            plan_type: None,
+        };
+    };
+    let Some(claims) = parse_jwt_claims(id_token) else {
+        return CodexIdentity {
+            email: None,
+            account_id: None,
+            plan_type: None,
+        };
+    };
+
+    let account_id = claims
+        .auth_info
+        .as_ref()
+        .and_then(|info| {
+            info.chatgpt_account_id
+                .clone()
+                .or_else(|| info.user_id.clone())
+        })
+        .or(claims.sub);
+    let plan_type = claims
+        .auth_info
+        .as_ref()
+        .and_then(|info| info.chatgpt_plan_type.clone());
+
+    CodexIdentity {
+        email: claims.email,
+        account_id,
+        plan_type,
+    }
 }
 
 /// Get the PKCE verifier for a given state
@@ -113,8 +228,9 @@ pub async fn start_oauth() -> Result<String> {
 
     tracing::info!("Generated OAuth state: {}", state);
 
+    let client_id = get_client_id();
     let params = [
-        ("client_id", CLIENT_ID),
+        ("client_id", client_id.as_str()),
         ("response_type", "code"),
         ("redirect_uri", REDIRECT_URI),
         ("scope", "openid email profile offline_access"),
@@ -139,13 +255,22 @@ pub async fn start_oauth() -> Result<String> {
 
 /// Exchange authorization code for tokens
 pub async fn exchange_code(code: &str, code_verifier: &str) -> Result<TokenResponse> {
+    exchange_code_with_redirect(code, code_verifier, REDIRECT_URI).await
+}
+
+async fn exchange_code_with_redirect(
+    code: &str,
+    code_verifier: &str,
+    redirect_uri: &str,
+) -> Result<TokenResponse> {
     let client = reqwest::Client::new();
 
+    let client_id = get_client_id();
     let params = [
         ("grant_type", "authorization_code"),
-        ("client_id", CLIENT_ID),
+        ("client_id", client_id.as_str()),
         ("code", code),
-        ("redirect_uri", REDIRECT_URI),
+        ("redirect_uri", redirect_uri),
         ("code_verifier", code_verifier),
     ];
 
@@ -175,9 +300,10 @@ pub async fn exchange_code(code: &str, code_verifier: &str) -> Result<TokenRespo
 pub async fn refresh_token(refresh_token: &str) -> Result<TokenResponse> {
     let client = reqwest::Client::new();
 
+    let client_id = get_client_id();
     let params = [
         ("grant_type", "refresh_token"),
-        ("client_id", CLIENT_ID),
+        ("client_id", client_id.as_str()),
         ("refresh_token", refresh_token),
     ];
 
@@ -207,12 +333,11 @@ pub async fn refresh_token(refresh_token: &str) -> Result<TokenResponse> {
 
 /// Extract email from token response
 pub fn extract_email(token_response: &TokenResponse) -> Option<String> {
-    if let Some(id_token) = &token_response.id_token {
-        if let Some(claims) = parse_jwt_claims(id_token) {
-            return claims.email;
-        }
-    }
-    None
+    extract_codex_identity_from_id_token(token_response.id_token.as_deref()).email
+}
+
+pub fn extract_codex_identity(token_response: &TokenResponse) -> CodexIdentity {
+    extract_codex_identity_from_id_token(token_response.id_token.as_deref())
 }
 
 // OAuth callback query parameters
@@ -229,6 +354,8 @@ pub struct OAuthCallbackParams {
 pub struct OAuthResult {
     pub token_response: TokenResponse,
     pub email: Option<String>,
+    pub account_id: Option<String>,
+    pub plan_type: Option<String>,
 }
 
 // Shared state for the callback server
@@ -324,6 +451,23 @@ fn kill_process_on_port(port: u16) {
     std::thread::sleep(std::time::Duration::from_millis(100));
 }
 
+fn open_system_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
 /// Start OAuth flow and wait for callback
 pub async fn start_oauth_with_callback() -> Result<OAuthResult> {
     let pkce = PKCECodes::new();
@@ -337,8 +481,9 @@ pub async fn start_oauth_with_callback() -> Result<OAuthResult> {
     tracing::info!("Starting OAuth flow with state: {}", state);
 
     // Build auth URL
+    let client_id = get_client_id();
     let params = [
-        ("client_id", CLIENT_ID),
+        ("client_id", client_id.as_str()),
         ("response_type", "code"),
         ("redirect_uri", REDIRECT_URI),
         ("scope", "openid email profile offline_access"),
@@ -370,9 +515,7 @@ pub async fn start_oauth_with_callback() -> Result<OAuthResult> {
     let state_clone = callback_state.clone();
     let callback_handler = move |Query(params): Query<OAuthCallbackParams>| {
         let state = state_clone.clone();
-        async move {
-            handle_callback(params, state).await
-        }
+        async move { handle_callback(params, state).await }
     };
 
     // Build router
@@ -401,24 +544,7 @@ pub async fn start_oauth_with_callback() -> Result<OAuthResult> {
     tracing::info!("Please open this URL in your browser: {}", auth_url);
 
     // Try to open browser using system command directly
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open")
-            .arg(&auth_url)
-            .spawn();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "", &auth_url])
-            .spawn();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("xdg-open")
-            .arg(&auth_url)
-            .spawn();
-    }
+    open_system_browser(&auth_url);
 
     // Spawn server with graceful shutdown
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -442,6 +568,163 @@ pub async fn start_oauth_with_callback() -> Result<OAuthResult> {
         Ok(Ok(res)) => res,
         Ok(Err(_)) => Err(anyhow::anyhow!("OAuth callback channel closed")),
         Err(_) => Err(anyhow::anyhow!("OAuth flow timed out after 5 minutes")),
+    }
+}
+
+pub async fn start_device_oauth() -> Result<DeviceOAuthStart> {
+    let user_code = request_device_user_code().await?;
+    let session_id = Uuid::new_v4().to_string();
+    let interval = parse_device_poll_interval(user_code.interval.as_ref());
+    let device_auth_id = user_code.device_auth_id.trim().to_string();
+    let code = user_code
+        .user_code
+        .clone()
+        .or(user_code.usercode.clone())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if device_auth_id.is_empty() || code.is_empty() {
+        return Err(anyhow::anyhow!(
+            "codex device flow did not return required fields"
+        ));
+    }
+
+    PENDING_DEVICE_OAUTH.write().insert(
+        session_id.clone(),
+        PendingDeviceFlow {
+            device_auth_id,
+            user_code: code.clone(),
+            poll_interval: interval,
+        },
+    );
+
+    open_system_browser(CODEX_DEVICE_VERIFICATION_URL);
+
+    Ok(DeviceOAuthStart {
+        session_id,
+        verification_url: CODEX_DEVICE_VERIFICATION_URL.to_string(),
+        user_code: code,
+        interval_seconds: interval.as_secs(),
+    })
+}
+
+pub async fn finish_device_oauth(session_id: &str) -> Result<OAuthResult> {
+    let pending = PENDING_DEVICE_OAUTH
+        .read()
+        .get(session_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Invalid or expired device login session"))?;
+
+    let token = poll_device_token(
+        &pending.device_auth_id,
+        &pending.user_code,
+        pending.poll_interval,
+    )
+    .await?;
+
+    let token_response = exchange_code_with_redirect(
+        &token.authorization_code,
+        &token.code_verifier,
+        CODEX_DEVICE_TOKEN_EXCHANGE_REDIRECT_URI,
+    )
+    .await?;
+
+    let identity = extract_codex_identity(&token_response);
+    PENDING_DEVICE_OAUTH.write().remove(session_id);
+
+    Ok(OAuthResult {
+        token_response,
+        email: identity.email,
+        account_id: identity.account_id,
+        plan_type: identity.plan_type,
+    })
+}
+
+async fn request_device_user_code() -> Result<DeviceUserCodeResponse> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(CODEX_DEVICE_USER_CODE_URL)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .json(&DeviceUserCodeRequest {
+            client_id: get_client_id(),
+        })
+        .send()
+        .await?;
+
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "codex device code request failed with status {}: {}",
+            status,
+            text
+        ));
+    }
+
+    serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("failed to decode codex device code response: {}", e))
+}
+
+async fn poll_device_token(
+    device_auth_id: &str,
+    user_code: &str,
+    interval: Duration,
+) -> Result<DeviceTokenResponse> {
+    let client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + CODEX_DEVICE_TIMEOUT;
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow::anyhow!(
+                "codex device authentication timed out after 15 minutes"
+            ));
+        }
+
+        let response = client
+            .post(CODEX_DEVICE_TOKEN_URL)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&DeviceTokenRequest {
+                device_auth_id: device_auth_id.to_string(),
+                user_code: user_code.to_string(),
+            })
+            .send()
+            .await?;
+
+        let status = response.status();
+        let text = response.text().await?;
+        if status.is_success() {
+            return serde_json::from_str(&text).map_err(|e| {
+                anyhow::anyhow!("failed to decode codex device token response: {}", e)
+            });
+        }
+
+        if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND {
+            tokio::time::sleep(interval).await;
+            continue;
+        }
+
+        return Err(anyhow::anyhow!(
+            "codex device token polling failed with status {}: {}",
+            status,
+            text
+        ));
+    }
+}
+
+fn parse_device_poll_interval(interval: Option<&ValueOrStringNumber>) -> Duration {
+    match interval {
+        Some(ValueOrStringNumber::Number(seconds)) if *seconds > 0 => Duration::from_secs(*seconds),
+        Some(ValueOrStringNumber::String(value)) => value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(CODEX_DEVICE_DEFAULT_POLL_INTERVAL),
+        _ => CODEX_DEVICE_DEFAULT_POLL_INTERVAL,
     }
 }
 
@@ -557,7 +840,10 @@ struct CreditsInfo {
 }
 
 /// Fetch Codex usage/quota data
-pub async fn fetch_codex_quota(access_token: &str, account_id: Option<&str>) -> Result<CodexQuotaData> {
+pub async fn fetch_codex_quota(
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<CodexQuotaData> {
     let client = reqwest::Client::new();
 
     let mut request = client
@@ -607,7 +893,8 @@ pub async fn fetch_codex_quota(access_token: &str, account_id: Option<&str>) -> 
             val.as_f64()
                 .or_else(|| val.as_i64().map(|i| i as f64))
                 .or_else(|| val.as_str().and_then(|s| s.parse().ok()))
-        }).unwrap_or(0.0)
+        })
+        .unwrap_or(0.0)
     };
 
     let get_i64 = |v: Option<&serde_json::Value>| -> Option<i64> {
@@ -622,7 +909,11 @@ pub async fn fetch_codex_quota(access_token: &str, account_id: Option<&str>) -> 
     };
 
     Ok(CodexQuotaData {
-        plan_type: data.get("plan_type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+        plan_type: data
+            .get("plan_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
         primary_used: get_f64(primary.and_then(|p| p.get("used_percent"))),
         primary_resets_at: get_i64(primary.and_then(|p| p.get("reset_at"))).map(|ts| {
             chrono::DateTime::from_timestamp(ts, 0)
@@ -637,7 +928,9 @@ pub async fn fetch_codex_quota(access_token: &str, account_id: Option<&str>) -> 
         }),
         has_credits: get_bool(credits.and_then(|c| c.get("has_credits"))),
         unlimited_credits: get_bool(credits.and_then(|c| c.get("unlimited"))),
-        credits_balance: credits.and_then(|c| c.get("balance")).and_then(|v| v.as_f64()),
+        credits_balance: credits
+            .and_then(|c| c.get("balance"))
+            .and_then(|v| v.as_f64()),
         last_updated: chrono::Utc::now().timestamp(),
         is_error: false,
         error_message: None,
@@ -694,10 +987,12 @@ async fn handle_callback(
     // Exchange code for tokens
     match exchange_code(&code, &code_verifier).await {
         Ok(token_response) => {
-            let email = extract_email(&token_response);
+            let identity = extract_codex_identity(&token_response);
             let result = OAuthResult {
                 token_response,
-                email,
+                email: identity.email,
+                account_id: identity.account_id,
+                plan_type: identity.plan_type,
             };
 
             if let Some(tx) = state.write().result_tx.take() {

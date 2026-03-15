@@ -2,6 +2,17 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-shell";
 import { ask } from "@tauri-apps/plugin-dialog";
+import {
+  Users,
+  Plus,
+  RefreshCw,
+  Download,
+  Upload,
+  LayoutList,
+  LayoutGrid,
+  CheckSquare,
+  Filter,
+} from "lucide-react";
 
 interface AuthAccount {
   id: string;
@@ -65,11 +76,26 @@ interface KiroQuotaData {
   error_message: string | null;
 }
 
+interface CodexDeviceLoginStart {
+  session_id: string;
+  verification_url: string;
+  user_code: string;
+  interval_seconds: number;
+}
+
 interface CachedQuota {
   account_id: string;
   provider: string;
   quota_data: string;
   last_updated: number;
+}
+
+interface CodexRoutingStatus {
+  account_id: string;
+  order: number;
+  selected: boolean;
+  exhausted: boolean;
+  quota_state: string;
 }
 
 type ProviderAuthType = "oauth" | "api_key";
@@ -83,18 +109,54 @@ interface ProviderInfo {
 }
 
 const PROVIDERS: ProviderInfo[] = [
-  { id: "google", name: "Gemini CLI", label: "Gemini", color: "bg-blue-100 text-blue-700", authType: "oauth" },
-  { id: "openai", name: "Codex", label: "Codex", color: "bg-green-100 text-green-700", authType: "oauth" },
-  { id: "antigravity", name: "Antigravity", label: "Antigravity", color: "bg-gray-100 text-gray-700", authType: "oauth" },
-  { id: "kiro", name: "Kiro", label: "Kiro", color: "bg-orange-100 text-orange-700", authType: "oauth" },
-  { id: "kimi", name: "Kimi API", label: "Kimi", color: "bg-rose-100 text-rose-700", authType: "api_key" },
-  { id: "glm", name: "GLM API", label: "GLM", color: "bg-cyan-100 text-cyan-700", authType: "api_key" },
+  {
+    id: "google",
+    name: "Gemini CLI",
+    label: "Gemini",
+    color: "bg-blue-100 text-blue-700",
+    authType: "oauth",
+  },
+  {
+    id: "openai",
+    name: "Codex",
+    label: "Codex",
+    color: "bg-green-100 text-green-700",
+    authType: "oauth",
+  },
+  {
+    id: "antigravity",
+    name: "Antigravity",
+    label: "Antigravity",
+    color: "bg-gray-100 text-gray-700",
+    authType: "oauth",
+  },
+  {
+    id: "kiro",
+    name: "Kiro",
+    label: "Kiro",
+    color: "bg-orange-100 text-orange-700",
+    authType: "oauth",
+  },
+  {
+    id: "kimi",
+    name: "Kimi API",
+    label: "Kimi",
+    color: "bg-rose-100 text-rose-700",
+    authType: "api_key",
+  },
+  {
+    id: "glm",
+    name: "GLM API",
+    label: "GLM",
+    color: "bg-cyan-100 text-cyan-700",
+    authType: "api_key",
+  },
 ];
 
 // Map provider names from auth files to display info
 const PROVIDER_ALIASES: Record<string, string> = {
-  "gemini": "google",
-  "codex": "openai",
+  gemini: "google",
+  codex: "openai",
 };
 
 // Subscription tier options for each provider
@@ -113,6 +175,7 @@ const PROVIDER_TIERS: Record<string, { id: string; label: string }[]> = {
   openai: [
     { id: "all", label: "全部" },
     { id: "free", label: "Free" },
+    { id: "team", label: "Team" },
     { id: "plus", label: "Plus" },
     { id: "pro", label: "Pro" },
   ],
@@ -120,7 +183,12 @@ const PROVIDER_TIERS: Record<string, { id: string; label: string }[]> = {
 
 function getProviderInfo(provider: string) {
   const normalizedProvider = PROVIDER_ALIASES[provider] || provider;
-  return PROVIDERS.find((p) => p.id === normalizedProvider) || { label: provider, color: "bg-gray-100 text-gray-700" };
+  return (
+    PROVIDERS.find((p) => p.id === normalizedProvider) || {
+      label: provider,
+      color: "bg-gray-100 text-gray-700",
+    }
+  );
 }
 
 export function Accounts() {
@@ -129,7 +197,9 @@ export function Accounts() {
   const [loginInProgress, setLoginInProgress] = useState<string | null>(null);
   const [showProjectPrompt, setShowProjectPrompt] = useState(false);
   const [projectIdInput, setProjectIdInput] = useState("");
-  const [pendingGeminiAccountId, setPendingGeminiAccountId] = useState<string | null>(null);
+  const [pendingGeminiAccountId, setPendingGeminiAccountId] = useState<
+    string | null
+  >(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [showAddMenu, setShowAddMenu] = useState(false);
   const [showApiKeyModal, setShowApiKeyModal] = useState(false);
@@ -137,22 +207,46 @@ export function Accounts() {
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [apiKeyLabel, setApiKeyLabel] = useState("");
   const [apiKeySaving, setApiKeySaving] = useState(false);
+  const [codexDeviceFlow, setCodexDeviceFlow] =
+    useState<CodexDeviceLoginStart | null>(null);
+  const [codexDeviceWaiting, setCodexDeviceWaiting] = useState(false);
+  const [codexDeviceStatus, setCodexDeviceStatus] = useState<string | null>(
+    null,
+  );
   const [viewMode, setViewMode] = useState<"list" | "card">("card");
   const [providerFilter, setProviderFilter] = useState<string>("all");
   const [tierFilter, setTierFilter] = useState<string>("all");
   const [quotaData, setQuotaData] = useState<Record<string, QuotaData>>({});
   const [quotaLoading, setQuotaLoading] = useState<Record<string, boolean>>({});
-  const [codexQuotaData, setCodexQuotaData] = useState<Record<string, CodexQuotaData>>({});
-  const [codexQuotaLoading, setCodexQuotaLoading] = useState<Record<string, boolean>>({});
-  const [geminiQuotaData, setGeminiQuotaData] = useState<Record<string, GeminiQuotaData>>({});
-  const [geminiQuotaLoading, setGeminiQuotaLoading] = useState<Record<string, boolean>>({});
-  const [kiroQuotaData, setKiroQuotaData] = useState<Record<string, KiroQuotaData>>({});
-  const [kiroQuotaLoading, setKiroQuotaLoading] = useState<Record<string, boolean>>({});
+  const [codexQuotaData, setCodexQuotaData] = useState<
+    Record<string, CodexQuotaData>
+  >({});
+  const [codexQuotaLoading, setCodexQuotaLoading] = useState<
+    Record<string, boolean>
+  >({});
+  const [codexRoutingStatus, setCodexRoutingStatus] = useState<
+    Record<string, CodexRoutingStatus>
+  >({});
+  const [geminiQuotaData, setGeminiQuotaData] = useState<
+    Record<string, GeminiQuotaData>
+  >({});
+  const [geminiQuotaLoading, setGeminiQuotaLoading] = useState<
+    Record<string, boolean>
+  >({});
+  const [kiroQuotaData, setKiroQuotaData] = useState<
+    Record<string, KiroQuotaData>
+  >({});
+  const [kiroQuotaLoading, setKiroQuotaLoading] = useState<
+    Record<string, boolean>
+  >({});
   const addMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
-      if (addMenuRef.current && !addMenuRef.current.contains(event.target as Node)) {
+      if (
+        addMenuRef.current &&
+        !addMenuRef.current.contains(event.target as Node)
+      ) {
         setShowAddMenu(false);
       }
     }
@@ -184,7 +278,10 @@ export function Accounts() {
 
     async function setupAutoRefresh() {
       try {
-        const settings = await invoke<{ quota_refresh_interval: number; token_refresh_interval: number }>("get_settings");
+        const settings = await invoke<{
+          quota_refresh_interval: number;
+          token_refresh_interval: number;
+        }>("get_settings");
         const intervalMs = settings.quota_refresh_interval * 60 * 1000;
 
         // Set up interval for auto-refresh
@@ -195,7 +292,9 @@ export function Accounts() {
           }
         }, intervalMs);
 
-        console.log(`Auto-refresh set to ${settings.quota_refresh_interval} minutes`);
+        console.log(
+          `Auto-refresh set to ${settings.quota_refresh_interval} minutes`,
+        );
       } catch (error) {
         console.error("Failed to get settings for auto-refresh:", error);
       }
@@ -213,18 +312,19 @@ export function Accounts() {
   // Load cached quotas from SQLite on startup
   async function loadCachedQuotas() {
     try {
-      const cached = await invoke<Record<string, CachedQuota>>("get_cached_quotas");
+      const cached =
+        await invoke<Record<string, CachedQuota>>("get_cached_quotas");
       for (const [accountId, cache] of Object.entries(cached)) {
         try {
           const data = JSON.parse(cache.quota_data);
           if (cache.provider === "antigravity") {
-            setQuotaData(prev => ({ ...prev, [accountId]: data }));
+            setQuotaData((prev) => ({ ...prev, [accountId]: data }));
           } else if (cache.provider === "codex") {
-            setCodexQuotaData(prev => ({ ...prev, [accountId]: data }));
+            setCodexQuotaData((prev) => ({ ...prev, [accountId]: data }));
           } else if (cache.provider === "gemini") {
-            setGeminiQuotaData(prev => ({ ...prev, [accountId]: data }));
+            setGeminiQuotaData((prev) => ({ ...prev, [accountId]: data }));
           } else if (cache.provider === "kiro") {
-            setKiroQuotaData(prev => ({ ...prev, [accountId]: data }));
+            setKiroQuotaData((prev) => ({ ...prev, [accountId]: data }));
           }
         } catch (e) {
           console.error("Failed to parse cached quota for", accountId, e);
@@ -232,6 +332,19 @@ export function Accounts() {
       }
     } catch (error) {
       console.error("Failed to load cached quotas:", error);
+    }
+
+    await fetchCodexRoutingStatuses();
+  }
+
+  async function fetchCodexRoutingStatuses() {
+    try {
+      const result = await invoke<Record<string, CodexRoutingStatus>>(
+        "get_codex_routing_statuses",
+      );
+      setCodexRoutingStatus(result);
+    } catch (error) {
+      console.error("Failed to fetch codex routing statuses:", error);
     }
   }
 
@@ -250,15 +363,22 @@ export function Accounts() {
       }
 
       setAccounts(result);
+      await fetchCodexRoutingStatuses();
       if (newAccounts.length > 0) {
         // Pull cached quota (if backend already fetched) and refresh quotas for new accounts.
         loadCachedQuotas();
         for (const account of newAccounts) {
           if (account.provider === "antigravity") {
             fetchQuota(account.id);
-          } else if (account.provider === "openai" || account.provider === "codex") {
+          } else if (
+            account.provider === "openai" ||
+            account.provider === "codex"
+          ) {
             fetchCodexQuota(account.id);
-          } else if (account.provider === "gemini" || account.provider === "google") {
+          } else if (
+            account.provider === "gemini" ||
+            account.provider === "google"
+          ) {
             fetchGeminiQuota(account.id);
           } else if (account.provider === "kiro") {
             fetchKiroQuota(account.id);
@@ -273,19 +393,25 @@ export function Accounts() {
   }
 
   async function refreshAllQuotas() {
-    const antigravityAccounts = accounts.filter(a => a.provider === "antigravity");
+    const antigravityAccounts = accounts.filter(
+      (a) => a.provider === "antigravity",
+    );
     for (const account of antigravityAccounts) {
       fetchQuota(account.id);
     }
-    const codexAccounts = accounts.filter(a => a.provider === "openai" || a.provider === "codex");
+    const codexAccounts = accounts.filter(
+      (a) => a.provider === "openai" || a.provider === "codex",
+    );
     for (const account of codexAccounts) {
       fetchCodexQuota(account.id);
     }
-    const geminiAccounts = accounts.filter(a => a.provider === "gemini" || a.provider === "google");
+    const geminiAccounts = accounts.filter(
+      (a) => a.provider === "gemini" || a.provider === "google",
+    );
     for (const account of geminiAccounts) {
       fetchGeminiQuota(account.id);
     }
-    const kiroAccounts = accounts.filter(a => a.provider === "kiro");
+    const kiroAccounts = accounts.filter((a) => a.provider === "kiro");
     for (const account of kiroAccounts) {
       fetchKiroQuota(account.id);
     }
@@ -323,7 +449,9 @@ export function Accounts() {
       });
       if (filePath) {
         // Call backend to import from file
-        const result = await invoke<number>("import_accounts_from_file", { filePath: filePath as string });
+        const result = await invoke<number>("import_accounts_from_file", {
+          filePath: filePath as string,
+        });
         console.log("Imported accounts:", result);
         await fetchAccounts();
         refreshAllQuotas();
@@ -338,17 +466,7 @@ export function Accounts() {
       console.log("Starting OAuth login for provider:", provider);
       setLoginInProgress(provider);
 
-      // Check if server is running, start it if not
-      console.log("Checking server status...");
-      const status = await invoke<{ running: boolean }>("get_server_status");
-      console.log("Server status:", status);
-
-      if (!status.running) {
-        console.log("Server not running, starting it first...");
-        await invoke("start_server");
-        // Wait a bit for server to start
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
+      await ensureServerRunning();
 
       console.log("Calling start_oauth_login...");
       const authUrl = await invoke<string>("start_oauth_login", { provider });
@@ -369,10 +487,10 @@ export function Accounts() {
         if (provider === "google") {
           const newGemini = latestAccounts.find(
             (account) =>
-              account.provider === "gemini" && !beforeIds.has(account.id)
+              account.provider === "gemini" && !beforeIds.has(account.id),
           );
           const fallbackGemini = latestAccounts.find(
-            (account) => account.provider === "gemini"
+            (account) => account.provider === "gemini",
           );
           const target = newGemini ?? fallbackGemini;
           if (target) {
@@ -400,6 +518,66 @@ export function Accounts() {
 
   async function handleLogin(provider: string) {
     await startLogin(provider);
+  }
+
+  async function ensureServerRunning() {
+    console.log("Checking server status...");
+    const status = await invoke<{ running: boolean }>("get_server_status");
+    console.log("Server status:", status);
+
+    if (!status.running) {
+      console.log("Server not running, starting it first...");
+      await invoke("start_server");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
+  async function startCodexDeviceLogin() {
+    try {
+      setShowAddMenu(false);
+      setLoginInProgress("openai-device");
+      await ensureServerRunning();
+
+      const flow = await invoke<CodexDeviceLoginStart>(
+        "start_codex_device_login",
+      );
+      setCodexDeviceFlow(flow);
+      setCodexDeviceWaiting(true);
+      setCodexDeviceStatus("已打开验证页，请输入设备码完成授权。");
+
+      void finishCodexDeviceLogin(flow.session_id);
+    } catch (error) {
+      console.error("Failed to start Codex device login:", error);
+      alert(`登录失败: ${error}`);
+      setLoginInProgress(null);
+    }
+  }
+
+  async function finishCodexDeviceLogin(sessionId: string) {
+    try {
+      const result = await invoke<string>("finish_codex_device_login", {
+        sessionId,
+      });
+      setCodexDeviceWaiting(false);
+      setCodexDeviceStatus(result || "OAuth completed successfully");
+      await fetchAccounts();
+      setLoginInProgress(null);
+      window.setTimeout(() => {
+        setCodexDeviceFlow(null);
+        setCodexDeviceStatus(null);
+      }, 1200);
+    } catch (error) {
+      console.error("Failed to finish Codex device login:", error);
+      setCodexDeviceWaiting(false);
+      setCodexDeviceStatus(`登录失败: ${error}`);
+      setLoginInProgress(null);
+    }
+  }
+
+  function closeCodexDeviceModal() {
+    if (codexDeviceWaiting) return;
+    setCodexDeviceFlow(null);
+    setCodexDeviceStatus(null);
   }
 
   async function handleProjectConfirm() {
@@ -508,7 +686,9 @@ export function Accounts() {
     if (quotaLoading[accountId]) return;
     setQuotaLoading((prev) => ({ ...prev, [accountId]: true }));
     try {
-      const result = await invoke<QuotaData>("fetch_antigravity_quota", { accountId });
+      const result = await invoke<QuotaData>("fetch_antigravity_quota", {
+        accountId,
+      });
       setQuotaData((prev) => ({ ...prev, [accountId]: result }));
     } catch (error) {
       console.error("Failed to fetch quota:", error);
@@ -521,12 +701,15 @@ export function Accounts() {
     if (codexQuotaLoading[accountId]) return;
     setCodexQuotaLoading((prev) => ({ ...prev, [accountId]: true }));
     try {
-      const result = await invoke<CodexQuotaData>("fetch_codex_quota", { accountId });
+      const result = await invoke<CodexQuotaData>("fetch_codex_quota", {
+        accountId,
+      });
       setCodexQuotaData((prev) => ({ ...prev, [accountId]: result }));
     } catch (error) {
       console.error("Failed to fetch codex quota:", error);
     } finally {
       setCodexQuotaLoading((prev) => ({ ...prev, [accountId]: false }));
+      void fetchCodexRoutingStatuses();
     }
   }
 
@@ -534,7 +717,9 @@ export function Accounts() {
     if (geminiQuotaLoading[accountId]) return;
     setGeminiQuotaLoading((prev) => ({ ...prev, [accountId]: true }));
     try {
-      const result = await invoke<GeminiQuotaData>("fetch_gemini_quota", { accountId });
+      const result = await invoke<GeminiQuotaData>("fetch_gemini_quota", {
+        accountId,
+      });
       setGeminiQuotaData((prev) => ({ ...prev, [accountId]: result }));
     } catch (error) {
       console.error("Failed to fetch gemini quota:", error);
@@ -547,7 +732,9 @@ export function Accounts() {
     if (kiroQuotaLoading[accountId]) return;
     setKiroQuotaLoading((prev) => ({ ...prev, [accountId]: true }));
     try {
-      const result = await invoke<KiroQuotaData>("fetch_kiro_quota", { accountId });
+      const result = await invoke<KiroQuotaData>("fetch_kiro_quota", {
+        accountId,
+      });
       setKiroQuotaData((prev) => ({ ...prev, [accountId]: result }));
     } catch (error) {
       console.error("Failed to fetch kiro quota:", error);
@@ -592,6 +779,88 @@ export function Accounts() {
     }
   }
 
+  function getCodexRoutingMeta(accountId: string): {
+    label: string;
+    className: string;
+  } | null {
+    const status = codexRoutingStatus[accountId];
+    if (!status) return null;
+
+    if (status.selected) {
+      if (status.quota_state === "unknown") {
+        return {
+          label: "当前优先 · 待校验",
+          className:
+            "bg-sky-50 text-sky-700 dark:bg-sky-900/20 dark:text-sky-300",
+        };
+      }
+      return {
+        label: "当前优先",
+        className:
+          "bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-300",
+      };
+    }
+
+    if (status.quota_state === "primary_exhausted") {
+      return {
+        label: "已跳过 · 5小时额度耗尽",
+        className:
+          "bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-300",
+      };
+    }
+
+    if (status.quota_state === "secondary_exhausted") {
+      return {
+        label: "已跳过 · 周额度耗尽",
+        className:
+          "bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-300",
+      };
+    }
+
+    if (status.quota_state === "fully_exhausted") {
+      return {
+        label: "已跳过 · 全部额度耗尽",
+        className:
+          "bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-300",
+      };
+    }
+
+    if (status.exhausted) {
+      return {
+        label: "已跳过 · 最近限流",
+        className:
+          "bg-amber-50 text-amber-700 dark:bg-amber-900/20 dark:text-amber-300",
+      };
+    }
+
+    if (status.quota_state === "unknown") {
+      return {
+        label: `候选 ${status.order} · 待校验`,
+        className:
+          "bg-slate-100 text-slate-700 dark:bg-slate-700/60 dark:text-slate-200",
+      };
+    }
+
+    return {
+      label: `候选 ${status.order}`,
+      className:
+        "bg-slate-100 text-slate-700 dark:bg-slate-700/60 dark:text-slate-200",
+    };
+  }
+
+  function renderCodexRoutingHint(accountId: string) {
+    const meta = getCodexRoutingMeta(accountId);
+    if (!meta) return null;
+
+    return (
+      <span
+        className={`inline-flex items-center rounded-full px-2 py-1 text-[11px] font-medium ${meta.className}`}
+      >
+        {meta.label}
+      </span>
+    );
+  }
+
   function getModelDisplayName(name: string): string {
     if (name === "gemini-3-pro-high") return "G3 Pro";
     if (name === "gemini-3-flash") return "G3 Flash";
@@ -613,11 +882,11 @@ export function Accounts() {
       "gemini-2.5-pro",
       "gemini-2.5-flash",
       "gemini-3-pro-preview",
-      "gemini-3-flash-preview"
+      "gemini-3-flash-preview",
     ];
 
     return keyModelNames
-      .map(name => models.find(m => m.model_id === name))
+      .map((name) => models.find((m) => m.model_id === name))
       .filter((m): m is GeminiModelQuota => m !== undefined);
   }
 
@@ -627,11 +896,11 @@ export function Accounts() {
       "gemini-3-pro-high",
       "gemini-3-flash",
       "gemini-3-pro-image",
-      "claude-sonnet-4-5-thinking"
+      "claude-sonnet-4-5-thinking",
     ];
 
     return keyModelNames
-      .map(name => models.find(m => m.name === name))
+      .map((name) => models.find((m) => m.name === name))
       .filter((m): m is ModelQuota => m !== undefined);
   }
 
@@ -663,11 +932,14 @@ export function Accounts() {
     }
   }
 
-  const apiKeyProviderInfo = apiKeyProvider ? getProviderInfo(apiKeyProvider) : null;
+  const apiKeyProviderInfo = apiKeyProvider
+    ? getProviderInfo(apiKeyProvider)
+    : null;
 
   // Helper function to get account subscription tier
   function getAccountTier(account: AuthAccount): string | null {
-    const normalizedProvider = PROVIDER_ALIASES[account.provider] || account.provider;
+    const normalizedProvider =
+      PROVIDER_ALIASES[account.provider] || account.provider;
 
     if (normalizedProvider === "antigravity") {
       const quota = quotaData[account.id];
@@ -676,7 +948,7 @@ export function Accounts() {
       const tier = quota.subscription_tier.toLowerCase();
       if (tier.includes("pro")) return "pro-tier";
       if (tier.includes("free") || tier.includes("legacy")) return "free-tier";
-      return "free-tier";  // Default to free for unknown tiers
+      return "free-tier"; // Default to free for unknown tiers
     } else if (normalizedProvider === "openai") {
       const quota = codexQuotaData[account.id];
       if (!quota) return null;
@@ -684,6 +956,14 @@ export function Accounts() {
       const planType = quota.plan_type?.toLowerCase();
       if (planType?.includes("pro")) return "pro";
       if (planType?.includes("plus")) return "plus";
+      if (
+        planType?.includes("team") ||
+        planType?.includes("business") ||
+        planType === "go" ||
+        planType?.includes("chatgpt_go")
+      ) {
+        return "team";
+      }
       return "free";
     } else if (normalizedProvider === "kiro") {
       const quota = kiroQuotaData[account.id];
@@ -693,9 +973,10 @@ export function Accounts() {
       const title = quota.subscription_title?.toLowerCase() || "";
       const subType = quota.subscription_type?.toLowerCase() || "";
 
-      if (title.includes("enterprise") || subType.includes("enterprise")) return "enterprise";
+      if (title.includes("enterprise") || subType.includes("enterprise"))
+        return "enterprise";
       if (title.includes("pro") || subType.includes("pro")) return "pro";
-      return "free";  // Default includes "FREE" in title
+      return "free"; // Default includes "FREE" in title
     }
     return null;
   }
@@ -703,7 +984,8 @@ export function Accounts() {
   // Provider 筛选逻辑
   const filteredAccounts = accounts.filter((account) => {
     // First filter by provider
-    const normalizedProvider = PROVIDER_ALIASES[account.provider] || account.provider;
+    const normalizedProvider =
+      PROVIDER_ALIASES[account.provider] || account.provider;
     if (providerFilter !== "all" && normalizedProvider !== providerFilter) {
       return false;
     }
@@ -720,34 +1002,46 @@ export function Accounts() {
   });
 
   // 计算各 provider 的账号数量
-  const providerCounts = PROVIDERS.reduce((acc, provider) => {
-    acc[provider.id] = accounts.filter((account) => {
-      const normalizedProvider = PROVIDER_ALIASES[account.provider] || account.provider;
-      return normalizedProvider === provider.id;
-    }).length;
-    return acc;
-  }, {} as Record<string, number>);
+  const providerCounts = PROVIDERS.reduce(
+    (acc, provider) => {
+      acc[provider.id] = accounts.filter((account) => {
+        const normalizedProvider =
+          PROVIDER_ALIASES[account.provider] || account.provider;
+        return normalizedProvider === provider.id;
+      }).length;
+      return acc;
+    },
+    {} as Record<string, number>,
+  );
 
   // 计算当前供应商下各订阅等级的账号数量
-  const tierCounts = providerFilter !== "all" && PROVIDER_TIERS[providerFilter]
-    ? PROVIDER_TIERS[providerFilter].reduce((acc, tier) => {
-      if (tier.id === "all") {
-        acc[tier.id] = accounts.filter(account => {
-          const normalizedProvider = PROVIDER_ALIASES[account.provider] || account.provider;
-          return normalizedProvider === providerFilter;
-        }).length;
-      } else {
-        acc[tier.id] = accounts.filter(account => {
-          const normalizedProvider = PROVIDER_ALIASES[account.provider] || account.provider;
-          if (normalizedProvider !== providerFilter) return false;
-          return getAccountTier(account) === tier.id;
-        }).length;
-      }
-      return acc;
-    }, {} as Record<string, number>)
-    : {};
+  const tierCounts =
+    providerFilter !== "all" && PROVIDER_TIERS[providerFilter]
+      ? PROVIDER_TIERS[providerFilter].reduce(
+          (acc, tier) => {
+            if (tier.id === "all") {
+              acc[tier.id] = accounts.filter((account) => {
+                const normalizedProvider =
+                  PROVIDER_ALIASES[account.provider] || account.provider;
+                return normalizedProvider === providerFilter;
+              }).length;
+            } else {
+              acc[tier.id] = accounts.filter((account) => {
+                const normalizedProvider =
+                  PROVIDER_ALIASES[account.provider] || account.provider;
+                if (normalizedProvider !== providerFilter) return false;
+                return getAccountTier(account) === tier.id;
+              }).length;
+            }
+            return acc;
+          },
+          {} as Record<string, number>,
+        )
+      : {};
 
-  const allSelected = filteredAccounts.length > 0 && filteredAccounts.every((a) => selectedIds.has(a.id));
+  const allSelected =
+    filteredAccounts.length > 0 &&
+    filteredAccounts.every((a) => selectedIds.has(a.id));
 
   function toggleSelectAll() {
     if (allSelected) {
@@ -769,141 +1063,190 @@ export function Accounts() {
 
   return (
     <>
-      <div className="space-y-4">
-        {/* Header */}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-lg bg-gray-100 dark:bg-gray-700 flex items-center justify-center">
-              <svg className="w-5 h-5 text-gray-600 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m13.5-9a2.5 2.5 0 11-5 0 2.5 2.5 0 015 0z" />
-              </svg>
+      <div className="max-w-[1400px] mx-auto space-y-6 animate-in mt-4">
+        {/* Page Header and Toolbar */}
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="flex items-center gap-4">
+            <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shadow-lg shadow-blue-500/20">
+              <Users className="w-7 h-7 text-white" />
             </div>
             <div>
-              <h2 className="text-xl font-bold text-gray-800 dark:text-white">账号管理</h2>
-              <p className="text-sm text-gray-500 dark:text-gray-400">管理你的 OAuth / API Key 账号</p>
+              <h2 className="text-3xl font-black tracking-tight text-gray-900 dark:text-white">
+                账号管理
+              </h2>
+              <p className="text-sm font-medium text-gray-500 dark:text-gray-400 mt-1">
+                管理支持库中的 OAuth与 API Key 凭证
+              </p>
             </div>
           </div>
 
           {/* Toolbar */}
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-3">
             {/* Add Account Dropdown */}
             <div className="relative" ref={addMenuRef}>
               <button
                 onClick={() => setShowAddMenu(!showAddMenu)}
                 disabled={loginInProgress !== null}
-                className="px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600 text-white text-sm font-medium flex items-center gap-2 disabled:opacity-50"
+                className="px-5 py-2.5 rounded-xl bg-gray-900 hover:bg-gray-800 dark:bg-white dark:hover:bg-gray-100 text-white dark:text-gray-900 text-sm font-bold flex items-center gap-2 shadow-sm transition-all active:scale-95 disabled:opacity-50"
               >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                </svg>
+                <Plus className="w-4 h-4 text-current" strokeWidth={3} />
                 添加账号
               </button>
               {showAddMenu && (
-                <div className="absolute right-0 mt-2 w-48 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 py-1 z-10">
-                  {PROVIDERS.map((provider) => (
-                    <button
-                      key={provider.id}
-                      onClick={() => {
-                        setShowAddMenu(false);
-                        if (provider.authType === "oauth") {
-                          handleLogin(provider.id);
-                        } else {
-                          openApiKeyModal(provider.id);
-                        }
-                      }}
-                      className="w-full px-4 py-2 text-left text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700"
-                    >
-                      {provider.name}
-                    </button>
-                  ))}
+                <div className="absolute right-0 mt-3 w-56 bg-white/90 dark:bg-gray-800/90 backdrop-blur-xl rounded-2xl shadow-xl shadow-black/5 dark:shadow-black/20 border border-gray-200/50 dark:border-gray-700/50 py-2 z-20 overflow-hidden animate-in fade-in slide-in-from-top-2">
+                  {PROVIDERS.map((provider) => {
+                    if (provider.id === "openai") {
+                      return (
+                        <div
+                          key={provider.id}
+                          className="border-b border-gray-100/80 dark:border-gray-700/60 last:border-b-0"
+                        >
+                          <button
+                            onClick={() => {
+                              setShowAddMenu(false);
+                              handleLogin(provider.id);
+                            }}
+                            className="w-full px-5 py-2.5 text-left text-sm font-medium text-gray-700 dark:text-gray-200 hover:bg-blue-50 dark:hover:bg-blue-900/40 hover:text-blue-600 dark:hover:text-blue-300 transition-colors flex items-center gap-3"
+                          >
+                            <span
+                              className={`w-2 h-2 rounded-full ${provider.color.split(" ")[0] || "bg-gray-400"}`}
+                            />
+                            {provider.name}
+                          </button>
+                          <button
+                            onClick={() => {
+                              void startCodexDeviceLogin();
+                            }}
+                            className="w-full px-5 py-2.5 text-left text-sm font-medium text-gray-700 dark:text-gray-200 hover:bg-blue-50 dark:hover:bg-blue-900/40 hover:text-blue-600 dark:hover:text-blue-300 transition-colors flex items-center gap-3"
+                          >
+                            <span
+                              className={`w-2 h-2 rounded-full ${provider.color.split(" ")[0] || "bg-gray-400"}`}
+                            />
+                            Codex Device Code
+                          </button>
+                        </div>
+                      );
+                    }
+
+                    return (
+                      <button
+                        key={provider.id}
+                        onClick={() => {
+                          setShowAddMenu(false);
+                          if (provider.authType === "oauth") {
+                            handleLogin(provider.id);
+                          } else {
+                            openApiKeyModal(provider.id);
+                          }
+                        }}
+                        className="w-full px-5 py-2.5 text-left text-sm font-medium text-gray-700 dark:text-gray-200 hover:bg-blue-50 dark:hover:bg-blue-900/40 hover:text-blue-600 dark:hover:text-blue-300 transition-colors flex items-center gap-3"
+                      >
+                        <span
+                          className={`w-2 h-2 rounded-full ${provider.color.split(" ")[0] || "bg-gray-400"}`}
+                        />
+                        {provider.name}
+                      </button>
+                    );
+                  })}
                 </div>
               )}
             </div>
 
-            {/* Refresh */}
-            <button
-              onClick={handleRefresh}
-              className="p-2 rounded-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
-              title="刷新账号和额度"
-            >
-              <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-              </svg>
-            </button>
+            <div className="h-8 w-px bg-gray-200 dark:bg-gray-800 mx-1" />
 
-            {/* Export */}
-            <button
-              onClick={handleExport}
-              className="p-2 rounded-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
-              title="导出所有账号"
-            >
-              <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
-              </svg>
-            </button>
+            {/* Action Buttons */}
+            <div className="flex items-center gap-1.5 p-1 bg-white/50 dark:bg-gray-900/50 backdrop-blur-sm rounded-xl border border-gray-200/50 dark:border-gray-800/50 shadow-sm">
+              <button
+                onClick={handleRefresh}
+                className="p-2 rounded-lg text-gray-600 hover:text-gray-900 hover:bg-gray-100/80 dark:text-gray-400 dark:hover:text-white dark:hover:bg-gray-800/80 transition-all font-medium"
+                title="刷新账号和额度"
+              >
+                <RefreshCw className="w-4 h-4" />
+              </button>
 
-            {/* Import */}
-            <button
-              onClick={handleImport}
-              className="p-2 rounded-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
-              title="导入账号"
-            >
-              <svg className="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-              </svg>
-            </button>
+              <button
+                onClick={handleExport}
+                className="p-2 rounded-lg text-gray-600 hover:text-gray-900 hover:bg-gray-100/80 dark:text-gray-400 dark:hover:text-white dark:hover:bg-gray-800/80 transition-all font-medium"
+                title="导出所有账号"
+              >
+                <Download className="w-4 h-4" />
+              </button>
+
+              <button
+                onClick={handleImport}
+                className="p-2 rounded-lg text-gray-600 hover:text-gray-900 hover:bg-gray-100/80 dark:text-gray-400 dark:hover:text-white dark:hover:bg-gray-800/80 transition-all font-medium"
+                title="导入账号"
+              >
+                <Upload className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="h-8 w-px bg-gray-200 dark:bg-gray-800 mx-1" />
 
             {/* View Mode Toggle */}
-            <div className="flex border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
+            <div className="flex p-1 bg-white/50 dark:bg-gray-900/50 backdrop-blur-sm rounded-xl border border-gray-200/50 dark:border-gray-800/50 shadow-sm">
               <button
                 onClick={() => setViewMode("list")}
-                className={`p-2 ${viewMode === "list" ? "bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-white" : "hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-500"}`}
+                className={`p-2 rounded-lg text-sm transition-all focus:outline-none ${viewMode === "list" ? "bg-white dark:bg-gray-700 text-gray-900 dark:text-white shadow-[0_2px_8px_-2px_rgba(0,0,0,0.1)] font-bold scale-100" : "text-gray-500 hover:bg-gray-100/50 dark:hover:bg-gray-800/80 hover:text-gray-700 dark:hover:text-gray-300 font-medium scale-95"}`}
                 title="列表视图"
               >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h16" />
-                </svg>
+                <LayoutList className="w-4 h-4" />
               </button>
               <button
                 onClick={() => setViewMode("card")}
-                className={`p-2 ${viewMode === "card" ? "bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-white" : "hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-500"}`}
+                className={`p-2 rounded-lg text-sm transition-all focus:outline-none ${viewMode === "card" ? "bg-white dark:bg-gray-700 text-gray-900 dark:text-white shadow-[0_2px_8px_-2px_rgba(0,0,0,0.1)] font-bold scale-100" : "text-gray-500 hover:bg-gray-100/50 dark:hover:bg-gray-800/80 hover:text-gray-700 dark:hover:text-gray-300 font-medium scale-95"}`}
                 title="卡片视图"
               >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
-                </svg>
+                <LayoutGrid className="w-4 h-4" />
               </button>
             </div>
           </div>
         </div>
 
-        {/* Select All & Count */}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={allSelected}
-                onChange={toggleSelectAll}
-                className="w-4 h-4 rounded border-gray-300 text-gray-800 focus:ring-gray-500"
-              />
-              <span className="text-sm text-gray-600 dark:text-gray-400">全选</span>
+        {/* Filter and Selection Bar */}
+        <div className="flex flex-wrap items-center justify-between gap-4 p-4 bg-white/60 dark:bg-gray-900/40 backdrop-blur-md rounded-2xl border border-gray-200/50 dark:border-gray-800/50 shadow-sm">
+          <div className="flex flex-wrap items-center gap-4">
+            <label className="flex items-center gap-2 cursor-pointer group">
+              <div className="relative flex items-center justify-center w-5 h-5">
+                <input
+                  type="checkbox"
+                  checked={allSelected}
+                  onChange={toggleSelectAll}
+                  className="peer appearance-none w-5 h-5 border-2 border-gray-300 dark:border-gray-600 rounded-md checked:bg-blue-500 checked:border-blue-500 transition-all cursor-pointer"
+                />
+                <CheckSquare
+                  className="absolute w-3.5 h-3.5 text-white pointer-events-none opacity-0 peer-checked:opacity-100 transition-opacity"
+                  strokeWidth={3}
+                />
+              </div>
+              <span className="text-sm font-bold text-gray-700 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white transition-colors">
+                全选
+              </span>
             </label>
 
-            {/* Provider 筛选按钮组 */}
-            <div className="flex items-center gap-1 bg-gray-100 dark:bg-gray-700 p-1 rounded-lg">
+            <div className="w-px h-6 bg-gray-200 dark:bg-gray-700 hidden sm:block" />
+
+            {/* Provider Filters */}
+            <div className="flex flex-wrap items-center gap-1.5 bg-gray-100/80 dark:bg-gray-800/80 p-1.5 rounded-xl border border-gray-200/50 dark:border-gray-700/50 shadow-inner">
               <button
-                onClick={() => { setProviderFilter("all"); setTierFilter("all"); }}
-                className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors flex items-center gap-2 ${providerFilter === "all"
-                  ? "bg-white dark:bg-gray-600 text-blue-600 dark:text-blue-400 shadow-sm"
-                  : "text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
-                  }`}
+                onClick={() => {
+                  setProviderFilter("all");
+                  setTierFilter("all");
+                }}
+                className={`px-3 py-1.5 text-sm font-bold rounded-lg transition-all duration-300 flex items-center gap-2 ${
+                  providerFilter === "all"
+                    ? "bg-white dark:bg-gray-700 text-blue-600 dark:text-blue-400 shadow-[0_2px_8px_-2px_rgba(0,0,0,0.1)] scale-100"
+                    : "text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 hover:bg-white/50 dark:hover:bg-gray-700/50 scale-95"
+                }`}
               >
                 全部
-                <span className={`px-1.5 py-0.5 text-xs rounded ${providerFilter === "all"
-                  ? "bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400"
-                  : "bg-gray-200 dark:bg-gray-600 text-gray-500 dark:text-gray-400"
-                  }`}>
+                <span
+                  className={`px-2 py-0.5 text-[10px] rounded-full ${
+                    providerFilter === "all"
+                      ? "bg-blue-100/80 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300"
+                      : "bg-gray-200/80 dark:bg-gray-600/80 text-gray-600 dark:text-gray-300"
+                  }`}
+                >
                   {accounts.length}
                 </span>
               </button>
@@ -913,17 +1256,24 @@ export function Accounts() {
                 return (
                   <button
                     key={provider.id}
-                    onClick={() => { setProviderFilter(provider.id); setTierFilter("all"); }}
-                    className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors flex items-center gap-2 ${providerFilter === provider.id
-                      ? "bg-white dark:bg-gray-600 text-blue-600 dark:text-blue-400 shadow-sm"
-                      : "text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
-                      }`}
+                    onClick={() => {
+                      setProviderFilter(provider.id);
+                      setTierFilter("all");
+                    }}
+                    className={`px-3 py-1.5 text-sm font-bold rounded-lg transition-all duration-300 flex items-center gap-2 ${
+                      providerFilter === provider.id
+                        ? "bg-white dark:bg-gray-700 text-blue-600 dark:text-blue-400 shadow-[0_2px_8px_-2px_rgba(0,0,0,0.1)] scale-100"
+                        : "text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 hover:bg-white/50 dark:hover:bg-gray-700/50 scale-95"
+                    }`}
                   >
                     {provider.label}
-                    <span className={`px-1.5 py-0.5 text-xs rounded ${providerFilter === provider.id
-                      ? "bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400"
-                      : "bg-gray-200 dark:bg-gray-600 text-gray-500 dark:text-gray-400"
-                      }`}>
+                    <span
+                      className={`px-2 py-0.5 text-[10px] rounded-full ${
+                        providerFilter === provider.id
+                          ? "bg-blue-100/80 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300"
+                          : "bg-gray-200/80 dark:bg-gray-600/80 text-gray-600 dark:text-gray-300"
+                      }`}
+                    >
                       {count}
                     </span>
                   </button>
@@ -931,53 +1281,72 @@ export function Accounts() {
               })}
             </div>
 
-            {/* 二级订阅等级筛选按钮组 - 仅当选中特定供应商时显示 */}
+            {/* Tier Filters */}
             {providerFilter !== "all" && PROVIDER_TIERS[providerFilter] && (
-              <div className="flex items-center gap-1 bg-gray-50 dark:bg-gray-800 p-1 rounded-lg border border-gray-200 dark:border-gray-600">
-                {PROVIDER_TIERS[providerFilter].map((tier) => {
-                  const count = tierCounts[tier.id] || 0;
-                  return (
-                    <button
-                      key={tier.id}
-                      onClick={() => setTierFilter(tier.id)}
-                      className={`px-2 py-1 text-xs font-medium rounded transition-colors flex items-center gap-1.5 ${tierFilter === tier.id
-                        ? "bg-white dark:bg-gray-600 text-blue-600 dark:text-blue-400 shadow-sm"
-                        : "text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
+              <>
+                <div className="w-px h-6 bg-gray-200 dark:bg-gray-700 hidden sm:block" />
+                <div className="flex flex-wrap items-center gap-1.5 bg-gray-50/80 dark:bg-gray-800/40 p-1.5 rounded-xl border border-gray-200/50 dark:border-gray-700/50">
+                  {PROVIDER_TIERS[providerFilter].map((tier) => {
+                    const count = tierCounts[tier.id] || 0;
+                    return (
+                      <button
+                        key={tier.id}
+                        onClick={() => setTierFilter(tier.id)}
+                        className={`px-2.5 py-1 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 ${
+                          tierFilter === tier.id
+                            ? "bg-white dark:bg-gray-700 text-blue-600 dark:text-blue-400 shadow-sm"
+                            : "text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 hover:bg-gray-200/50 dark:hover:bg-gray-700"
                         }`}
-                    >
-                      {tier.label}
-                      <span className={`px-1 py-0.5 text-[10px] rounded ${tierFilter === tier.id
-                        ? "bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400"
-                        : "bg-gray-200 dark:bg-gray-600 text-gray-500 dark:text-gray-400"
-                        }`}>
-                        {count}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
+                      >
+                        {tier.label}
+                        <span
+                          className={`px-1.5 py-0.5 text-[10px] rounded-md ${
+                            tierFilter === tier.id
+                              ? "bg-blue-100/80 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300"
+                              : "bg-gray-200/80 dark:bg-gray-600/80 text-gray-500 dark:text-gray-400"
+                          }`}
+                        >
+                          {count}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </>
             )}
 
+            {/* Batch Actions */}
             {selectedIds.size > 0 && (
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={handleBatchEnable}
-                  className="px-3 py-1 text-xs rounded-lg bg-gray-200 text-gray-700 hover:bg-gray-300 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600"
-                >
-                  批量启用 ({selectedIds.size})
-                </button>
-                <button
-                  onClick={handleBatchDisable}
-                  className="px-3 py-1 text-xs rounded-lg bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600"
-                >
-                  批量禁用 ({selectedIds.size})
-                </button>
-              </div>
+              <>
+                <div className="w-px h-6 bg-gray-200 dark:bg-gray-700 hidden lg:block" />
+                <div className="flex items-center gap-2 animate-in fade-in zoom-in duration-300">
+                  <button
+                    onClick={handleBatchEnable}
+                    className="px-3 py-1.5 text-xs font-bold rounded-lg bg-emerald-100/80 text-emerald-700 hover:bg-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/50 transition-colors shadow-sm border border-emerald-200/50 dark:border-emerald-800/50"
+                  >
+                    批量启用 ({selectedIds.size})
+                  </button>
+                  <button
+                    onClick={handleBatchDisable}
+                    className="px-3 py-1.5 text-xs font-bold rounded-lg bg-orange-100/80 text-orange-700 hover:bg-orange-200 dark:bg-orange-900/30 dark:text-orange-400 dark:hover:bg-orange-900/50 transition-colors shadow-sm border border-orange-200/50 dark:border-orange-800/50"
+                  >
+                    批量禁用 ({selectedIds.size})
+                  </button>
+                </div>
+              </>
             )}
           </div>
-          <span className="text-sm text-gray-600 dark:text-gray-400">
-            共 {filteredAccounts.length} 个账号
-          </span>
+
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-gray-50 dark:bg-gray-800/50 border border-gray-200/50 dark:border-gray-700/50">
+            <Filter className="w-3.5 h-3.5 text-gray-400" />
+            <span className="text-xs font-bold text-gray-500 dark:text-gray-400">
+              共{" "}
+              <span className="text-gray-900 dark:text-white mx-0.5 text-sm">
+                {filteredAccounts.length}
+              </span>{" "}
+              个账号匹配
+            </span>
+          </div>
         </div>
 
         {/* Table View */}
@@ -987,22 +1356,36 @@ export function Accounts() {
               <thead className="bg-gray-50 dark:bg-gray-700/50">
                 <tr>
                   <th className="w-10 px-3 py-3"></th>
-                  <th className="w-56 px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">邮箱</th>
-                  <th className="w-[500px] px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">模型配额</th>
-                  <th className="w-20 px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">状态</th>
-                  <th className="w-32 px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">操作</th>
+                  <th className="w-56 px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">
+                    邮箱
+                  </th>
+                  <th className="w-[500px] px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">
+                    模型配额
+                  </th>
+                  <th className="w-20 px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">
+                    状态
+                  </th>
+                  <th className="w-32 px-3 py-3 text-left text-sm font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">
+                    操作
+                  </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100 dark:divide-gray-700">
                 {loading ? (
                   <tr>
-                    <td colSpan={5} className="px-3 py-8 text-center text-gray-500 dark:text-gray-400">
+                    <td
+                      colSpan={5}
+                      className="px-3 py-8 text-center text-gray-500 dark:text-gray-400"
+                    >
                       加载中...
                     </td>
                   </tr>
                 ) : filteredAccounts.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="px-3 py-8 text-center text-gray-500 dark:text-gray-400">
+                    <td
+                      colSpan={5}
+                      className="px-3 py-8 text-center text-gray-500 dark:text-gray-400"
+                    >
                       暂无账号，请点击「添加账号」按钮
                     </td>
                   </tr>
@@ -1010,8 +1393,12 @@ export function Accounts() {
                   filteredAccounts.map((account) => {
                     const providerInfo = getProviderInfo(account.provider);
                     const isAntigravity = account.provider === "antigravity";
-                    const isCodex = account.provider === "openai" || account.provider === "codex";
-                    const isGemini = account.provider === "gemini" || account.provider === "google";
+                    const isCodex =
+                      account.provider === "openai" ||
+                      account.provider === "codex";
+                    const isGemini =
+                      account.provider === "gemini" ||
+                      account.provider === "google";
                     const isKiro = account.provider === "kiro";
                     const quota = quotaData[account.id];
                     const isLoadingQuota = quotaLoading[account.id];
@@ -1022,7 +1409,10 @@ export function Accounts() {
                     const kiroQuota = kiroQuotaData[account.id];
                     const isLoadingKiroQuota = kiroQuotaLoading[account.id];
                     return (
-                      <tr key={account.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
+                      <tr
+                        key={account.id}
+                        className="hover:bg-gray-50 dark:hover:bg-gray-700/50"
+                      >
                         <td className="px-3 py-3">
                           <input
                             type="checkbox"
@@ -1032,141 +1422,294 @@ export function Accounts() {
                           />
                         </td>
                         <td className="px-3 py-3 w-56 max-w-56">
-                          <div className="flex items-center gap-2">
-                            <span className="text-sm font-medium text-gray-800 dark:text-white truncate max-w-[120px]" title={account.email || account.id}>
-                              {account.email || account.id}
-                            </span>
-                            <span className={`inline-block px-2 py-0.5 text-xs rounded border flex-shrink-0 ${providerInfo.color}`}>
-                              {providerInfo.label}
-                            </span>
-                            {isAntigravity && quota?.subscription_tier && (
-                              <span className={`inline-block px-1.5 py-0.5 text-[10px] rounded font-medium flex-shrink-0 ${quota.subscription_tier.toLowerCase().includes("pro")
-                                ? "bg-blue-500 text-white"
-                                : quota.subscription_tier.toLowerCase().includes("ultra")
-                                  ? "bg-purple-500 text-white"
-                                  : "bg-gray-400 text-white"
-                                }`}>
-                                {quota.subscription_tier.toLowerCase().includes("pro") ? "PRO" :
-                                  quota.subscription_tier.toLowerCase().includes("ultra") ? "ULTRA" : "FREE"}
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-2">
+                              <span
+                                className="text-sm font-medium text-gray-800 dark:text-white truncate max-w-[120px]"
+                                title={account.email || account.id}
+                              >
+                                {account.email || account.id}
                               </span>
-                            )}
-                            {isCodex && codexQuota && !codexQuota.is_error && (
-                              <span className={`inline-block px-1.5 py-0.5 text-[10px] rounded font-medium flex-shrink-0 ${codexQuota.plan_type.toLowerCase().includes("plus")
-                                ? "bg-green-500 text-white"
-                                : "bg-gray-400 text-white"
-                                }`}>
-                                {codexQuota.plan_type.toUpperCase()}
+                              <span
+                                className={`inline-block px-2 py-0.5 text-xs rounded border flex-shrink-0 ${providerInfo.color}`}
+                              >
+                                {providerInfo.label}
                               </span>
-                            )}
-                            {isKiro && kiroQuota && !kiroQuota.is_error && kiroQuota.subscription_title && (
-                              <span className={`inline-block px-1.5 py-0.5 text-[10px] rounded font-medium flex-shrink-0 ${kiroQuota.subscription_title.toLowerCase().includes("pro")
-                                ? "bg-purple-500 text-white"
-                                : "bg-gray-400 text-white"
-                                }`}>
-                                {kiroQuota.subscription_title.replace("KIRO ", "")}
-                              </span>
-                            )}
+                              {isAntigravity && quota?.subscription_tier && (
+                                <span
+                                  className={`inline-block px-1.5 py-0.5 text-[10px] rounded font-medium flex-shrink-0 ${
+                                    quota.subscription_tier
+                                      .toLowerCase()
+                                      .includes("pro")
+                                      ? "bg-blue-500 text-white"
+                                      : quota.subscription_tier
+                                            .toLowerCase()
+                                            .includes("ultra")
+                                        ? "bg-purple-500 text-white"
+                                        : "bg-gray-400 text-white"
+                                  }`}
+                                >
+                                  {quota.subscription_tier
+                                    .toLowerCase()
+                                    .includes("pro")
+                                    ? "PRO"
+                                    : quota.subscription_tier
+                                          .toLowerCase()
+                                          .includes("ultra")
+                                      ? "ULTRA"
+                                      : "FREE"}
+                                </span>
+                              )}
+                              {isCodex &&
+                                codexQuota &&
+                                !codexQuota.is_error && (
+                                  <span
+                                    className={`inline-block px-1.5 py-0.5 text-[10px] rounded font-medium flex-shrink-0 ${
+                                      codexQuota.plan_type
+                                        .toLowerCase()
+                                        .includes("plus")
+                                        ? "bg-green-500 text-white"
+                                        : "bg-gray-400 text-white"
+                                    }`}
+                                  >
+                                    {codexQuota.plan_type.toUpperCase()}
+                                  </span>
+                                )}
+                              {isKiro &&
+                                kiroQuota &&
+                                !kiroQuota.is_error &&
+                                kiroQuota.subscription_title && (
+                                  <span
+                                    className={`inline-block px-1.5 py-0.5 text-[10px] rounded font-medium flex-shrink-0 ${
+                                      kiroQuota.subscription_title
+                                        .toLowerCase()
+                                        .includes("pro")
+                                        ? "bg-purple-500 text-white"
+                                        : "bg-gray-400 text-white"
+                                    }`}
+                                  >
+                                    {kiroQuota.subscription_title.replace(
+                                      "KIRO ",
+                                      "",
+                                    )}
+                                  </span>
+                                )}
+                            </div>
+                            {isCodex && renderCodexRoutingHint(account.id)}
                           </div>
                         </td>
                         <td className="px-3 py-3 w-[500px]">
                           {isAntigravity ? (
                             isLoadingQuota ? (
-                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">加载中...</span></div>
+                              <div className="h-10 flex items-center">
+                                <span className="text-xs text-gray-400">
+                                  加载中...
+                                </span>
+                              </div>
                             ) : quota?.is_forbidden ? (
-                              <div className="h-10 flex items-center"><span className="text-xs text-red-500">已禁用</span></div>
+                              <div className="h-10 flex items-center">
+                                <span className="text-xs text-red-500">
+                                  已禁用
+                                </span>
+                              </div>
                             ) : quota ? (
                               <div className="grid grid-cols-2 gap-x-4 gap-y-1 min-h-10">
                                 {getKeyModels(quota.models).map((model) => (
-                                  <div key={model.name} className="flex items-center gap-1 text-xs whitespace-nowrap">
-                                    <span className="text-gray-600 dark:text-gray-400 font-medium w-16">{getModelDisplayName(model.name)}</span>
+                                  <div
+                                    key={model.name}
+                                    className="flex items-center gap-1 text-xs whitespace-nowrap"
+                                  >
+                                    <span className="text-gray-600 dark:text-gray-400 font-medium w-16">
+                                      {getModelDisplayName(model.name)}
+                                    </span>
                                     {model.reset_time && (
                                       <span className="text-gray-400 flex items-center gap-0.5">
-                                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                        <svg
+                                          className="w-3 h-3"
+                                          fill="none"
+                                          stroke="currentColor"
+                                          viewBox="0 0 24 24"
+                                        >
+                                          <path
+                                            strokeLinecap="round"
+                                            strokeLinejoin="round"
+                                            strokeWidth={2}
+                                            d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                                          />
                                         </svg>
                                         {formatResetTime(model.reset_time)}
                                       </span>
                                     )}
-                                    <span className={`font-bold ${getQuotaTextColor(model.percentage)}`}>
+                                    <span
+                                      className={`font-bold ${getQuotaTextColor(model.percentage)}`}
+                                    >
                                       {model.percentage}%
                                     </span>
                                   </div>
                                 ))}
                               </div>
                             ) : (
-                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">-</span></div>
+                              <div className="h-10 flex items-center">
+                                <span className="text-xs text-gray-400">-</span>
+                              </div>
                             )
                           ) : isCodex ? (
                             isLoadingCodexQuota ? (
-                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">加载中...</span></div>
+                              <div className="h-10 flex items-center">
+                                <span className="text-xs text-gray-400">
+                                  加载中...
+                                </span>
+                              </div>
                             ) : codexQuota?.is_error ? (
-                              <div className="h-10 flex items-center"><span className="text-xs text-red-500">{codexQuota.error_message || "错误"}</span></div>
+                              <div className="h-10 flex items-center">
+                                <span className="text-xs text-red-500">
+                                  {codexQuota.error_message || "错误"}
+                                </span>
+                              </div>
                             ) : codexQuota ? (
                               <div className="grid grid-cols-2 gap-x-4 gap-y-1 min-h-10">
                                 <div className="flex items-center gap-1 text-xs whitespace-nowrap">
-                                  <span className="text-gray-600 dark:text-gray-400 font-medium w-16">5小时</span>
+                                  <span className="text-gray-600 dark:text-gray-400 font-medium w-16">
+                                    5小时
+                                  </span>
                                   {codexQuota.primary_resets_at && (
                                     <span className="text-gray-400 flex items-center gap-0.5">
-                                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                      <svg
+                                        className="w-3 h-3"
+                                        fill="none"
+                                        stroke="currentColor"
+                                        viewBox="0 0 24 24"
+                                      >
+                                        <path
+                                          strokeLinecap="round"
+                                          strokeLinejoin="round"
+                                          strokeWidth={2}
+                                          d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                                        />
                                       </svg>
-                                      {formatResetTime(codexQuota.primary_resets_at)}
+                                      {formatResetTime(
+                                        codexQuota.primary_resets_at,
+                                      )}
                                     </span>
                                   )}
-                                  <span className={`font-bold ${getCodexUsageColor(codexQuota.primary_used)}`}>
-                                    {(100 - codexQuota.primary_used).toFixed(0)}%
+                                  <span
+                                    className={`font-bold ${getCodexUsageColor(codexQuota.primary_used)}`}
+                                  >
+                                    {(100 - codexQuota.primary_used).toFixed(0)}
+                                    %
                                   </span>
                                 </div>
                                 <div className="flex items-center gap-1 text-xs whitespace-nowrap">
-                                  <span className="text-gray-600 dark:text-gray-400 font-medium w-16">周限制</span>
+                                  <span className="text-gray-600 dark:text-gray-400 font-medium w-16">
+                                    周限制
+                                  </span>
                                   {codexQuota.secondary_resets_at && (
                                     <span className="text-gray-400 flex items-center gap-0.5">
-                                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                      <svg
+                                        className="w-3 h-3"
+                                        fill="none"
+                                        stroke="currentColor"
+                                        viewBox="0 0 24 24"
+                                      >
+                                        <path
+                                          strokeLinecap="round"
+                                          strokeLinejoin="round"
+                                          strokeWidth={2}
+                                          d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                                        />
                                       </svg>
-                                      {formatResetTime(codexQuota.secondary_resets_at)}
+                                      {formatResetTime(
+                                        codexQuota.secondary_resets_at,
+                                      )}
                                     </span>
                                   )}
-                                  <span className={`font-bold ${getCodexUsageColor(codexQuota.secondary_used)}`}>
-                                    {(100 - codexQuota.secondary_used).toFixed(0)}%
+                                  <span
+                                    className={`font-bold ${getCodexUsageColor(codexQuota.secondary_used)}`}
+                                  >
+                                    {(100 - codexQuota.secondary_used).toFixed(
+                                      0,
+                                    )}
+                                    %
                                   </span>
                                 </div>
                               </div>
                             ) : (
-                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">-</span></div>
+                              <div className="h-10 flex items-center">
+                                <span className="text-xs text-gray-400">-</span>
+                              </div>
                             )
                           ) : isGemini ? (
                             isLoadingGeminiQuota ? (
-                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">加载中...</span></div>
+                              <div className="h-10 flex items-center">
+                                <span className="text-xs text-gray-400">
+                                  加载中...
+                                </span>
+                              </div>
                             ) : geminiQuota?.is_error ? (
-                              <div className="h-10 flex items-center"><span className="text-xs text-red-500">{geminiQuota.error_message || "错误"}</span></div>
+                              <div className="h-10 flex items-center">
+                                <span className="text-xs text-red-500">
+                                  {geminiQuota.error_message || "错误"}
+                                </span>
+                              </div>
                             ) : geminiQuota ? (
                               <div className="grid grid-cols-2 gap-x-4 gap-y-1 min-h-10">
-                                {getKeyGeminiModels(geminiQuota.models).map((model) => (
-                                  <div key={model.model_id} className="flex items-center gap-1 text-xs whitespace-nowrap">
-                                    <span className="text-gray-600 dark:text-gray-400 font-medium w-16">{getModelDisplayName(model.model_id)}</span>
-                                    {model.reset_time && (
-                                      <span className="text-gray-400 flex items-center gap-0.5">
-                                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                        </svg>
-                                        {formatResetTime(model.reset_time)}
+                                {getKeyGeminiModels(geminiQuota.models).map(
+                                  (model) => (
+                                    <div
+                                      key={model.model_id}
+                                      className="flex items-center gap-1 text-xs whitespace-nowrap"
+                                    >
+                                      <span className="text-gray-600 dark:text-gray-400 font-medium w-16">
+                                        {getModelDisplayName(model.model_id)}
                                       </span>
-                                    )}
-                                    <span className={`font-bold ${getQuotaTextColor(Math.round(model.remaining_fraction * 100))}`}>
-                                      {Math.round(model.remaining_fraction * 100)}%
-                                    </span>
-                                  </div>
-                                ))}
+                                      {model.reset_time && (
+                                        <span className="text-gray-400 flex items-center gap-0.5">
+                                          <svg
+                                            className="w-3 h-3"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            viewBox="0 0 24 24"
+                                          >
+                                            <path
+                                              strokeLinecap="round"
+                                              strokeLinejoin="round"
+                                              strokeWidth={2}
+                                              d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                                            />
+                                          </svg>
+                                          {formatResetTime(model.reset_time)}
+                                        </span>
+                                      )}
+                                      <span
+                                        className={`font-bold ${getQuotaTextColor(Math.round(model.remaining_fraction * 100))}`}
+                                      >
+                                        {Math.round(
+                                          model.remaining_fraction * 100,
+                                        )}
+                                        %
+                                      </span>
+                                    </div>
+                                  ),
+                                )}
                               </div>
                             ) : (
-                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">-</span></div>
+                              <div className="h-10 flex items-center">
+                                <span className="text-xs text-gray-400">-</span>
+                              </div>
                             )
                           ) : isKiro ? (
                             isLoadingKiroQuota ? (
-                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">加载中...</span></div>
+                              <div className="h-10 flex items-center">
+                                <span className="text-xs text-gray-400">
+                                  加载中...
+                                </span>
+                              </div>
                             ) : kiroQuota?.is_error ? (
-                              <div className="h-10 flex items-center"><span className="text-xs text-red-500">{kiroQuota.error_message || "错误"}</span></div>
+                              <div className="h-10 flex items-center">
+                                <span className="text-xs text-red-500">
+                                  {kiroQuota.error_message || "错误"}
+                                </span>
+                              </div>
                             ) : kiroQuota ? (
                               (() => {
                                 const baseLimit = kiroQuota.usage_limit ?? 0;
@@ -1181,32 +1724,49 @@ export function Accounts() {
                                   );
                                 }
                                 const baseUsage = kiroQuota.current_usage ?? 0;
-                                const trialLimit = kiroQuota.free_trial_limit ?? 0;
-                                const trialUsage = kiroQuota.free_trial_usage ?? 0;
+                                const trialLimit =
+                                  kiroQuota.free_trial_limit ?? 0;
+                                const trialUsage =
+                                  kiroQuota.free_trial_usage ?? 0;
                                 const totalLimit = baseLimit + trialLimit;
                                 const totalUsage = baseUsage + trialUsage;
                                 const remaining = totalLimit - totalUsage;
-                                const remainingPercent = totalLimit > 0 ? Math.round((remaining / totalLimit) * 100) : 0;
+                                const remainingPercent =
+                                  totalLimit > 0
+                                    ? Math.round((remaining / totalLimit) * 100)
+                                    : 0;
                                 return totalLimit > 0 ? (
                                   <div className="h-10 flex items-center gap-2 text-xs">
-                                    <span className={`font-medium ${getQuotaTextColor(remainingPercent)}`}>
-                                      {totalUsage}/{totalLimit} ({remainingPercent}%)
+                                    <span
+                                      className={`font-medium ${getQuotaTextColor(remainingPercent)}`}
+                                    >
+                                      {totalUsage}/{totalLimit} (
+                                      {remainingPercent}%)
                                     </span>
                                   </div>
-                                ) : <div className="h-10"></div>;
+                                ) : (
+                                  <div className="h-10"></div>
+                                );
                               })()
                             ) : (
-                              <div className="h-10 flex items-center"><span className="text-xs text-gray-400">-</span></div>
+                              <div className="h-10 flex items-center">
+                                <span className="text-xs text-gray-400">-</span>
+                              </div>
                             )
                           ) : (
-                            <div className="h-10 flex items-center"><span className="text-xs text-gray-400">-</span></div>
+                            <div className="h-10 flex items-center">
+                              <span className="text-xs text-gray-400">-</span>
+                            </div>
                           )}
                         </td>
                         <td className="px-3 py-3">
-                          <span className={`inline-block px-2 py-1 text-xs rounded ${account.enabled
-                            ? "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300"
-                            : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
-                            }`}>
+                          <span
+                            className={`inline-block px-2 py-1 text-xs rounded ${
+                              account.enabled
+                                ? "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300"
+                                : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
+                            }`}
+                          >
                             {account.enabled ? "正常" : "禁用"}
                           </span>
                         </td>
@@ -1219,8 +1779,18 @@ export function Accounts() {
                                 className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                                 title="刷新额度"
                               >
-                                <svg className={`w-4 h-4 ${isLoadingQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                <svg
+                                  className={`w-4 h-4 ${isLoadingQuota ? "animate-spin" : ""}`}
+                                  fill="none"
+                                  stroke="currentColor"
+                                  viewBox="0 0 24 24"
+                                >
+                                  <path
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    strokeWidth={2}
+                                    d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                                  />
                                 </svg>
                               </button>
                             )}
@@ -1231,8 +1801,18 @@ export function Accounts() {
                                 className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingCodexQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                                 title="刷新额度"
                               >
-                                <svg className={`w-4 h-4 ${isLoadingCodexQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                <svg
+                                  className={`w-4 h-4 ${isLoadingCodexQuota ? "animate-spin" : ""}`}
+                                  fill="none"
+                                  stroke="currentColor"
+                                  viewBox="0 0 24 24"
+                                >
+                                  <path
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    strokeWidth={2}
+                                    d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                                  />
                                 </svg>
                               </button>
                             )}
@@ -1243,8 +1823,18 @@ export function Accounts() {
                                 className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingGeminiQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                                 title="刷新额度"
                               >
-                                <svg className={`w-4 h-4 ${isLoadingGeminiQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                <svg
+                                  className={`w-4 h-4 ${isLoadingGeminiQuota ? "animate-spin" : ""}`}
+                                  fill="none"
+                                  stroke="currentColor"
+                                  viewBox="0 0 24 24"
+                                >
+                                  <path
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    strokeWidth={2}
+                                    d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                                  />
                                 </svg>
                               </button>
                             )}
@@ -1255,26 +1845,62 @@ export function Accounts() {
                                 className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingKiroQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                                 title="刷新额度"
                               >
-                                <svg className={`w-4 h-4 ${isLoadingKiroQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                <svg
+                                  className={`w-4 h-4 ${isLoadingKiroQuota ? "animate-spin" : ""}`}
+                                  fill="none"
+                                  stroke="currentColor"
+                                  viewBox="0 0 24 24"
+                                >
+                                  <path
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    strokeWidth={2}
+                                    d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                                  />
                                 </svg>
                               </button>
                             )}
                             <button
-                              onClick={() => handleToggleEnabled(account.id, !account.enabled)}
-                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${account.enabled
-                                ? "text-gray-400 hover:text-orange-500"
-                                : "text-blue-500 hover:text-blue-600"
-                                }`}
+                              onClick={() =>
+                                handleToggleEnabled(
+                                  account.id,
+                                  !account.enabled,
+                                )
+                              }
+                              className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${
+                                account.enabled
+                                  ? "text-gray-400 hover:text-orange-500"
+                                  : "text-blue-500 hover:text-blue-600"
+                              }`}
                               title={account.enabled ? "禁用账号" : "启用账号"}
                             >
                               {account.enabled ? (
-                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+                                <svg
+                                  className="w-4 h-4"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  viewBox="0 0 24 24"
+                                >
+                                  <path
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    strokeWidth={2}
+                                    d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"
+                                  />
                                 </svg>
                               ) : (
-                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                <svg
+                                  className="w-4 h-4"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  viewBox="0 0 24 24"
+                                >
+                                  <path
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                    strokeWidth={2}
+                                    d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
+                                  />
                                 </svg>
                               )}
                             </button>
@@ -1283,8 +1909,18 @@ export function Accounts() {
                               className="p-1.5 rounded text-gray-400 hover:text-red-500 hover:bg-gray-100 dark:hover:bg-gray-700"
                               title="删除账号"
                             >
-                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                              <svg
+                                className="w-4 h-4"
+                                fill="none"
+                                stroke="currentColor"
+                                viewBox="0 0 24 24"
+                              >
+                                <path
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  strokeWidth={2}
+                                  d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                                />
                               </svg>
                             </button>
                           </div>
@@ -1302,7 +1938,9 @@ export function Accounts() {
         {viewMode === "card" && (
           <div>
             {loading ? (
-              <div className="text-center py-8 text-gray-500 dark:text-gray-400">加载中...</div>
+              <div className="text-center py-8 text-gray-500 dark:text-gray-400">
+                加载中...
+              </div>
             ) : filteredAccounts.length === 0 ? (
               <div className="text-center py-8 text-gray-500 dark:text-gray-400">
                 暂无账号，请点击「添加账号」按钮
@@ -1312,8 +1950,12 @@ export function Accounts() {
                 {filteredAccounts.map((account) => {
                   const providerInfo = getProviderInfo(account.provider);
                   const isAntigravity = account.provider === "antigravity";
-                  const isCodex = account.provider === "openai" || account.provider === "codex";
-                  const isGemini = account.provider === "gemini" || account.provider === "google";
+                  const isCodex =
+                    account.provider === "openai" ||
+                    account.provider === "codex";
+                  const isGemini =
+                    account.provider === "gemini" ||
+                    account.provider === "google";
                   const isKiro = account.provider === "kiro";
                   const quota = quotaData[account.id];
                   const isLoadingQuota = quotaLoading[account.id];
@@ -1326,10 +1968,11 @@ export function Accounts() {
                   return (
                     <div
                       key={account.id}
-                      className={`bg-white dark:bg-gray-800 rounded-lg shadow p-4 border-2 transition-colors ${selectedIds.has(account.id)
-                        ? "border-blue-500"
-                        : "border-transparent hover:border-gray-200 dark:hover:border-gray-700"
-                        }`}
+                      className={`bg-white dark:bg-gray-800 rounded-lg shadow p-4 border-2 transition-colors ${
+                        selectedIds.has(account.id)
+                          ? "border-blue-500"
+                          : "border-transparent hover:border-gray-200 dark:hover:border-gray-700"
+                      }`}
                     >
                       <div className="flex items-start justify-between">
                         <div className="flex items-center gap-3">
@@ -1342,33 +1985,65 @@ export function Accounts() {
                         </div>
                         <div className="flex items-center gap-2">
                           {isAntigravity && quota?.subscription_tier && (
-                            <span className={`inline-block px-2 py-1 text-xs rounded font-medium ${quota.subscription_tier.toLowerCase().includes("pro")
-                              ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400"
-                              : quota.subscription_tier.toLowerCase().includes("ultra")
-                                ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
-                                : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
-                              }`}>
-                              {quota.subscription_tier.toLowerCase().includes("pro") ? "PRO" :
-                                quota.subscription_tier.toLowerCase().includes("ultra") ? "ULTRA" : "FREE"}
+                            <span
+                              className={`inline-block px-2 py-1 text-xs rounded font-medium ${
+                                quota.subscription_tier
+                                  .toLowerCase()
+                                  .includes("pro")
+                                  ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400"
+                                  : quota.subscription_tier
+                                        .toLowerCase()
+                                        .includes("ultra")
+                                    ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
+                                    : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
+                              }`}
+                            >
+                              {quota.subscription_tier
+                                .toLowerCase()
+                                .includes("pro")
+                                ? "PRO"
+                                : quota.subscription_tier
+                                      .toLowerCase()
+                                      .includes("ultra")
+                                  ? "ULTRA"
+                                  : "FREE"}
                             </span>
                           )}
                           {isCodex && codexQuota && !codexQuota.is_error && (
-                            <span className={`inline-block px-2 py-1 text-xs rounded font-medium ${codexQuota.plan_type.toLowerCase().includes("plus")
-                              ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
-                              : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
-                              }`}>
+                            <span
+                              className={`inline-block px-2 py-1 text-xs rounded font-medium ${
+                                codexQuota.plan_type
+                                  .toLowerCase()
+                                  .includes("plus")
+                                  ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
+                                  : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
+                              }`}
+                            >
                               {codexQuota.plan_type.toUpperCase()}
                             </span>
                           )}
-                          {isKiro && kiroQuota && !kiroQuota.is_error && kiroQuota.subscription_title && (
-                            <span className={`inline-block px-2 py-1 text-xs rounded font-medium ${kiroQuota.subscription_title.toLowerCase().includes("pro")
-                              ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400"
-                              : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
-                              }`}>
-                              {kiroQuota.subscription_title.replace("KIRO ", "")}
-                            </span>
-                          )}
-                          <span className={`inline-block px-2 py-1 text-xs rounded border ${providerInfo.color}`}>
+                          {isKiro &&
+                            kiroQuota &&
+                            !kiroQuota.is_error &&
+                            kiroQuota.subscription_title && (
+                              <span
+                                className={`inline-block px-2 py-1 text-xs rounded font-medium ${
+                                  kiroQuota.subscription_title
+                                    .toLowerCase()
+                                    .includes("pro")
+                                    ? "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400"
+                                    : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
+                                }`}
+                              >
+                                {kiroQuota.subscription_title.replace(
+                                  "KIRO ",
+                                  "",
+                                )}
+                              </span>
+                            )}
+                          <span
+                            className={`inline-block px-2 py-1 text-xs rounded border ${providerInfo.color}`}
+                          >
                             {providerInfo.label}
                           </span>
                         </div>
@@ -1377,40 +2052,66 @@ export function Accounts() {
                         <p className="text-sm font-medium text-gray-800 dark:text-white truncate">
                           {account.email || account.id}
                         </p>
+                        {isCodex && (
+                          <div className="mt-2">
+                            {renderCodexRoutingHint(account.id)}
+                          </div>
+                        )}
                       </div>
 
                       {/* Quota Display for Antigravity */}
                       {isAntigravity && (
                         <div className="mt-3 min-h-[140px]">
                           {isLoadingQuota && (
-                            <p className="text-xs text-gray-500 dark:text-gray-400">加载额度中...</p>
+                            <p className="text-xs text-gray-500 dark:text-gray-400">
+                              加载额度中...
+                            </p>
                           )}
                           {quota && !isLoadingQuota && (
                             <div className="space-y-2">
                               {quota.is_forbidden ? (
-                                <p className="text-xs text-red-500">账号已被禁用 (403)</p>
+                                <p className="text-xs text-red-500">
+                                  账号已被禁用 (403)
+                                </p>
                               ) : (
                                 <div className="grid grid-cols-2 gap-2">
                                   {getKeyModels(quota.models).map((model) => (
-                                    <div key={model.name} className="bg-gray-50 dark:bg-gray-700/50 rounded p-2">
+                                    <div
+                                      key={model.name}
+                                      className="bg-gray-50 dark:bg-gray-700/50 rounded p-2"
+                                    >
                                       <div className="flex items-center justify-between mb-1">
                                         <span className="text-xs font-medium text-gray-700 dark:text-gray-300 truncate">
                                           {getModelDisplayName(model.name)}
                                         </span>
-                                        <span className={`text-xs font-bold ${getQuotaTextColor(model.percentage)}`}>
+                                        <span
+                                          className={`text-xs font-bold ${getQuotaTextColor(model.percentage)}`}
+                                        >
                                           {model.percentage}%
                                         </span>
                                       </div>
                                       <div className="w-full h-1.5 bg-gray-200 dark:bg-gray-600 rounded-full overflow-hidden">
                                         <div
                                           className={`h-full ${getQuotaColor(model.percentage)} transition-all`}
-                                          style={{ width: `${model.percentage}%` }}
+                                          style={{
+                                            width: `${model.percentage}%`,
+                                          }}
                                         />
                                       </div>
                                       {model.reset_time && (
                                         <div className="flex items-center gap-1 mt-1">
-                                          <svg className="w-3 h-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                          <svg
+                                            className="w-3 h-3 text-gray-400"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            viewBox="0 0 24 24"
+                                          >
+                                            <path
+                                              strokeLinecap="round"
+                                              strokeLinejoin="round"
+                                              strokeWidth={2}
+                                              d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                                            />
                                           </svg>
                                           <span className="text-xs text-gray-500 dark:text-gray-400">
                                             {formatResetTime(model.reset_time)}
@@ -1420,7 +2121,9 @@ export function Accounts() {
                                     </div>
                                   ))}
                                   {getKeyModels(quota.models).length === 0 && (
-                                    <p className="col-span-2 text-xs text-gray-500 dark:text-gray-400">无可用模型</p>
+                                    <p className="col-span-2 text-xs text-gray-500 dark:text-gray-400">
+                                      无可用模型
+                                    </p>
                                   )}
                                 </div>
                               )}
@@ -1433,58 +2136,104 @@ export function Accounts() {
                       {isCodex && (
                         <div className="mt-3 min-h-[80px]">
                           {isLoadingCodexQuota && (
-                            <p className="text-xs text-gray-500 dark:text-gray-400">加载额度中...</p>
+                            <p className="text-xs text-gray-500 dark:text-gray-400">
+                              加载额度中...
+                            </p>
                           )}
                           {codexQuota && !isLoadingCodexQuota && (
                             <div className="space-y-2">
                               {codexQuota.is_error ? (
-                                <p className="text-xs text-red-500">{codexQuota.error_message || "获取额度失败"}</p>
+                                <p className="text-xs text-red-500">
+                                  {codexQuota.error_message || "获取额度失败"}
+                                </p>
                               ) : (
                                 <div className="grid grid-cols-2 gap-2">
                                   <div className="bg-gray-50 dark:bg-gray-700/50 rounded p-2">
                                     <div className="flex items-center justify-between mb-1">
-                                      <span className="text-xs font-medium text-gray-700 dark:text-gray-300">5小时</span>
-                                      <span className={`text-xs font-bold ${getCodexUsageColor(codexQuota.primary_used)}`}>
-                                        {(100 - codexQuota.primary_used).toFixed(0)}%
+                                      <span className="text-xs font-medium text-gray-700 dark:text-gray-300">
+                                        5小时
+                                      </span>
+                                      <span
+                                        className={`text-xs font-bold ${getCodexUsageColor(codexQuota.primary_used)}`}
+                                      >
+                                        {(
+                                          100 - codexQuota.primary_used
+                                        ).toFixed(0)}
+                                        %
                                       </span>
                                     </div>
                                     <div className="w-full h-1.5 bg-gray-200 dark:bg-gray-600 rounded-full overflow-hidden">
                                       <div
                                         className={`h-full ${getQuotaColor(100 - codexQuota.primary_used)} transition-all`}
-                                        style={{ width: `${100 - codexQuota.primary_used}%` }}
+                                        style={{
+                                          width: `${100 - codexQuota.primary_used}%`,
+                                        }}
                                       />
                                     </div>
                                     {codexQuota.primary_resets_at && (
                                       <div className="flex items-center gap-1 mt-1">
-                                        <svg className="w-3 h-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                        <svg
+                                          className="w-3 h-3 text-gray-400"
+                                          fill="none"
+                                          stroke="currentColor"
+                                          viewBox="0 0 24 24"
+                                        >
+                                          <path
+                                            strokeLinecap="round"
+                                            strokeLinejoin="round"
+                                            strokeWidth={2}
+                                            d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                                          />
                                         </svg>
                                         <span className="text-xs text-gray-500 dark:text-gray-400">
-                                          {formatResetTime(codexQuota.primary_resets_at)}
+                                          {formatResetTime(
+                                            codexQuota.primary_resets_at,
+                                          )}
                                         </span>
                                       </div>
                                     )}
                                   </div>
                                   <div className="bg-gray-50 dark:bg-gray-700/50 rounded p-2">
                                     <div className="flex items-center justify-between mb-1">
-                                      <span className="text-xs font-medium text-gray-700 dark:text-gray-300">周限制</span>
-                                      <span className={`text-xs font-bold ${getCodexUsageColor(codexQuota.secondary_used)}`}>
-                                        {(100 - codexQuota.secondary_used).toFixed(0)}%
+                                      <span className="text-xs font-medium text-gray-700 dark:text-gray-300">
+                                        周限制
+                                      </span>
+                                      <span
+                                        className={`text-xs font-bold ${getCodexUsageColor(codexQuota.secondary_used)}`}
+                                      >
+                                        {(
+                                          100 - codexQuota.secondary_used
+                                        ).toFixed(0)}
+                                        %
                                       </span>
                                     </div>
                                     <div className="w-full h-1.5 bg-gray-200 dark:bg-gray-600 rounded-full overflow-hidden">
                                       <div
                                         className={`h-full ${getQuotaColor(100 - codexQuota.secondary_used)} transition-all`}
-                                        style={{ width: `${100 - codexQuota.secondary_used}%` }}
+                                        style={{
+                                          width: `${100 - codexQuota.secondary_used}%`,
+                                        }}
                                       />
                                     </div>
                                     {codexQuota.secondary_resets_at && (
                                       <div className="flex items-center gap-1 mt-1">
-                                        <svg className="w-3 h-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                        <svg
+                                          className="w-3 h-3 text-gray-400"
+                                          fill="none"
+                                          stroke="currentColor"
+                                          viewBox="0 0 24 24"
+                                        >
+                                          <path
+                                            strokeLinecap="round"
+                                            strokeLinejoin="round"
+                                            strokeWidth={2}
+                                            d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                                          />
                                         </svg>
                                         <span className="text-xs text-gray-500 dark:text-gray-400">
-                                          {formatResetTime(codexQuota.secondary_resets_at)}
+                                          {formatResetTime(
+                                            codexQuota.secondary_resets_at,
+                                          )}
                                         </span>
                                       </div>
                                     )}
@@ -1500,42 +2249,72 @@ export function Accounts() {
                       {isGemini && (
                         <div className="mt-3 min-h-[80px]">
                           {isLoadingGeminiQuota && (
-                            <p className="text-xs text-gray-500 dark:text-gray-400">加载额度中...</p>
+                            <p className="text-xs text-gray-500 dark:text-gray-400">
+                              加载额度中...
+                            </p>
                           )}
                           {geminiQuota && !isLoadingGeminiQuota && (
                             <div className="space-y-2">
                               {geminiQuota.is_error ? (
-                                <p className="text-xs text-red-500">{geminiQuota.error_message || "获取额度失败"}</p>
+                                <p className="text-xs text-red-500">
+                                  {geminiQuota.error_message || "获取额度失败"}
+                                </p>
                               ) : (
                                 <div className="grid grid-cols-2 gap-2">
-                                  {getKeyGeminiModels(geminiQuota.models).map((model) => (
-                                    <div key={model.model_id} className="bg-gray-50 dark:bg-gray-700/50 rounded p-2">
-                                      <div className="flex items-center justify-between mb-1">
-                                        <span className="text-xs font-medium text-gray-700 dark:text-gray-300 truncate">
-                                          {getModelDisplayName(model.model_id)}
-                                        </span>
-                                        <span className={`text-xs font-bold ${getQuotaTextColor(Math.round(model.remaining_fraction * 100))}`}>
-                                          {Math.round(model.remaining_fraction * 100)}%
-                                        </span>
-                                      </div>
-                                      <div className="w-full h-1.5 bg-gray-200 dark:bg-gray-600 rounded-full overflow-hidden">
-                                        <div
-                                          className={`h-full ${getQuotaColor(Math.round(model.remaining_fraction * 100))} transition-all`}
-                                          style={{ width: `${model.remaining_fraction * 100}%` }}
-                                        />
-                                      </div>
-                                      {model.reset_time && (
-                                        <div className="flex items-center gap-1 mt-1">
-                                          <svg className="w-3 h-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                          </svg>
-                                          <span className="text-xs text-gray-500 dark:text-gray-400">
-                                            {formatResetTime(model.reset_time)}
+                                  {getKeyGeminiModels(geminiQuota.models).map(
+                                    (model) => (
+                                      <div
+                                        key={model.model_id}
+                                        className="bg-gray-50 dark:bg-gray-700/50 rounded p-2"
+                                      >
+                                        <div className="flex items-center justify-between mb-1">
+                                          <span className="text-xs font-medium text-gray-700 dark:text-gray-300 truncate">
+                                            {getModelDisplayName(
+                                              model.model_id,
+                                            )}
+                                          </span>
+                                          <span
+                                            className={`text-xs font-bold ${getQuotaTextColor(Math.round(model.remaining_fraction * 100))}`}
+                                          >
+                                            {Math.round(
+                                              model.remaining_fraction * 100,
+                                            )}
+                                            %
                                           </span>
                                         </div>
-                                      )}
-                                    </div>
-                                  ))}
+                                        <div className="w-full h-1.5 bg-gray-200 dark:bg-gray-600 rounded-full overflow-hidden">
+                                          <div
+                                            className={`h-full ${getQuotaColor(Math.round(model.remaining_fraction * 100))} transition-all`}
+                                            style={{
+                                              width: `${model.remaining_fraction * 100}%`,
+                                            }}
+                                          />
+                                        </div>
+                                        {model.reset_time && (
+                                          <div className="flex items-center gap-1 mt-1">
+                                            <svg
+                                              className="w-3 h-3 text-gray-400"
+                                              fill="none"
+                                              stroke="currentColor"
+                                              viewBox="0 0 24 24"
+                                            >
+                                              <path
+                                                strokeLinecap="round"
+                                                strokeLinejoin="round"
+                                                strokeWidth={2}
+                                                d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                                              />
+                                            </svg>
+                                            <span className="text-xs text-gray-500 dark:text-gray-400">
+                                              {formatResetTime(
+                                                model.reset_time,
+                                              )}
+                                            </span>
+                                          </div>
+                                        )}
+                                      </div>
+                                    ),
+                                  )}
                                 </div>
                               )}
                             </div>
@@ -1547,17 +2326,22 @@ export function Accounts() {
                       {isKiro && (
                         <div className="mt-3 min-h-[40px]">
                           {isLoadingKiroQuota && (
-                            <p className="text-xs text-gray-500 dark:text-gray-400">加载额度中...</p>
+                            <p className="text-xs text-gray-500 dark:text-gray-400">
+                              加载额度中...
+                            </p>
                           )}
                           {kiroQuota && !isLoadingKiroQuota && (
                             <div className="space-y-2">
                               {kiroQuota.is_error ? (
-                                <p className="text-xs text-red-500">{kiroQuota.error_message || "获取额度失败"}</p>
+                                <p className="text-xs text-red-500">
+                                  {kiroQuota.error_message || "获取额度失败"}
+                                </p>
                               ) : (
                                 <div className="bg-gray-50 dark:bg-gray-700/50 rounded p-2">
                                   {(() => {
                                     // Combine base quota + free trial quota like kiro-account-manager
-                                    const baseLimit = kiroQuota.usage_limit ?? 0;
+                                    const baseLimit =
+                                      kiroQuota.usage_limit ?? 0;
 
                                     // usage_limit = -1 indicates unlimited (Enterprise accounts)
                                     if (baseLimit === -1) {
@@ -1573,34 +2357,54 @@ export function Accounts() {
                                       );
                                     }
 
-                                    const baseUsage = kiroQuota.current_usage ?? 0;
-                                    const trialLimit = kiroQuota.free_trial_limit ?? 0;
-                                    const trialUsage = kiroQuota.free_trial_usage ?? 0;
+                                    const baseUsage =
+                                      kiroQuota.current_usage ?? 0;
+                                    const trialLimit =
+                                      kiroQuota.free_trial_limit ?? 0;
+                                    const trialUsage =
+                                      kiroQuota.free_trial_usage ?? 0;
                                     const totalLimit = baseLimit + trialLimit;
                                     const totalUsage = baseUsage + trialUsage;
                                     const remaining = totalLimit - totalUsage;
-                                    const remainingPercent = totalLimit > 0 ? Math.round((remaining / totalLimit) * 100) : 0;
+                                    const remainingPercent =
+                                      totalLimit > 0
+                                        ? Math.round(
+                                            (remaining / totalLimit) * 100,
+                                          )
+                                        : 0;
 
                                     if (totalLimit > 0) {
                                       return (
                                         <>
                                           <div className="flex items-center justify-between mb-1">
-                                            <span className="text-xs font-medium text-gray-700 dark:text-gray-300">使用量</span>
-                                            <span className={`text-xs font-bold ${getQuotaTextColor(remainingPercent)}`}>
+                                            <span className="text-xs font-medium text-gray-700 dark:text-gray-300">
+                                              使用量
+                                            </span>
+                                            <span
+                                              className={`text-xs font-bold ${getQuotaTextColor(remainingPercent)}`}
+                                            >
                                               {remainingPercent}%
                                             </span>
                                           </div>
                                           <div className="w-full h-1.5 bg-gray-200 dark:bg-gray-600 rounded-full overflow-hidden">
                                             <div
                                               className={`h-full ${getQuotaColor(remainingPercent)} transition-all`}
-                                              style={{ width: `${remainingPercent}%` }}
+                                              style={{
+                                                width: `${remainingPercent}%`,
+                                              }}
                                             />
                                           </div>
-                                          <p className="text-xs text-gray-500 mt-1">{totalUsage} / {totalLimit}</p>
+                                          <p className="text-xs text-gray-500 mt-1">
+                                            {totalUsage} / {totalLimit}
+                                          </p>
                                         </>
                                       );
                                     }
-                                    return <p className="text-xs text-gray-500">无额度信息</p>;
+                                    return (
+                                      <p className="text-xs text-gray-500">
+                                        无额度信息
+                                      </p>
+                                    );
                                   })()}
                                 </div>
                               )}
@@ -1610,10 +2414,13 @@ export function Accounts() {
                       )}
 
                       <div className="mt-4 flex items-center justify-between">
-                        <span className={`inline-block px-2 py-1 text-xs rounded ${account.enabled
-                          ? "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300"
-                          : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
-                          }`}>
+                        <span
+                          className={`inline-block px-2 py-1 text-xs rounded ${
+                            account.enabled
+                              ? "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300"
+                              : "bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300"
+                          }`}
+                        >
                           {account.enabled ? "正常" : "禁用"}
                         </span>
                         <div className="flex items-center gap-1">
@@ -1624,8 +2431,18 @@ export function Accounts() {
                               className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                               title="刷新额度"
                             >
-                              <svg className={`w-4 h-4 ${isLoadingQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                              <svg
+                                className={`w-4 h-4 ${isLoadingQuota ? "animate-spin" : ""}`}
+                                fill="none"
+                                stroke="currentColor"
+                                viewBox="0 0 24 24"
+                              >
+                                <path
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  strokeWidth={2}
+                                  d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                                />
                               </svg>
                             </button>
                           )}
@@ -1636,8 +2453,18 @@ export function Accounts() {
                               className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingCodexQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                               title="刷新额度"
                             >
-                              <svg className={`w-4 h-4 ${isLoadingCodexQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                              <svg
+                                className={`w-4 h-4 ${isLoadingCodexQuota ? "animate-spin" : ""}`}
+                                fill="none"
+                                stroke="currentColor"
+                                viewBox="0 0 24 24"
+                              >
+                                <path
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  strokeWidth={2}
+                                  d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                                />
                               </svg>
                             </button>
                           )}
@@ -1648,8 +2475,18 @@ export function Accounts() {
                               className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingGeminiQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                               title="刷新额度"
                             >
-                              <svg className={`w-4 h-4 ${isLoadingGeminiQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                              <svg
+                                className={`w-4 h-4 ${isLoadingGeminiQuota ? "animate-spin" : ""}`}
+                                fill="none"
+                                stroke="currentColor"
+                                viewBox="0 0 24 24"
+                              >
+                                <path
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  strokeWidth={2}
+                                  d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                                />
                               </svg>
                             </button>
                           )}
@@ -1660,26 +2497,59 @@ export function Accounts() {
                               className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${isLoadingKiroQuota ? "text-gray-300" : "text-gray-400 hover:text-blue-500"}`}
                               title="刷新额度"
                             >
-                              <svg className={`w-4 h-4 ${isLoadingKiroQuota ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                              <svg
+                                className={`w-4 h-4 ${isLoadingKiroQuota ? "animate-spin" : ""}`}
+                                fill="none"
+                                stroke="currentColor"
+                                viewBox="0 0 24 24"
+                              >
+                                <path
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  strokeWidth={2}
+                                  d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                                />
                               </svg>
                             </button>
                           )}
                           <button
-                            onClick={() => handleToggleEnabled(account.id, !account.enabled)}
-                            className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${account.enabled
-                              ? "text-gray-400 hover:text-orange-500"
-                              : "text-blue-500 hover:text-blue-600"
-                              }`}
+                            onClick={() =>
+                              handleToggleEnabled(account.id, !account.enabled)
+                            }
+                            className={`p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${
+                              account.enabled
+                                ? "text-gray-400 hover:text-orange-500"
+                                : "text-blue-500 hover:text-blue-600"
+                            }`}
                             title={account.enabled ? "禁用账号" : "启用账号"}
                           >
                             {account.enabled ? (
-                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+                              <svg
+                                className="w-4 h-4"
+                                fill="none"
+                                stroke="currentColor"
+                                viewBox="0 0 24 24"
+                              >
+                                <path
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  strokeWidth={2}
+                                  d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"
+                                />
                               </svg>
                             ) : (
-                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                              <svg
+                                className="w-4 h-4"
+                                fill="none"
+                                stroke="currentColor"
+                                viewBox="0 0 24 24"
+                              >
+                                <path
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  strokeWidth={2}
+                                  d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
+                                />
                               </svg>
                             )}
                           </button>
@@ -1688,8 +2558,18 @@ export function Accounts() {
                             className="p-1.5 rounded text-gray-400 hover:text-red-500 hover:bg-gray-100 dark:hover:bg-gray-700"
                             title="删除账号"
                           >
-                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                            <svg
+                              className="w-4 h-4"
+                              fill="none"
+                              stroke="currentColor"
+                              viewBox="0 0 24 24"
+                            >
+                              <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth={2}
+                                d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                              />
                             </svg>
                           </button>
                         </div>
@@ -1701,95 +2581,148 @@ export function Accounts() {
             )}
           </div>
         )}
-      </div>
-      {showProjectPrompt && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
-          <div className="w-full max-w-md rounded-lg bg-white dark:bg-gray-800 shadow-lg border border-gray-200 dark:border-gray-700 p-6">
-            <h4 className="text-lg font-semibold text-gray-800 dark:text-white">
-              输入 GCP 项目 ID
-            </h4>
-            <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
-              Gemini CLI 需要项目 ID 才能请求 Cloud Code Assist。
-            </p>
-            <input
-              type="text"
-              value={projectIdInput}
-              onChange={(e) => setProjectIdInput(e.target.value)}
-              placeholder="例如：my-gcp-project"
-              className="mt-4 w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-800 dark:text-white"
-              autoFocus
-            />
-            <div className="mt-6 flex justify-end gap-2">
-              <button
-                onClick={handleProjectCancel}
-                className="px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700"
-              >
-                取消
-              </button>
-              <button
-                onClick={handleProjectConfirm}
-                className="px-4 py-2 rounded-lg bg-blue-500 hover:bg-blue-600 text-white"
-              >
-                继续登录
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-      {showApiKeyModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
-          <div className="w-full max-w-md rounded-lg bg-white dark:bg-gray-800 shadow-lg border border-gray-200 dark:border-gray-700 p-6">
-            <h4 className="text-lg font-semibold text-gray-800 dark:text-white">
-              添加 {apiKeyProviderInfo?.label ?? "API"} 密钥
-            </h4>
-            <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
-              API Key 将保存在本地配置中，仅用于代理转发。
-            </p>
-            <div className="mt-4 space-y-3">
-              <div>
-                <label className="block text-sm text-gray-700 dark:text-gray-300 mb-1">
-                  备注（可选）
-                </label>
-                <input
-                  type="text"
-                  value={apiKeyLabel}
-                  onChange={(e) => setApiKeyLabel(e.target.value)}
-                  placeholder="例如：主账号 / 备用"
-                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-800 dark:text-white"
-                />
+
+        {codexDeviceFlow && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+            <div className="w-full max-w-md rounded-lg bg-white dark:bg-gray-800 shadow-lg border border-gray-200 dark:border-gray-700 p-6">
+              <h4 className="text-lg font-semibold text-gray-800 dark:text-white">
+                Codex 设备码登录
+              </h4>
+              <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
+                在验证页面输入下面的设备码，当前窗口会自动继续完成登录。
+              </p>
+              <div className="mt-4 rounded-xl border border-dashed border-green-300 dark:border-green-700 bg-green-50/70 dark:bg-green-950/30 px-4 py-3">
+                <div className="text-xs font-medium uppercase tracking-[0.2em] text-green-700 dark:text-green-400">
+                  User Code
+                </div>
+                <div className="mt-2 text-2xl font-black tracking-[0.25em] text-gray-900 dark:text-white">
+                  {codexDeviceFlow.user_code}
+                </div>
               </div>
-              <div>
-                <label className="block text-sm text-gray-700 dark:text-gray-300 mb-1">
-                  API Key
-                </label>
-                <input
-                  type="password"
-                  value={apiKeyInput}
-                  onChange={(e) => setApiKeyInput(e.target.value)}
-                  placeholder="请输入 API Key"
-                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-800 dark:text-white"
-                />
+              <div className="mt-4 space-y-2 text-sm text-gray-600 dark:text-gray-300">
+                <p>
+                  验证地址：
+                  <span className="ml-1 break-all text-blue-600 dark:text-blue-400">
+                    {codexDeviceFlow.verification_url}
+                  </span>
+                </p>
+                <p>{codexDeviceStatus}</p>
               </div>
-            </div>
-            <div className="mt-6 flex justify-end gap-2">
-              <button
-                onClick={closeApiKeyModal}
-                className="px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700"
-              >
-                取消
-              </button>
-              <button
-                onClick={handleSaveApiKey}
-                disabled={apiKeySaving}
-                className={`px-4 py-2 rounded-lg text-white ${apiKeySaving ? "bg-gray-400" : "bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600"
+              <div className="mt-6 flex justify-end gap-2">
+                <button
+                  onClick={() => open(codexDeviceFlow.verification_url)}
+                  className="px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700"
+                >
+                  重新打开验证页
+                </button>
+                <button
+                  onClick={closeCodexDeviceModal}
+                  disabled={codexDeviceWaiting}
+                  className={`px-4 py-2 rounded-lg text-white ${
+                    codexDeviceWaiting
+                      ? "bg-gray-400"
+                      : "bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600"
                   }`}
-              >
-                {apiKeySaving ? "保存中..." : "保存"}
-              </button>
+                >
+                  {codexDeviceWaiting ? "等待完成..." : "关闭"}
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
+        {showProjectPrompt && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+            <div className="w-full max-w-md rounded-lg bg-white dark:bg-gray-800 shadow-lg border border-gray-200 dark:border-gray-700 p-6">
+              <h4 className="text-lg font-semibold text-gray-800 dark:text-white">
+                输入 GCP 项目 ID
+              </h4>
+              <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
+                Gemini CLI 需要项目 ID 才能请求 Cloud Code Assist。
+              </p>
+              <input
+                type="text"
+                value={projectIdInput}
+                onChange={(e) => setProjectIdInput(e.target.value)}
+                placeholder="例如：my-gcp-project"
+                className="mt-4 w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-800 dark:text-white"
+                autoFocus
+              />
+              <div className="mt-6 flex justify-end gap-2">
+                <button
+                  onClick={handleProjectCancel}
+                  className="px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={handleProjectConfirm}
+                  className="px-4 py-2 rounded-lg bg-blue-500 hover:bg-blue-600 text-white"
+                >
+                  继续登录
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {showApiKeyModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+            <div className="w-full max-w-md rounded-lg bg-white dark:bg-gray-800 shadow-lg border border-gray-200 dark:border-gray-700 p-6">
+              <h4 className="text-lg font-semibold text-gray-800 dark:text-white">
+                添加 {apiKeyProviderInfo?.label ?? "API"} 密钥
+              </h4>
+              <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
+                API Key 将保存在本地配置中，仅用于代理转发。
+              </p>
+              <div className="mt-4 space-y-3">
+                <div>
+                  <label className="block text-sm text-gray-700 dark:text-gray-300 mb-1">
+                    备注（可选）
+                  </label>
+                  <input
+                    type="text"
+                    value={apiKeyLabel}
+                    onChange={(e) => setApiKeyLabel(e.target.value)}
+                    placeholder="例如：主账号 / 备用"
+                    className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-800 dark:text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm text-gray-700 dark:text-gray-300 mb-1">
+                    API Key
+                  </label>
+                  <input
+                    type="password"
+                    value={apiKeyInput}
+                    onChange={(e) => setApiKeyInput(e.target.value)}
+                    placeholder="请输入 API Key"
+                    className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-800 dark:text-white"
+                  />
+                </div>
+              </div>
+              <div className="mt-6 flex justify-end gap-2">
+                <button
+                  onClick={closeApiKeyModal}
+                  className="px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={handleSaveApiKey}
+                  disabled={apiKeySaving}
+                  className={`px-4 py-2 rounded-lg text-white ${
+                    apiKeySaving
+                      ? "bg-gray-400"
+                      : "bg-gray-800 hover:bg-gray-900 dark:bg-gray-700 dark:hover:bg-gray-600"
+                  }`}
+                >
+                  {apiKeySaving ? "保存中..." : "保存"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {/* Add closing div for the extra tag we added */}
+      </div>
     </>
   );
 }

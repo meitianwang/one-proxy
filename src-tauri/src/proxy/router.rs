@@ -1,7 +1,7 @@
 // Request router - selects credentials and routes requests
 
-use anyhow::Result;
 use crate::config;
+use anyhow::Result;
 
 pub struct CredentialSelector {
     strategy: RoutingStrategy,

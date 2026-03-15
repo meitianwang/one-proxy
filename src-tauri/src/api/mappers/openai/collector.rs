@@ -9,9 +9,7 @@ use std::collections::HashMap;
 use std::io;
 
 /// Collects an OpenAI SSE stream into a complete OpenAIResponse
-pub async fn collect_stream_to_json<S, E>(
-    mut stream: S,
-) -> Result<OpenAIResponse, String>
+pub async fn collect_stream_to_json<S, E>(mut stream: S) -> Result<OpenAIResponse, String>
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
@@ -71,45 +69,63 @@ where
                                 if let Some(r) = delta.get("role").and_then(|v| v.as_str()) {
                                     role = Some(r.to_string());
                                 }
-                                
+
                                 // Content
                                 if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
                                     content_parts.push(c.to_string());
                                 }
 
                                 // Reasoning Content
-                                if let Some(rc) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                                if let Some(rc) =
+                                    delta.get("reasoning_content").and_then(|v| v.as_str())
+                                {
                                     reasoning_parts.push(rc.to_string());
                                 }
 
                                 // Tool Calls aggregation by index
-                                if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                if let Some(tcs) =
+                                    delta.get("tool_calls").and_then(|v| v.as_array())
+                                {
                                     for tc in tcs {
-                                        let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                                        
-                                        let entry = tool_calls_map.entry(index).or_insert_with(|| {
-                                            (String::new(), String::from("function"), String::new(), Vec::new())
-                                        });
-                                        
+                                        let index =
+                                            tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
+                                                as u32;
+
+                                        let entry =
+                                            tool_calls_map.entry(index).or_insert_with(|| {
+                                                (
+                                                    String::new(),
+                                                    String::from("function"),
+                                                    String::new(),
+                                                    Vec::new(),
+                                                )
+                                            });
+
                                         if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
                                             if !id.is_empty() {
                                                 entry.0 = id.to_string();
                                             }
                                         }
-                                        
-                                        if let Some(tc_type) = tc.get("type").and_then(|v| v.as_str()) {
+
+                                        if let Some(tc_type) =
+                                            tc.get("type").and_then(|v| v.as_str())
+                                        {
                                             if !tc_type.is_empty() {
                                                 entry.1 = tc_type.to_string();
                                             }
                                         }
-                                        
+
                                         if let Some(func) = tc.get("function") {
-                                            if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                            if let Some(name) =
+                                                func.get("name").and_then(|v| v.as_str())
+                                            {
                                                 if !name.is_empty() {
                                                     entry.2 = name.to_string();
                                                 }
                                             }
-                                            if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                            if let Some(args) =
+                                                func.get("arguments").and_then(|v| v.as_str())
+                                            {
                                                 entry.3.push(args.to_string());
                                             }
                                         }
@@ -142,14 +158,17 @@ where
         let mut calls: Vec<(u32, ToolCall)> = tool_calls_map
             .into_iter()
             .map(|(index, (id, tc_type, name, args_parts))| {
-                (index, ToolCall {
-                    id,
-                    r#type: tc_type,
-                    function: ToolFunction {
-                        name,
-                        arguments: args_parts.join(""),
+                (
+                    index,
+                    ToolCall {
+                        id,
+                        r#type: tc_type,
+                        function: ToolFunction {
+                            name,
+                            arguments: args_parts.join(""),
+                        },
                     },
-                })
+                )
             })
             .collect();
         calls.sort_by_key(|(index, _)| *index);

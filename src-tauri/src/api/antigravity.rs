@@ -2,11 +2,11 @@ use anyhow::{anyhow, Result};
 use axum::response::sse::Event;
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
-use sha2::{Digest, Sha256};
 
 use super::{gemini, schema_cleaner};
 
@@ -34,18 +34,25 @@ impl AntigravityClient {
     }
 
     pub async fn generate_content(&self, payload: &Value, alt: Option<&str>) -> Result<Value> {
-        let response = self
-            .send_request(payload, false, alt)
-            .await?;
+        let response = self.send_request(payload, false, alt).await?;
         let body: Value = response.json().await?;
         Ok(body)
     }
 
-    pub async fn stream_generate_content(&self, payload: &Value, alt: Option<&str>) -> Result<reqwest::Response> {
+    pub async fn stream_generate_content(
+        &self,
+        payload: &Value,
+        alt: Option<&str>,
+    ) -> Result<reqwest::Response> {
         self.send_request(payload, true, alt).await
     }
 
-    async fn send_request(&self, payload: &Value, stream: bool, alt: Option<&str>) -> Result<reqwest::Response> {
+    async fn send_request(
+        &self,
+        payload: &Value,
+        stream: bool,
+        alt: Option<&str>,
+    ) -> Result<reqwest::Response> {
         let base_urls = [ANTIGRAVITY_BASE_URL_DAILY, ANTIGRAVITY_BASE_URL_SANDBOX];
         let path = if stream {
             ANTIGRAVITY_STREAM_PATH
@@ -94,7 +101,7 @@ impl AntigravityClient {
                     continue;
                 }
             };
-            
+
             if response.status().is_success() {
                 return Ok(response);
             }
@@ -114,14 +121,24 @@ impl AntigravityClient {
     }
 }
 
-pub fn openai_to_antigravity_request(raw: &Value, model: &str, project_id: Option<String>) -> Value {
+pub fn openai_to_antigravity_request(
+    raw: &Value,
+    model: &str,
+    project_id: Option<String>,
+) -> Value {
     // 尝试解析为 OpenAIRequest 结构体
-    if let Ok(openai_req) = serde_json::from_value::<crate::api::mappers::openai::models::OpenAIRequest>(raw.clone()) {
+    if let Ok(openai_req) =
+        serde_json::from_value::<crate::api::mappers::openai::models::OpenAIRequest>(raw.clone())
+    {
         // 使用新的 mapper 模块进行转换
         let proj_id = project_id.unwrap_or_else(generate_project_id);
-        return crate::api::mappers::openai::request::transform_openai_request(&openai_req, &proj_id, model);
+        return crate::api::mappers::openai::request::transform_openai_request(
+            &openai_req,
+            &proj_id,
+            model,
+        );
     }
-    
+
     // Fallback: 使用原有的转换逻辑
     let mut payload = gemini::openai_to_gemini_cli_request(raw, model);
 
@@ -133,7 +150,11 @@ pub fn openai_to_antigravity_request(raw: &Value, model: &str, project_id: Optio
     apply_antigravity_envelope(payload, model, project_id)
 }
 
-fn apply_antigravity_envelope(mut payload: Value, model: &str, project_id: Option<String>) -> Value {
+fn apply_antigravity_envelope(
+    mut payload: Value,
+    model: &str,
+    project_id: Option<String>,
+) -> Value {
     payload["model"] = json!(model);
     payload["userAgent"] = json!("antigravity");
     payload["requestType"] = json!("agent");
@@ -149,7 +170,12 @@ fn apply_antigravity_envelope(mut payload: Value, model: &str, project_id: Optio
         }
     }
 
-    if payload.get("toolConfig").is_some() && payload.get("request").and_then(|v| v.get("toolConfig")).is_none() {
+    if payload.get("toolConfig").is_some()
+        && payload
+            .get("request")
+            .and_then(|v| v.get("toolConfig"))
+            .is_none()
+    {
         let tool_config = payload.get("toolConfig").cloned().unwrap_or(Value::Null);
         payload["request"]["toolConfig"] = tool_config;
         if let Some(obj) = payload.as_object_mut() {
@@ -225,7 +251,11 @@ fn clean_tool_schemas(payload: &mut Value, use_antigravity_schema: bool) {
 }
 
 fn ensure_generation_config(payload: &mut Value) {
-    if !payload.get("request").and_then(|v| v.get("generationConfig")).is_some() {
+    if !payload
+        .get("request")
+        .and_then(|v| v.get("generationConfig"))
+        .is_some()
+    {
         payload["request"]["generationConfig"] = json!({});
     }
 }
@@ -364,8 +394,7 @@ pub fn antigravity_stream_to_openai_chunks(
 pub fn antigravity_stream_to_openai_events(
     response: reqwest::Response,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    antigravity_stream_to_openai_chunks(response)
-        .map(|chunk| Ok(Event::default().data(chunk)))
+    antigravity_stream_to_openai_chunks(response).map(|chunk| Ok(Event::default().data(chunk)))
 }
 
 pub async fn collect_antigravity_stream(response: reqwest::Response) -> Result<Value> {
@@ -475,9 +504,18 @@ fn convert_antigravity_stream_chunk(data: &str, state: &mut AntigravityStreamSta
         if let Some(total) = usage.get("totalTokenCount").and_then(|v| v.as_i64()) {
             template["usage"]["total_tokens"] = json!(total);
         }
-        let cached = usage.get("cachedContentTokenCount").and_then(|v| v.as_i64()).unwrap_or(0);
-        let prompt = usage.get("promptTokenCount").and_then(|v| v.as_i64()).unwrap_or(0);
-        let thoughts = usage.get("thoughtsTokenCount").and_then(|v| v.as_i64()).unwrap_or(0);
+        let cached = usage
+            .get("cachedContentTokenCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let prompt = usage
+            .get("promptTokenCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let thoughts = usage
+            .get("thoughtsTokenCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         template["usage"]["prompt_tokens"] = json!(prompt - cached + thoughts);
         if thoughts > 0 {
             template["usage"]["completion_tokens_details"]["reasoning_tokens"] = json!(thoughts);
@@ -515,7 +553,11 @@ fn convert_antigravity_stream_chunk(data: &str, state: &mut AntigravityStreamSta
             }
 
             if let Some(text) = part_text {
-                if part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if part
+                    .get("thought")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     template["choices"][0]["delta"]["reasoning_content"] = json!(text);
                 } else {
                     template["choices"][0]["delta"]["content"] = json!(text);
@@ -603,7 +645,10 @@ fn convert_antigravity_stream_chunk(data: &str, state: &mut AntigravityStreamSta
             }
 
             if let Some(inline_data) = inline_data {
-                let data = inline_data.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                let data = inline_data
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if data.is_empty() {
                     continue;
                 }
@@ -666,9 +711,9 @@ fn convert_stream_payloads_to_non_stream(payloads: &[Value]) -> Value {
     let mut pending_thought_sig = String::new();
 
     let flush_pending = |parts: &mut Vec<Value>,
-                             pending_kind: &mut Option<&'static str>,
-                             pending_text: &mut String,
-                             pending_thought_sig: &mut String| {
+                         pending_kind: &mut Option<&'static str>,
+                         pending_text: &mut String,
+                         pending_thought_sig: &mut String| {
         let kind = pending_kind.take();
         if kind.is_none() {
             return;
@@ -773,7 +818,10 @@ fn convert_stream_payloads_to_non_stream(payloads: &[Value]) -> Value {
                     .unwrap_or("")
                     .to_string();
                 let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                let thought = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
+                let thought = part
+                    .get("thought")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
 
                 if has_function_call || has_inline_data {
                     flush_pending(

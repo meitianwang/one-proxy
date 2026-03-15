@@ -2,7 +2,12 @@
 // This implementation matches CLIProxyAPI exactly for compatibility
 
 use anyhow::Result;
-use axum::{extract::Query, response::{Html, IntoResponse}, Router, routing::get};
+use axum::{
+    extract::Query,
+    response::{Html, IntoResponse},
+    routing::get,
+    Router,
+};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -15,7 +20,8 @@ const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json";
 
 // OAuth configuration constants - same as CLIProxyAPI
-pub const GOOGLE_CLIENT_ID: &str = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
+pub const GOOGLE_CLIENT_ID: &str =
+    "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
 pub const GOOGLE_CLIENT_SECRET: &str = "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";
 const OAUTH_CALLBACK_PORT: u16 = 8085;
 const REDIRECT_URI: &str = "http://localhost:8085/oauth2callback";
@@ -189,9 +195,7 @@ pub async fn start_oauth_with_callback() -> Result<OAuthResult> {
     let state_clone = callback_state.clone();
     let callback_handler = move |Query(params): Query<OAuthCallbackParams>| {
         let state = state_clone.clone();
-        async move {
-            handle_callback(params, state).await
-        }
+        async move { handle_callback(params, state).await }
     };
 
     // Build router
@@ -218,9 +222,7 @@ pub async fn start_oauth_with_callback() -> Result<OAuthResult> {
     // Open browser using system command
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open")
-            .arg(&auth_url)
-            .spawn();
+        let _ = std::process::Command::new("open").arg(&auth_url).spawn();
     }
     #[cfg(target_os = "windows")]
     {
@@ -354,7 +356,9 @@ async fn handle_callback(
         Some(c) => c,
         None => {
             if let Some(tx) = state.write().result_tx.take() {
-                let _ = tx.send(Err(anyhow::anyhow!("Authentication failed: code not found")));
+                let _ = tx.send(Err(anyhow::anyhow!(
+                    "Authentication failed: code not found"
+                )));
             }
             return Html(ERROR_HTML.replace("{{ERROR}}", "Authentication failed: code not found"));
         }
@@ -415,11 +419,7 @@ async fn exchange_code_internal(code: &str) -> Result<TokenResponse> {
         ("redirect_uri", REDIRECT_URI),
     ];
 
-    let response = client
-        .post(GOOGLE_TOKEN_URL)
-        .form(&params)
-        .send()
-        .await?;
+    let response = client.post(GOOGLE_TOKEN_URL).form(&params).send().await?;
 
     if !response.status().is_success() {
         let error_text = response.text().await?;
@@ -463,11 +463,7 @@ pub async fn refresh_token(refresh_token: &str) -> Result<TokenResponse> {
         ("grant_type", "refresh_token"),
     ];
 
-    let response = client
-        .post(GOOGLE_TOKEN_URL)
-        .form(&params)
-        .send()
-        .await?;
+    let response = client.post(GOOGLE_TOKEN_URL).form(&params).send().await?;
 
     if !response.status().is_success() {
         let error_text = response.text().await?;
@@ -523,7 +519,10 @@ struct BucketInfo {
 }
 
 /// Fetch Gemini quota data
-pub async fn fetch_gemini_quota(access_token: &str, project_id: Option<&str>) -> Result<GeminiQuotaData> {
+pub async fn fetch_gemini_quota(
+    access_token: &str,
+    project_id: Option<&str>,
+) -> Result<GeminiQuotaData> {
     let client = reqwest::Client::new();
 
     let body = serde_json::json!({
@@ -552,7 +551,8 @@ pub async fn fetch_gemini_quota(access_token: &str, project_id: Option<&str>) ->
 
     let data: GeminiQuotaResponse = response.json().await?;
 
-    let models = data.buckets
+    let models = data
+        .buckets
         .unwrap_or_default()
         .into_iter()
         .filter(|b| b.token_type.as_deref() == Some("REQUESTS"))

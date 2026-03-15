@@ -8,9 +8,9 @@ pub mod db;
 pub mod proxy;
 
 use tauri::{
-    Manager,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Manager,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -21,7 +21,7 @@ pub fn run() {
         .with(tracing_subscriber::fmt::layer())
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
@@ -69,6 +69,8 @@ pub fn run() {
             commands::stop_server,
             commands::get_server_status,
             commands::start_oauth_login,
+            commands::start_codex_device_login,
+            commands::finish_codex_device_login,
             commands::save_api_key_account,
             commands::delete_account,
             commands::set_account_enabled,
@@ -82,6 +84,7 @@ pub fn run() {
             commands::export_accounts_to_file,
             commands::import_accounts_from_file,
             commands::get_cached_quotas,
+            commands::get_codex_routing_statuses,
             commands::get_settings,
             commands::save_settings,
             commands::get_request_logs,
@@ -124,39 +127,37 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let _tray = TrayIconBuilder::new()
         .menu(&menu)
         .tooltip("CLI Proxy API")
-        .on_menu_event(|app, event| {
-            match event.id.as_ref() {
-                "show" => {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
                 }
-                "hide" => {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.hide();
-                    }
-                }
-                "start" => {
-                    let handle = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(e) = crate::api::start_server(handle).await {
-                            tracing::error!("Failed to start server: {}", e);
-                        }
-                    });
-                }
-                "stop" => {
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(e) = crate::api::stop_server().await {
-                            tracing::error!("Failed to stop server: {}", e);
-                        }
-                    });
-                }
-                "quit" => {
-                    app.exit(0);
-                }
-                _ => {}
             }
+            "hide" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
+            "start" => {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = crate::api::start_server(handle).await {
+                        tracing::error!("Failed to start server: {}", e);
+                    }
+                });
+            }
+            "stop" => {
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = crate::api::stop_server().await {
+                        tracing::error!("Failed to stop server: {}", e);
+                    }
+                });
+            }
+            "quit" => {
+                app.exit(0);
+            }
+            _ => {}
         })
         .on_tray_icon_event(|tray, event| {
             // Show window on left click

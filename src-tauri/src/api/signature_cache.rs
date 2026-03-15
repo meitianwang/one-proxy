@@ -61,11 +61,14 @@ impl SignatureCache {
         if signature.len() < MIN_SIGNATURE_LENGTH {
             return;
         }
-        
+
         if let Ok(mut cache) = self.tool_signatures.lock() {
-            tracing::debug!("[SignatureCache] Caching tool signature for id: {}", tool_use_id);
+            tracing::debug!(
+                "[SignatureCache] Caching tool signature for id: {}",
+                tool_use_id
+            );
             cache.insert(tool_use_id.to_string(), CacheEntry::new(signature));
-            
+
             if cache.len() > TOOL_CACHE_LIMIT {
                 cache.retain(|_, v| !v.is_expired());
             }
@@ -90,7 +93,7 @@ impl SignatureCache {
 
         if let Ok(mut cache) = self.thinking_families.lock() {
             cache.insert(signature, CacheEntry::new(family));
-            
+
             if cache.len() > FAMILY_CACHE_LIMIT {
                 cache.retain(|_, v| !v.is_expired());
             }
@@ -108,7 +111,12 @@ impl SignatureCache {
         None
     }
 
-    pub fn cache_session_signature(&self, session_id: &str, signature: String, message_count: usize) {
+    pub fn cache_session_signature(
+        &self,
+        session_id: &str,
+        signature: String,
+        message_count: usize,
+    ) {
         if signature.len() < MIN_SIGNATURE_LENGTH {
             return;
         }
@@ -131,11 +139,11 @@ impl SignatureCache {
 
             if should_store {
                 cache.insert(
-                    session_id.to_string(), 
-                    CacheEntry::new(SessionSignatureEntry { 
-                        signature, 
-                        message_count 
-                    })
+                    session_id.to_string(),
+                    CacheEntry::new(SessionSignatureEntry {
+                        signature,
+                        message_count,
+                    }),
                 );
             }
 

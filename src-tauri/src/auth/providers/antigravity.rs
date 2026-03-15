@@ -13,8 +13,14 @@ use std::collections::HashMap;
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json";
-const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-const CLIENT_SECRET: &str = "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";
+fn get_client_id() -> String {
+    std::env::var("ANTIGRAVITY_CLIENT_ID")
+        .unwrap_or_else(|_| include_str!("../../../credentials/antigravity.txt").lines().next().unwrap_or_default().to_string())
+}
+fn get_client_secret() -> String {
+    std::env::var("ANTIGRAVITY_CLIENT_SECRET")
+        .unwrap_or_else(|_| include_str!("../../../credentials/antigravity.txt").lines().nth(1).unwrap_or_default().to_string())
+}
 fn get_redirect_uri() -> String {
     let config = crate::config::get_config().unwrap_or_default();
     format!("http://localhost:{}/antigravity/callback", config.port)
@@ -111,7 +117,7 @@ pub async fn start_oauth() -> Result<String> {
     let auth_url = format!(
         "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}&code_challenge={}&code_challenge_method=S256",
         AUTH_URL,
-        CLIENT_ID,
+        get_client_id(),
         urlencoding::encode(&redirect_uri),
         urlencoding::encode(&scopes),
         state,
@@ -132,20 +138,18 @@ pub async fn exchange_code(code: &str, state: &str) -> Result<TokenResponse> {
     let client = reqwest::Client::new();
 
     let redirect_uri = get_redirect_uri();
+    let client_id = get_client_id();
+    let client_secret = get_client_secret();
     let params = [
-        ("client_id", CLIENT_ID),
-        ("client_secret", CLIENT_SECRET),
+        ("client_id", client_id.as_str()),
+        ("client_secret", client_secret.as_str()),
         ("code", code),
         ("code_verifier", &session.code_verifier),
         ("grant_type", "authorization_code"),
         ("redirect_uri", redirect_uri.as_str()),
     ];
 
-    let response = client
-        .post(TOKEN_URL)
-        .form(&params)
-        .send()
-        .await?;
+    let response = client.post(TOKEN_URL).form(&params).send().await?;
 
     if !response.status().is_success() {
         let error_text = response.text().await?;
@@ -181,18 +185,16 @@ pub async fn get_user_info(access_token: &str) -> Result<UserInfo> {
 pub async fn refresh_token(refresh_token: &str) -> Result<TokenResponse> {
     let client = reqwest::Client::new();
 
+    let client_id = get_client_id();
+    let client_secret = get_client_secret();
     let params = [
-        ("client_id", CLIENT_ID),
-        ("client_secret", CLIENT_SECRET),
+        ("client_id", client_id.as_str()),
+        ("client_secret", client_secret.as_str()),
         ("refresh_token", refresh_token),
         ("grant_type", "refresh_token"),
     ];
 
-    let response = client
-        .post(TOKEN_URL)
-        .form(&params)
-        .send()
-        .await?;
+    let response = client.post(TOKEN_URL).form(&params).send().await?;
 
     if !response.status().is_success() {
         let error_text = response.text().await?;
@@ -297,11 +299,7 @@ async fn onboard_user(access_token: &str, tier_id: &str) -> Result<String> {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             continue;
         }
-        return Err(anyhow::anyhow!(
-            "onboardUser failed: {} {}",
-            status,
-            text
-        ));
+        return Err(anyhow::anyhow!("onboardUser failed: {} {}", status, text));
     }
 
     Err(anyhow::anyhow!("onboardUser did not complete"))
@@ -326,21 +324,27 @@ fn extract_project_id(value: &serde_json::Value) -> Option<String> {
 }
 
 fn extract_default_tier(value: &serde_json::Value) -> Option<String> {
-    value.get("allowedTiers").and_then(|tiers| tiers.as_array()).and_then(|tiers| {
-        for tier in tiers {
-            let is_default = tier.get("isDefault").and_then(|v| v.as_bool()).unwrap_or(false);
-            if !is_default {
-                continue;
-            }
-            if let Some(id) = tier.get("id").and_then(|v| v.as_str()) {
-                let id = id.trim();
-                if !id.is_empty() {
-                    return Some(id.to_string());
+    value
+        .get("allowedTiers")
+        .and_then(|tiers| tiers.as_array())
+        .and_then(|tiers| {
+            for tier in tiers {
+                let is_default = tier
+                    .get("isDefault")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !is_default {
+                    continue;
+                }
+                if let Some(id) = tier.get("id").and_then(|v| v.as_str()) {
+                    let id = id.trim();
+                    if !id.is_empty() {
+                        return Some(id.to_string());
+                    }
                 }
             }
-        }
-        None
-    })
+            None
+        })
 }
 
 /// Clean up OAuth sessions older than 10 minutes
@@ -356,8 +360,10 @@ pub fn get_pending_session(state: &str) -> Option<OAuthSession> {
 }
 
 // Quota API
-const QUOTA_API_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels";
-const LOAD_CODE_ASSIST_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist";
+const QUOTA_API_URL: &str =
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels";
+const LOAD_CODE_ASSIST_URL: &str =
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist";
 const QUOTA_USER_AGENT: &str = "antigravity/1.0.0 macos/aarch64";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -414,7 +420,9 @@ struct TierInfo {
 }
 
 /// Fetch project ID and subscription tier
-pub async fn fetch_project_and_tier(access_token: &str) -> Result<(Option<String>, Option<String>)> {
+pub async fn fetch_project_and_tier(
+    access_token: &str,
+) -> Result<(Option<String>, Option<String>)> {
     let client = reqwest::Client::new();
     let body = serde_json::json!({
         "metadata": {
@@ -443,7 +451,8 @@ pub async fn fetch_project_and_tier(access_token: &str) -> Result<(Option<String
     let project_id = load_resp.project_id;
 
     // Priority: paid_tier > current_tier
-    let subscription_tier = load_resp.paid_tier
+    let subscription_tier = load_resp
+        .paid_tier
         .and_then(|t| t.id)
         .or_else(|| load_resp.current_tier.and_then(|t| t.id));
 
@@ -451,12 +460,16 @@ pub async fn fetch_project_and_tier(access_token: &str) -> Result<(Option<String
 }
 
 /// Fetch quota for an Antigravity account
-pub async fn fetch_quota(access_token: &str, cached_project_id: Option<&str>, _cached_subscription_tier: Option<&str>) -> Result<QuotaData> {
+pub async fn fetch_quota(
+    access_token: &str,
+    cached_project_id: Option<&str>,
+    _cached_subscription_tier: Option<&str>,
+) -> Result<QuotaData> {
     // Always fetch fresh project_id and subscription_tier from API
     // This ensures we get the latest subscription status (FREE/PRO) when user upgrades
     // Note: We ignore cached_subscription_tier and always fetch fresh data
     let (api_project_id, subscription_tier) = fetch_project_and_tier(access_token).await?;
-    
+
     // Use cached project_id if available (for performance), but always use fresh subscription_tier
     let project_id = if cached_project_id.is_some() {
         cached_project_id.map(|s| s.to_string())
@@ -464,7 +477,9 @@ pub async fn fetch_quota(access_token: &str, cached_project_id: Option<&str>, _c
         api_project_id.clone()
     };
 
-    let final_project_id = project_id.clone().unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
+    let final_project_id = project_id
+        .clone()
+        .unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
 
     let client = reqwest::Client::new();
     let body = serde_json::json!({
@@ -509,7 +524,8 @@ pub async fn fetch_quota(access_token: &str, cached_project_id: Option<&str>, _c
             }
 
             if let Some(quota_info) = info.quota_info {
-                let percentage = quota_info.remaining_fraction
+                let percentage = quota_info
+                    .remaining_fraction
                     .map(|f| (f * 100.0) as i32)
                     .unwrap_or(0);
 

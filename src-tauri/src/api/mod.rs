@@ -17,21 +17,23 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 
-mod handlers;
 pub mod antigravity;
-pub mod kiro;
-mod schema_cleaner;
 pub mod claude;
 pub mod codex;
-pub mod gemini;
-mod mime_types;
-pub mod management;
-pub mod streaming;
-pub mod model_router;
-pub mod mappers;
 pub mod common;
-pub mod signature_cache;
 pub mod config;
+pub mod gemini;
+mod handlers;
+pub mod kiro;
+pub mod management;
+pub mod mappers;
+mod mime_types;
+pub mod model_router;
+mod schema_cleaner;
+pub mod signature_cache;
+pub mod streaming;
+
+pub use handlers::{get_codex_routing_statuses, CodexRoutingStatusSnapshot};
 
 static SERVER_HANDLE: OnceCell<RwLock<Option<oneshot::Sender<()>>>> = OnceCell::new();
 
@@ -42,7 +44,10 @@ pub struct AppState {
 
 /// Determine protocol from request path
 fn protocol_from_path(path: &str) -> Option<String> {
-    if path.starts_with("/v1/chat/completions") || path.starts_with("/v1/completions") || path.starts_with("/v1/models") {
+    if path.starts_with("/v1/chat/completions")
+        || path.starts_with("/v1/completions")
+        || path.starts_with("/v1/models")
+    {
         Some("openai".to_string())
     } else if path.starts_with("/v1/messages") {
         Some("anthropic".to_string())
@@ -52,7 +57,6 @@ fn protocol_from_path(path: &str) -> Option<String> {
         None
     }
 }
-
 
 /// Internal header name for passing account_id from handlers to logging middleware
 /// This header will be stripped before sending response to client
@@ -66,11 +70,12 @@ pub const X_ONEPROXY_PROVIDER: &str = "x-oneproxy-provider";
 /// This header will be stripped before sending response to client
 pub const X_ONEPROXY_MODEL: &str = "x-oneproxy-model";
 
-
 /// Extract model name from request body JSON
 fn extract_model_from_body(body: &[u8]) -> Option<String> {
     let json: serde_json::Value = serde_json::from_slice(body).ok()?;
-    json.get("model").and_then(|v| v.as_str()).map(|s| s.to_string())
+    json.get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Normalize model name by removing provider prefix (e.g., "antigravity/claude-3.5" -> "claude-3.5")
@@ -87,7 +92,7 @@ fn normalize_model_name(model: &str) -> String {
         "glm/",
         "deepseek/",
     ];
-    
+
     let lower = model.to_lowercase();
     for prefix in PREFIXES {
         if lower.starts_with(prefix) {
@@ -108,7 +113,7 @@ fn extract_model_from_gemini_path(path: &str) -> Option<String> {
     } else {
         return None;
     };
-    
+
     let after_models = path.split(models_prefix).nth(1)?;
     // Remove the action suffix like ":generateContent" or ":streamGenerateContent"
     let model = after_models.split(':').next()?;
@@ -118,7 +123,6 @@ fn extract_model_from_gemini_path(path: &str) -> Option<String> {
         Some(model.to_string())
     }
 }
-
 
 fn should_verbose_log() -> bool {
     if let Some(config) = crate::config::get_config() {
@@ -270,8 +274,8 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
             }
         };
 
-        let model = extract_model_from_body(&bytes)
-            .or_else(|| extract_model_from_gemini_path(&path));
+        let model =
+            extract_model_from_body(&bytes).or_else(|| extract_model_from_gemini_path(&path));
 
         if verbose {
             log_request_body(&method, &path, &bytes);
@@ -280,45 +284,48 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
         // Reconstruct the request with the buffered body
         let request = Request::from_parts(parts, Body::from(bytes.to_vec()));
         let mut response = next.run(request).await;
-        
+
         // Extract and remove internal account_id header
-        let account_id = response.headers()
+        let account_id = response
+            .headers()
             .get(X_ONEPROXY_ACCOUNT_ID)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         response.headers_mut().remove(X_ONEPROXY_ACCOUNT_ID);
-        
+
         // Extract and remove internal provider header
-        let provider = response.headers()
+        let provider = response
+            .headers()
             .get(X_ONEPROXY_PROVIDER)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         response.headers_mut().remove(X_ONEPROXY_PROVIDER);
-        
+
         // Extract and remove internal model header (prefer this over request body model)
-        let handler_model = response.headers()
+        let handler_model = response
+            .headers()
             .get(X_ONEPROXY_MODEL)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         response.headers_mut().remove(X_ONEPROXY_MODEL);
-        
+
         // Use handler-provided model if available, otherwise fall back to request body
         let final_model = handler_model.or(model);
         // Normalize model name (remove provider prefix) for consistent logging
         let normalized_model = final_model.map(|m| normalize_model_name(&m));
-        
+
         let response = log_response_if_needed(&method, &path, response, verbose).await;
 
         let protocol = protocol_from_path(&path);
         let duration_ms = start.elapsed().as_millis() as i64;
         let status = response.status().as_u16() as i32;
-        
+
         let error_message = if status >= 400 {
             Some(format!("HTTP {}", status))
         } else {
             None
         };
-        
+
         let _ = crate::db::save_request_log(
             status,
             &method,
@@ -332,7 +339,7 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
             duration_ms,
             error_message.as_deref(),
         );
-        
+
         return response;
     }
 
@@ -340,21 +347,23 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
         log_request_body(&method, &path, &[]);
     }
     let mut response = next.run(request).await;
-    
+
     // Extract and remove internal account_id header
-    let account_id = response.headers()
+    let account_id = response
+        .headers()
         .get(X_ONEPROXY_ACCOUNT_ID)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     response.headers_mut().remove(X_ONEPROXY_ACCOUNT_ID);
-    
+
     // Extract and remove internal provider header
-    let provider = response.headers()
+    let provider = response
+        .headers()
         .get(X_ONEPROXY_PROVIDER)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     response.headers_mut().remove(X_ONEPROXY_PROVIDER);
-    
+
     let response = log_response_if_needed(&method, &path, response, verbose).await;
 
     let protocol = protocol_from_path(&path);
@@ -383,9 +392,6 @@ async fn logging_middleware(request: Request<Body>, next: Next) -> Response {
 
     response
 }
-
-
-
 
 /// API Key authentication middleware
 async fn auth_middleware(request: Request<Body>, next: Next) -> Response {
@@ -479,7 +485,13 @@ pub async fn start_server(app_handle: tauri::AppHandle) -> Result<()> {
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers(Any);
 
     // Routes that require API key authentication
@@ -487,15 +499,28 @@ pub async fn start_server(app_handle: tauri::AppHandle) -> Result<()> {
         .route("/v1/models", get(handlers::openai_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/v1/completions", post(handlers::completions))
+        .route(
+            "/v1/responses",
+            get(handlers::responses_websocket).post(handlers::responses),
+        )
         .route("/v1/messages", post(handlers::claude_messages))
-        .route("/v1/messages/count_tokens", post(handlers::claude_count_tokens))
+        .route(
+            "/v1/messages/count_tokens",
+            post(handlers::claude_count_tokens),
+        )
         // Gemini protocol routes (both with and without /gemini prefix)
         .route("/v1beta/models", get(handlers::gemini_models))
         .route("/v1beta/models/*action", post(handlers::gemini_handler))
         .route("/v1beta/models/*action", get(handlers::gemini_get_handler))
         .route("/gemini/v1beta/models", get(handlers::gemini_models))
-        .route("/gemini/v1beta/models/*action", post(handlers::gemini_handler))
-        .route("/gemini/v1beta/models/*action", get(handlers::gemini_get_handler))
+        .route(
+            "/gemini/v1beta/models/*action",
+            post(handlers::gemini_handler),
+        )
+        .route(
+            "/gemini/v1beta/models/*action",
+            get(handlers::gemini_get_handler),
+        )
         .layer(middleware::from_fn(auth_middleware))
         .layer(middleware::from_fn(logging_middleware));
 
@@ -510,9 +535,18 @@ pub async fn start_server(app_handle: tauri::AppHandle) -> Result<()> {
         .route("/antigravity/callback", get(handlers::antigravity_callback))
         // Management API (internal use)
         .route("/management/auth-files", get(management::list_auth_files))
-        .route("/management/auth-files", delete(management::delete_auth_file))
-        .route("/management/auth-files/status", patch(management::patch_auth_status))
-        .route("/management/auth-summary", get(management::get_auth_summary))
+        .route(
+            "/management/auth-files",
+            delete(management::delete_auth_file),
+        )
+        .route(
+            "/management/auth-files/status",
+            patch(management::patch_auth_status),
+        )
+        .route(
+            "/management/auth-summary",
+            get(management::get_auth_summary),
+        )
         .route("/management/accounts", get(management::list_accounts))
         .route("/management/config", get(management::get_config))
         .route("/management/config", put(management::update_config))
@@ -528,7 +562,10 @@ pub async fn start_server(app_handle: tauri::AppHandle) -> Result<()> {
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            tracing::warn!("Port {} is in use, killing existing process...", config.port);
+            tracing::warn!(
+                "Port {} is in use, killing existing process...",
+                config.port
+            );
             kill_process_on_port(config.port);
             tokio::net::TcpListener::bind(&addr).await?
         }

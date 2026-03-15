@@ -65,10 +65,7 @@ static MODEL_NAME_ALIASES: &[(&str, &str, &str)] = &[
 #[derive(Debug, Clone)]
 pub enum ResolvedModel {
     /// Model with explicit provider prefix
-    Explicit {
-        provider: String,
-        model: String,
-    },
+    Explicit { provider: String, model: String },
     /// Model resolved through aggregation (no prefix, found provider)
     Aggregated {
         provider: String,
@@ -77,38 +74,36 @@ pub enum ResolvedModel {
         fallbacks: Vec<String>,
     },
     /// No provider found (in provider mode without prefix)
-    NoProvider {
-        model: String,
-    },
+    NoProvider { model: String },
 }
 
 /// Normalize model names to unify different naming conventions
 /// e.g., "claude-sonnet-4.5" and "claude-sonnet-4-5" are the same model
 fn normalize_model_name(name: &str) -> String {
     let normalized = name.to_lowercase();
-    
+
     // Normalize version separators: 4.5 -> 4-5, 4_5 -> 4-5
-    normalized
-        .replace(".", "-")
-        .replace("_", "-")
+    normalized.replace(".", "-").replace("_", "-")
 }
 
 /// Get supported providers for a model name
 pub fn get_providers_for_model(model: &str) -> Vec<String> {
     // Strip reasoning effort prefix if present (e.g., "high/gemini-3-flash" -> "gemini-3-flash")
     let model_stripped = strip_reasoning_prefix(model);
-    
+
     // Normalize the input model name first
     let model_normalized = normalize_model_name(&model_stripped);
-    
+
     // Check exact matches first
     for (pattern, providers) in MODEL_PROVIDER_MAP {
         let pattern_normalized = normalize_model_name(pattern);
-        if model_normalized == pattern_normalized || model_normalized.starts_with(&format!("{}-", pattern_normalized)) {
+        if model_normalized == pattern_normalized
+            || model_normalized.starts_with(&format!("{}-", pattern_normalized))
+        {
             return providers.iter().map(|s| s.to_string()).collect();
         }
     }
-    
+
     // Check prefix matches
     for (pattern, providers) in MODEL_PROVIDER_MAP {
         let pattern_normalized = normalize_model_name(pattern);
@@ -116,18 +111,25 @@ pub fn get_providers_for_model(model: &str) -> Vec<String> {
             return providers.iter().map(|s| s.to_string()).collect();
         }
     }
-    
+
     // Try to infer from model name
     if model_normalized.starts_with("claude-") {
-        return vec!["kiro".to_string(), "antigravity".to_string(), "claude".to_string()];
+        return vec![
+            "kiro".to_string(),
+            "antigravity".to_string(),
+            "claude".to_string(),
+        ];
     }
     if model_normalized.starts_with("gemini-") {
         return vec!["gemini".to_string(), "antigravity".to_string()];
     }
-    if model_normalized.starts_with("gpt-") || model_normalized.starts_with("o3") || model_normalized.starts_with("o4") {
+    if model_normalized.starts_with("gpt-")
+        || model_normalized.starts_with("o3")
+        || model_normalized.starts_with("o4")
+    {
         return vec!["codex".to_string()];
     }
-    
+
     Vec::new()
 }
 
@@ -136,13 +138,13 @@ pub fn get_providers_for_model(model: &str) -> Vec<String> {
 fn strip_reasoning_prefix(model: &str) -> String {
     let reasoning_prefixes = ["low/", "medium/", "high/", "xhigh/"];
     let model_lower = model.to_lowercase();
-    
+
     for prefix in &reasoning_prefixes {
         if model_lower.starts_with(prefix) {
             return model[prefix.len()..].to_string();
         }
     }
-    
+
     model.to_string()
 }
 
@@ -165,10 +167,10 @@ pub fn is_aggregation_mode() -> bool {
 pub fn get_provider_model_name(normalized_model: &str, provider: &str) -> String {
     // Extract reasoning prefix if present
     let (reasoning_prefix, base_model) = extract_reasoning_prefix(normalized_model);
-    
+
     // Normalize the base model
     let normalized = normalize_model_name(&base_model);
-    
+
     // Look for an alias
     for (model, prov, actual) in MODEL_NAME_ALIASES {
         if normalize_model_name(model) == normalized && *prov == provider {
@@ -180,7 +182,7 @@ pub fn get_provider_model_name(normalized_model: &str, provider: &str) -> String
             };
         }
     }
-    
+
     // No alias found, return the original model name (with prefix if present)
     normalized_model.to_string()
 }
@@ -189,19 +191,19 @@ pub fn get_provider_model_name(normalized_model: &str, provider: &str) -> String
 /// Returns (Some(prefix), base_model) or (None, original_model)
 fn extract_reasoning_prefix(model: &str) -> (Option<String>, String) {
     let reasoning_prefixes = ["low", "medium", "high", "xhigh"];
-    
+
     if let Some((prefix, rest)) = model.split_once('/') {
         let prefix_lower = prefix.to_lowercase();
         if reasoning_prefixes.contains(&prefix_lower.as_str()) {
             return (Some(prefix.to_string()), rest.to_string());
         }
     }
-    
+
     (None, model.to_string())
 }
 
 /// Resolve a model name to provider and model, considering routing mode
-/// 
+///
 /// In provider mode: requires explicit prefix, returns NoProvider if missing
 /// In model mode: automatically finds best provider based on quota
 pub fn resolve_model(raw_model: &str, explicit_provider: Option<&str>) -> ResolvedModel {
@@ -212,16 +214,16 @@ pub fn resolve_model(raw_model: &str, explicit_provider: Option<&str>) -> Resolv
             model: raw_model.to_string(),
         };
     }
-    
+
     let config = get_config().unwrap_or_default();
-    
+
     // In provider mode, require explicit prefix
     if config.model_routing.mode != "model" {
         return ResolvedModel::NoProvider {
             model: raw_model.to_string(),
         };
     }
-    
+
     // In model aggregation mode, find providers
     let available_providers = get_providers_for_model(raw_model);
     if available_providers.is_empty() {
@@ -229,34 +231,34 @@ pub fn resolve_model(raw_model: &str, explicit_provider: Option<&str>) -> Resolv
             model: raw_model.to_string(),
         };
     }
-    
+
     // Get priorities and filter to enabled providers that support this model
     let priorities = get_sorted_priorities();
     let mut ordered_providers: Vec<String> = Vec::new();
-    
+
     for priority in &priorities {
         if priority.enabled && available_providers.contains(&priority.provider) {
             ordered_providers.push(priority.provider.clone());
         }
     }
-    
+
     // Add any remaining providers not in priorities
     for provider in &available_providers {
         if !ordered_providers.contains(provider) {
             ordered_providers.push(provider.clone());
         }
     }
-    
+
     if ordered_providers.is_empty() {
         return ResolvedModel::NoProvider {
             model: raw_model.to_string(),
         };
     }
-    
+
     let primary = ordered_providers.remove(0);
     // Convert the normalized model name to the provider-specific name
     let actual_model = get_provider_model_name(raw_model, &primary);
-    
+
     ResolvedModel::Aggregated {
         provider: primary,
         model: actual_model,
@@ -267,14 +269,14 @@ pub fn resolve_model(raw_model: &str, explicit_provider: Option<&str>) -> Resolv
 /// Get all unique models across all providers with their supported provider list
 pub fn get_aggregated_model_list() -> HashMap<String, Vec<String>> {
     let mut result: HashMap<String, Vec<String>> = HashMap::new();
-    
+
     for (model, providers) in MODEL_PROVIDER_MAP {
         result.insert(
             model.to_string(),
             providers.iter().map(|s| s.to_string()).collect(),
         );
     }
-    
+
     result
 }
 
@@ -287,7 +289,7 @@ mod tests {
         let providers = get_providers_for_model("claude-sonnet-4-5");
         assert!(providers.contains(&"kiro".to_string()));
         assert!(providers.contains(&"antigravity".to_string()));
-        
+
         let providers = get_providers_for_model("gemini-2.5-pro");
         assert!(providers.contains(&"gemini".to_string()));
         assert!(providers.contains(&"antigravity".to_string()));

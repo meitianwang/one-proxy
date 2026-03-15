@@ -2,7 +2,7 @@
 use reqwest::Error;
 
 /// 分类流式响应错误并返回错误类型、英文消息和 i18n key
-/// 
+///
 /// 返回值: (错误类型, 英文错误消息, i18n_key)
 /// - 错误类型: 用于日志和错误码
 /// - 英文消息: fallback 消息,供非浏览器客户端使用
@@ -12,13 +12,13 @@ pub fn classify_stream_error(error: &Error) -> (&'static str, &'static str, &'st
         (
             "timeout_error",
             "Request timeout, please check your network connection",
-            "errors.stream.timeout_error"
+            "errors.stream.timeout_error",
         )
     } else if error.is_connect() {
         (
             "connection_error",
             "Connection failed, please check your network or proxy settings",
-            "errors.stream.connection_error"
+            "errors.stream.connection_error",
         )
     } else if error.is_decode() {
         (
@@ -30,13 +30,13 @@ pub fn classify_stream_error(error: &Error) -> (&'static str, &'static str, &'st
         (
             "stream_error",
             "Stream transmission error, please retry later",
-            "errors.stream.stream_error"
+            "errors.stream.stream_error",
         )
     } else {
         (
             "unknown_error",
             "Unknown error occurred",
-            "errors.stream.unknown_error"
+            "errors.stream.unknown_error",
         )
     }
 }
@@ -53,12 +53,10 @@ mod tests {
             .timeout(std::time::Duration::from_millis(1))
             .build()
             .unwrap();
-        
+
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let error = rt.block_on(async {
-            client.get(url).send().await.unwrap_err()
-        });
-        
+        let error = rt.block_on(async { client.get(url).send().await.unwrap_err() });
+
         if error.is_timeout() {
             let (error_type, message, i18n_key) = classify_stream_error(&error);
             assert_eq!(error_type, "timeout_error");
@@ -72,26 +70,24 @@ mod tests {
         // 测试错误消息格式
         let url = "http://invalid-domain-that-does-not-exist-12345.com";
         let client = reqwest::Client::new();
-        
+
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let error = rt.block_on(async {
-            client.get(url).send().await.unwrap_err()
-        });
-        
+        let error = rt.block_on(async { client.get(url).send().await.unwrap_err() });
+
         let (error_type, message, i18n_key) = classify_stream_error(&error);
-        
+
         // 错误类型应该是已知的类型之一
         assert!(
-            error_type == "timeout_error" ||
-            error_type == "connection_error" ||
-            error_type == "decode_error" ||
-            error_type == "stream_error" ||
-            error_type == "unknown_error"
+            error_type == "timeout_error"
+                || error_type == "connection_error"
+                || error_type == "decode_error"
+                || error_type == "stream_error"
+                || error_type == "unknown_error"
         );
-        
+
         // 消息不应该为空
         assert!(!message.is_empty());
-        
+
         // i18n_key 应该以 errors.stream. 开头
         assert!(i18n_key.starts_with("errors.stream."));
     }
@@ -106,7 +102,7 @@ mod tests {
             ("stream_error", "errors.stream.stream_error"),
             ("unknown_error", "errors.stream.unknown_error"),
         ];
-        
+
         // 这里我们只验证 i18n_key 格式
         for (expected_type, expected_key) in test_cases {
             assert_eq!(format!("errors.stream.{}", expected_type), expected_key);

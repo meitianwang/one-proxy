@@ -2,7 +2,10 @@
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Path, Query, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
     http::{header, HeaderValue, StatusCode},
     response::{sse::Event, Html, IntoResponse, Json, Response, Sse},
 };
@@ -15,16 +18,20 @@ use super::codex::{self, CodexClient};
 use super::gemini::{self, GeminiClient};
 use super::kiro;
 use super::AppState;
-use crate::auth::{self, providers::{google, anthropic, antigravity as antigravity_oauth, openai}, AuthFile, TokenInfo};
 use crate::auth::providers::antigravity::QuotaData as AntigravityQuotaData;
+use crate::auth::{
+    self,
+    providers::{anthropic, antigravity as antigravity_oauth, google, openai},
+    AuthFile, TokenInfo,
+};
+use flate2::read::GzDecoder;
+use futures::{StreamExt, TryStreamExt};
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use futures::{StreamExt, TryStreamExt};
-use flate2::read::GzDecoder;
-use std::io::Read;
 
 #[derive(Debug, Clone)]
 struct GeminiAuth {
@@ -56,6 +63,15 @@ struct CodexAuth {
     provider: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexRoutingStatusSnapshot {
+    pub account_id: String,
+    pub order: usize,
+    pub selected: bool,
+    pub exhausted: bool,
+    pub quota_state: String,
+}
+
 #[derive(Debug, Clone)]
 struct KimiAuth {
     api_key: String,
@@ -80,10 +96,16 @@ const KIMI_ANTHROPIC_BASE: &str = "https://api.kimi.com/coding/v1";
 const GLM_ANTHROPIC_BASE: &str = "https://open.bigmodel.cn/api/anthropic/v1";
 
 /// Helper function to add account_id, provider, and model headers to a response for logging
-fn with_log_info<T: IntoResponse>(response: T, provider: &str, account_id: &str, model: &str) -> Response {
+fn with_log_info<T: IntoResponse>(
+    response: T,
+    provider: &str,
+    account_id: &str,
+    model: &str,
+) -> Response {
     let mut resp = response.into_response();
     if let Ok(value) = axum::http::HeaderValue::from_str(account_id) {
-        resp.headers_mut().insert(super::X_ONEPROXY_ACCOUNT_ID, value);
+        resp.headers_mut()
+            .insert(super::X_ONEPROXY_ACCOUNT_ID, value);
     }
     if let Ok(value) = axum::http::HeaderValue::from_str(provider) {
         resp.headers_mut().insert(super::X_ONEPROXY_PROVIDER, value);
@@ -114,7 +136,7 @@ fn error_response(
         503 => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    
+
     let json_body = Json(json!({
         "error": {
             "message": message,
@@ -122,10 +144,11 @@ fn error_response(
             "code": status_code
         }
     }));
-    
+
     let mut resp = (http_status, json_body).into_response();
     if let Ok(value) = axum::http::HeaderValue::from_str(account_id) {
-        resp.headers_mut().insert(super::X_ONEPROXY_ACCOUNT_ID, value);
+        resp.headers_mut()
+            .insert(super::X_ONEPROXY_ACCOUNT_ID, value);
     }
     if let Ok(value) = axum::http::HeaderValue::from_str(provider) {
         resp.headers_mut().insert(super::X_ONEPROXY_PROVIDER, value);
@@ -135,7 +158,6 @@ fn error_response(
     }
     resp
 }
-
 
 // Root endpoint
 pub async fn root() -> Json<Value> {
@@ -170,7 +192,6 @@ pub struct ModelsResponse {
 pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsResponse> {
     let mut models = Vec::new();
     let mut has_gemini = false;
-    let mut has_codex = false;
     let mut has_antigravity = false;
     let mut has_claude = false;
     let mut has_kimi = false;
@@ -196,14 +217,19 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
                             if provider.is_empty() {
                                 continue;
                             }
-                            let disabled = json.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
-                            let enabled = json.get("enabled").and_then(|v| v.as_bool()).unwrap_or(!disabled);
+                            let disabled = json
+                                .get("disabled")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let enabled = json
+                                .get("enabled")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(!disabled);
                             if disabled || !enabled {
                                 continue;
                             }
                             match provider.as_str() {
                                 "gemini" => has_gemini = true,
-                                "codex" => has_codex = true,
                                 "antigravity" => has_antigravity = true,
                                 "claude" => has_claude = true,
                                 "kimi" => has_kimi = true,
@@ -225,9 +251,10 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
     }
 
     // Add Codex/OpenAI models if available (with reasoning_effort variants)
-    if has_codex {
-        let base = get_codex_models();
-        models.extend(build_codex_models_with_reasoning(&base));
+    let codex_base = get_available_codex_models(&auth_dir);
+    if !codex_base.is_empty() {
+        models.extend(build_prefixed_models("codex", &codex_base));
+        models.extend(build_codex_models_with_reasoning(&codex_base));
     }
 
     // Add Antigravity models if available
@@ -258,8 +285,10 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
     // Add Kiro models if available
     if has_kiro {
         if let Some(auth_with_account) = get_kiro_auth("auto").await {
-            if kiro::ensure_model_cache(&auth_with_account.auth).await.is_ok() {
-
+            if kiro::ensure_model_cache(&auth_with_account.auth)
+                .await
+                .is_ok()
+            {
                 let model_ids = kiro::available_models();
                 if !model_ids.is_empty() {
                     let created = chrono::Utc::now().timestamp();
@@ -288,12 +317,16 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
                 continue;
             }
             let prefix = entry.prefix.as_ref().unwrap_or(&entry.name);
-            let custom_models: Vec<ModelInfo> = entry.models.iter().map(|m| ModelInfo {
-                id: m.clone(),
-                object: "model".to_string(),
-                created,
-                owned_by: entry.name.clone(),
-            }).collect();
+            let custom_models: Vec<ModelInfo> = entry
+                .models
+                .iter()
+                .map(|m| ModelInfo {
+                    id: m.clone(),
+                    object: "model".to_string(),
+                    created,
+                    owned_by: entry.name.clone(),
+                })
+                .collect();
             if custom_models.is_empty() {
                 // If no models specified, add a placeholder
                 models.push(ModelInfo {
@@ -313,12 +346,16 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
                 continue;
             }
             let prefix = entry.prefix.as_ref().unwrap_or(&entry.name);
-            let custom_models: Vec<ModelInfo> = entry.models.iter().map(|m| ModelInfo {
-                id: m.clone(),
-                object: "model".to_string(),
-                created,
-                owned_by: entry.name.clone(),
-            }).collect();
+            let custom_models: Vec<ModelInfo> = entry
+                .models
+                .iter()
+                .map(|m| ModelInfo {
+                    id: m.clone(),
+                    object: "model".to_string(),
+                    created,
+                    owned_by: entry.name.clone(),
+                })
+                .collect();
             if custom_models.is_empty() {
                 // If no models specified, add a placeholder
                 models.push(ModelInfo {
@@ -333,38 +370,45 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
         }
     }
 
+    models = dedupe_models(models);
+
     // In model aggregation mode, aggregate models by base name
     let config = crate::config::get_config().unwrap_or_default();
     if config.model_routing.mode == "model" {
         // Aggregate models: extract base model names and combine providers
         use std::collections::HashMap;
         let mut aggregated: HashMap<String, (ModelInfo, Vec<(String, String)>)> = HashMap::new();
-        
+
         for model in &models {
             // Parse provider/model format
             if let Some((provider, base_model)) = model.id.split_once('/') {
                 // Normalize model name to unify different naming conventions
                 let normalized = normalize_model_name(base_model);
                 let entry = aggregated.entry(normalized.clone()).or_insert_with(|| {
-                    (ModelInfo {
-                        id: normalized.clone(),
-                        object: model.object.clone(),
-                        created: model.created,
-                        owned_by: String::new(),
-                    }, Vec::new())
+                    (
+                        ModelInfo {
+                            id: normalized.clone(),
+                            object: model.object.clone(),
+                            created: model.created,
+                            owned_by: String::new(),
+                        },
+                        Vec::new(),
+                    )
                 });
                 // Store both provider and original model name for routing
                 entry.1.push((provider.to_string(), base_model.to_string()));
             }
         }
-        
+
         // Sort providers by priority and build final list
         let priorities = super::model_router::get_sorted_priorities();
-        let priority_order: HashMap<String, u32> = priorities.iter()
+        let priority_order: HashMap<String, u32> = priorities
+            .iter()
             .map(|p| (p.provider.clone(), p.priority))
             .collect();
-        
-        let mut aggregated_models: Vec<ModelInfo> = aggregated.into_iter()
+
+        let mut aggregated_models: Vec<ModelInfo> = aggregated
+            .into_iter()
             .map(|(_base_model, (mut info, mut providers))| {
                 // Sort providers by priority
                 providers.sort_by(|(a, _), (b, _)| {
@@ -373,18 +417,22 @@ pub async fn openai_models(State(_state): State<AppState>) -> Json<ModelsRespons
                     pb.cmp(&pa)
                 });
                 // Set owned_by to show which providers support this model
-                info.owned_by = providers.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(", ");
+                info.owned_by = providers
+                    .iter()
+                    .map(|(p, _)| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 info
             })
             .collect();
-        
+
         // Filter out hidden models (like auto-kiro)
         let hidden_models = ["auto-kiro", "auto"];
         aggregated_models.retain(|m| !hidden_models.contains(&m.id.as_str()));
-        
+
         // Sort models alphabetically
         aggregated_models.sort_by(|a, b| a.id.cmp(&b.id));
-        
+
         return Json(ModelsResponse {
             object: "list".to_string(),
             data: aggregated_models,
@@ -408,28 +456,37 @@ fn build_prefixed_models(prefix: &str, base: &[ModelInfo]) -> Vec<ModelInfo> {
         .collect()
 }
 
+fn dedupe_models(models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    let mut seen = HashSet::new();
+    models
+        .into_iter()
+        .filter(|model| seen.insert(model.id.clone()))
+        .collect()
+}
+
 /// Normalize model names to unify different naming conventions
 /// e.g., "claude-sonnet-4.5" and "claude-sonnet-4-5" are the same model
 fn normalize_model_name(name: &str) -> String {
-    let normalized = name.to_lowercase();
-    
-    // Normalize version separators: 4.5 -> 4-5, 4_5 -> 4-5
-    let normalized = normalized
-        .replace(".", "-")
-        .replace("_", "-");
-    
+    let normalized = name.to_lowercase().replace('_', "-");
+
     // Common model name mappings
     let normalized = match normalized.as_str() {
         // Claude models - normalize variations
+        "claude-sonnet-4.5" => "claude-sonnet-4-5".to_string(),
         "claude-sonnet-4-5" => "claude-sonnet-4-5".to_string(),
+        "claude-4.5-sonnet" => "claude-sonnet-4-5".to_string(),
         "claude-4-5-sonnet" => "claude-sonnet-4-5".to_string(),
+        "claude-opus-4.5" => "claude-opus-4-5".to_string(),
         "claude-opus-4-5" => "claude-opus-4-5".to_string(),
+        "claude-4.5-opus" => "claude-opus-4-5".to_string(),
         "claude-4-5-opus" => "claude-opus-4-5".to_string(),
+        "claude-haiku-4.5" => "claude-haiku-4-5".to_string(),
         "claude-haiku-4-5" => "claude-haiku-4-5".to_string(),
+        "claude-4.5-haiku" => "claude-haiku-4-5".to_string(),
         "claude-4-5-haiku" => "claude-haiku-4-5".to_string(),
         _ => normalized,
     };
-    
+
     normalized
 }
 
@@ -448,6 +505,201 @@ fn build_codex_models_with_reasoning(base: &[ModelInfo]) -> Vec<ModelInfo> {
         }
     }
     models
+}
+
+const CODEX_MODEL_CREATED: i64 = 1765440000;
+const CODEX_FREE_MODEL_IDS: &[&str] = &[
+    "gpt-5",
+    "gpt-5-codex",
+    "gpt-5-codex-mini",
+    "gpt-5.1",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5.1-codex-max",
+    "gpt-5.2",
+    "gpt-5.2-codex",
+];
+const CODEX_TEAM_MODEL_IDS: &[&str] = &[
+    "gpt-5",
+    "gpt-5-codex",
+    "gpt-5-codex-mini",
+    "gpt-5.1",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5.1-codex-max",
+    "gpt-5.2",
+    "gpt-5.2-codex",
+    "gpt-5.3-codex",
+    "gpt-5.4",
+];
+const CODEX_PLUS_MODEL_IDS: &[&str] = &[
+    "gpt-5",
+    "gpt-5-codex",
+    "gpt-5-codex-mini",
+    "gpt-5.1",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5.1-codex-max",
+    "gpt-5.2",
+    "gpt-5.2-codex",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-5.4",
+];
+const CODEX_PRO_MODEL_IDS: &[&str] = CODEX_PLUS_MODEL_IDS;
+
+fn codex_model_info(id: &str) -> ModelInfo {
+    ModelInfo {
+        id: id.to_string(),
+        object: "model".to_string(),
+        created: CODEX_MODEL_CREATED,
+        owned_by: "openai".to_string(),
+    }
+}
+
+fn codex_model_ids_for_plan(plan_type: Option<&str>) -> &'static [&'static str] {
+    match normalize_codex_plan_type(plan_type) {
+        "free" => CODEX_FREE_MODEL_IDS,
+        "team" => CODEX_TEAM_MODEL_IDS,
+        "plus" => CODEX_PLUS_MODEL_IDS,
+        "pro" => CODEX_PRO_MODEL_IDS,
+        _ => CODEX_PRO_MODEL_IDS,
+    }
+}
+
+fn normalize_codex_plan_type(plan_type: Option<&str>) -> &'static str {
+    let normalized = plan_type.unwrap_or("").trim().to_ascii_lowercase();
+    if normalized.contains("free") {
+        "free"
+    } else if normalized.contains("plus") {
+        "plus"
+    } else if normalized.contains("pro") {
+        "pro"
+    } else if normalized.contains("team")
+        || normalized.contains("business")
+        || normalized == "go"
+        || normalized.contains("chatgpt_go")
+    {
+        "team"
+    } else {
+        "pro"
+    }
+}
+
+fn get_codex_models_for_plan(plan_type: Option<&str>) -> Vec<ModelInfo> {
+    codex_model_ids_for_plan(plan_type)
+        .iter()
+        .map(|id| codex_model_info(id))
+        .collect()
+}
+
+fn infer_codex_plan_type_from_path(path: &std::path::Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
+    let suffix = stem.rsplit('-').next()?;
+    match suffix {
+        "free" | "team" | "business" | "go" | "plus" | "pro" => Some(suffix.to_string()),
+        _ => None,
+    }
+}
+
+fn extract_codex_plan_type(json: &Value, path: &std::path::Path) -> Option<String> {
+    json.get("codex_plan_type")
+        .or_else(|| json.get("plan_type"))
+        .or_else(|| {
+            json.get("token").and_then(|token| {
+                token
+                    .get("codex_plan_type")
+                    .or_else(|| token.get("plan_type"))
+            })
+        })
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .or_else(|| {
+            let id_token = json
+                .get("id_token")
+                .or_else(|| json.get("token").and_then(|token| token.get("id_token")))
+                .and_then(|value| value.as_str());
+            openai::extract_codex_identity_from_id_token(id_token).plan_type
+        })
+        .or_else(|| infer_codex_plan_type_from_path(path))
+}
+
+fn get_available_codex_models(auth_dir: &std::path::Path) -> Vec<ModelInfo> {
+    if !auth_dir.exists() {
+        return Vec::new();
+    }
+
+    let mut files = Vec::new();
+    collect_json_files(auth_dir, &mut files);
+
+    let mut supported = HashSet::new();
+    for path in files {
+        if let Some(candidate) = candidate_from_path("codex", auth_dir, &path) {
+            for model_id in codex_model_ids_for_plan(candidate.codex_plan_type.as_deref()) {
+                supported.insert(*model_id);
+            }
+        }
+    }
+
+    get_codex_models_for_plan(Some("pro"))
+        .into_iter()
+        .filter(|model| supported.contains(model.id.as_str()))
+        .collect()
+}
+
+fn codex_model_supported_for_plan(plan_type: Option<&str>, model: &str) -> bool {
+    let (_provider_override, stripped_model) = parse_provider_prefix(model);
+    let (actual_model, _) = parse_codex_model_with_effort(&stripped_model);
+    if actual_model.trim().is_empty() {
+        return true;
+    }
+    if !CODEX_PRO_MODEL_IDS.contains(&actual_model.as_str()) {
+        return true;
+    }
+    codex_model_ids_for_plan(plan_type).contains(&actual_model.as_str())
+}
+
+fn candidate_supports_requested_model(candidate: &AuthCandidate, model: &str) -> bool {
+    if candidate.provider != "codex" {
+        return true;
+    }
+    codex_model_supported_for_plan(candidate.codex_plan_type.as_deref(), model)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexQuotaState {
+    Available,
+    Unknown,
+    PrimaryExhausted,
+    SecondaryExhausted,
+    FullyExhausted,
+}
+
+impl CodexQuotaState {
+    fn rank(self) -> i32 {
+        match self {
+            Self::Available => 0,
+            Self::Unknown => 1,
+            Self::PrimaryExhausted | Self::SecondaryExhausted | Self::FullyExhausted => 2,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Unknown => "unknown",
+            Self::PrimaryExhausted => "primary_exhausted",
+            Self::SecondaryExhausted => "secondary_exhausted",
+            Self::FullyExhausted => "fully_exhausted",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RankedCodexCandidate {
+    candidate: AuthCandidate,
+    quota_state: CodexQuotaState,
+    exhausted: bool,
 }
 
 /// Build Antigravity models with thinking-level variants
@@ -555,25 +807,6 @@ fn get_gemini_models() -> Vec<ModelInfo> {
 }
 
 /// Get static Codex/OpenAI model definitions
-fn get_codex_models() -> Vec<ModelInfo> {
-    vec![
-        // GPT-5.2 系列
-        ModelInfo {
-            id: "gpt-5.2".to_string(),
-            object: "model".to_string(),
-            created: 1765440000,
-            owned_by: "openai".to_string(),
-        },
-        ModelInfo {
-            id: "gpt-5.2-codex".to_string(),
-            object: "model".to_string(),
-            created: 1765440000,
-            owned_by: "openai".to_string(),
-        },
-    ]
-}
-
-
 fn parse_provider_prefix(model: &str) -> (Option<String>, String) {
     let trimmed = model.trim();
     if let Some((prefix, rest)) = trimmed.split_once('/') {
@@ -592,16 +825,19 @@ fn parse_provider_prefix(model: &str) -> (Option<String>, String) {
 /// Convert Gemini format contents to OpenAI/Claude messages format
 fn convert_gemini_to_messages(request: &Value) -> Vec<Value> {
     let mut messages = Vec::new();
-    
+
     if let Some(contents) = request.get("contents").and_then(|c| c.as_array()) {
         for content in contents {
-            let role = content.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let role = content
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("user");
             // Convert Gemini role to OpenAI/Claude role
             let normalized_role = match role {
                 "model" => "assistant",
                 _ => role,
             };
-            
+
             // Extract text from parts
             let mut text_content = String::new();
             if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
@@ -614,7 +850,7 @@ fn convert_gemini_to_messages(request: &Value) -> Vec<Value> {
                     }
                 }
             }
-            
+
             if !text_content.is_empty() {
                 messages.push(json!({
                     "role": normalized_role,
@@ -623,7 +859,7 @@ fn convert_gemini_to_messages(request: &Value) -> Vec<Value> {
             }
         }
     }
-    
+
     // If systemInstruction is present, add it as a system message at the beginning
     if let Some(sys) = request.get("systemInstruction") {
         if let Some(parts) = sys.get("parts").and_then(|p| p.as_array()) {
@@ -637,21 +873,27 @@ fn convert_gemini_to_messages(request: &Value) -> Vec<Value> {
                 }
             }
             if !sys_text.is_empty() {
-                messages.insert(0, json!({
-                    "role": "system",
-                    "content": sys_text
-                }));
+                messages.insert(
+                    0,
+                    json!({
+                        "role": "system",
+                        "content": sys_text
+                    }),
+                );
             }
         }
     }
-    
+
     messages
 }
 
 /// Handle Kiro Claude request (converted from Gemini format)
 async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::response::Response {
-    let model = payload.get("model").and_then(|m| m.as_str()).unwrap_or("claude-sonnet-4");
-    
+    let model = payload
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("claude-sonnet-4");
+
     let kiro_auth = match get_kiro_auth(model).await {
         Some(a) => a,
         None => {
@@ -665,11 +907,11 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
             .into_response();
         }
     };
-    
+
     let auth = &kiro_auth.auth;
     let account_id = &kiro_auth.account_id;
     let provider = &kiro_auth.provider;
-    
+
     // Build Kiro payload from OpenAI-style messages
     let resolution = kiro::resolve_model(model);
     let conversation_id = kiro::generate_conversation_id(payload.get("messages"));
@@ -678,8 +920,13 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
     } else {
         None
     };
-    
-    let kiro_payload = match kiro::build_kiro_payload_from_openai(&payload, &resolution.internal_id, conversation_id, profile_arn) {
+
+    let kiro_payload = match kiro::build_kiro_payload_from_openai(
+        &payload,
+        &resolution.internal_id,
+        conversation_id,
+        profile_arn,
+    ) {
         Ok(p) => p,
         Err(e) => {
             return Json(json!({
@@ -692,7 +939,7 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
             .into_response();
         }
     };
-    
+
     // Send request to Kiro
     let response = match kiro::send_kiro_request(auth, &kiro_payload, true).await {
         Ok(r) => r,
@@ -707,7 +954,7 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
             .into_response();
         }
     };
-    
+
     if is_stream {
         let messages_for_stream = payload.get("messages").cloned();
         let upstream = kiro::stream_kiro_to_openai(
@@ -731,7 +978,9 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
             model.to_string(),
             messages_for_stream,
             None, // request_tools
-        ).await {
+        )
+        .await
+        {
             Ok(json_response) => with_log_info(Json(json_response), provider, account_id, model),
             Err(e) => Json(json!({
                 "error": {
@@ -745,10 +994,12 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
     }
 }
 
-
-
 /// Handle native Claude request (converted from Gemini format)
-async fn handle_native_claude_request(payload: Value, is_stream: bool, model: &str) -> axum::response::Response {
+async fn handle_native_claude_request(
+    payload: Value,
+    is_stream: bool,
+    model: &str,
+) -> axum::response::Response {
     let token = match get_claude_token(model).await {
         Some(t) => t,
         None => {
@@ -762,30 +1013,596 @@ async fn handle_native_claude_request(payload: Value, is_stream: bool, model: &s
             .into_response();
         }
     };
-    
-    forward_claude_compatible(payload, "https://api.anthropic.com/v1", &token, is_stream, "Claude").await
+
+    forward_claude_compatible(
+        payload,
+        "https://api.anthropic.com/v1",
+        &token,
+        is_stream,
+        "Claude",
+    )
+    .await
 }
 
 /// Handle Codex OpenAI request (converted from Gemini format)
-async fn handle_codex_openai_request(payload: Value, is_stream: bool, model: &str) -> axum::response::Response {
-    let auth = match get_codex_auth(model).await {
-        Some(a) => a,
-        None => {
+async fn handle_codex_openai_request(
+    payload: Value,
+    is_stream: bool,
+    model: &str,
+) -> axum::response::Response {
+    let (actual_model, reasoning_effort) = parse_codex_model_with_effort(model);
+    let auths = get_codex_auths(&actual_model).await;
+    if auths.is_empty() {
+        return Json(json!({
+            "error": {
+                "message": "No valid Codex credentials found. Please login first.",
+                "type": "authentication_error",
+                "code": 401
+            }
+        }))
+        .into_response();
+    }
+
+    let original_payload = payload.clone();
+    let mut modified_payload = payload;
+    if let Some(effort) = reasoning_effort {
+        modified_payload["reasoning_effort"] = json!(effort);
+    }
+
+    let mut last_error: Option<String> = None;
+    let total = auths.len();
+
+    for (idx, auth) in auths.into_iter().enumerate() {
+        let client = CodexClient::new(auth.access_token.clone());
+        let codex_request = codex::openai_to_codex_request(&modified_payload, &actual_model, true);
+
+        if is_stream {
+            match client.stream_responses(&codex_request, true).await {
+                Ok(response) => {
+                    clear_account_exhausted(&auth.provider, &auth.account_id);
+                    let stream =
+                        codex::codex_stream_to_openai_events(response, original_payload.clone());
+                    return with_log_info(
+                        Sse::new(stream),
+                        &auth.provider,
+                        &auth.account_id,
+                        &actual_model,
+                    );
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::error!("Codex API error: {}", msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_codex_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(&auth.provider, &auth.account_id);
+                        }
+                        continue;
+                    }
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Codex API error: {}", msg),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            }
+        }
+
+        match client.stream_responses(&codex_request, true).await {
+            Ok(response) => {
+                match codex::collect_non_stream_response(response, &original_payload).await {
+                    Ok(openai_response) => {
+                        clear_account_exhausted(&auth.provider, &auth.account_id);
+                        return with_log_info(
+                            Json(openai_response),
+                            &auth.provider,
+                            &auth.account_id,
+                            &actual_model,
+                        );
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::error!("Codex API error: {}", msg);
+                        last_error = Some(msg.clone());
+                        if should_rotate_codex_error(&msg) && idx + 1 < total {
+                            if should_mark_account_exhausted(&msg) {
+                                mark_account_exhausted(&auth.provider, &auth.account_id);
+                            }
+                            continue;
+                        }
+                        return Json(json!({
+                            "error": {
+                                "message": format!("Codex API error: {}", msg),
+                                "type": "api_error",
+                                "code": 500
+                            }
+                        }))
+                        .into_response();
+                    }
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                tracing::error!("Codex API error: {}", msg);
+                last_error = Some(msg.clone());
+                if should_rotate_codex_error(&msg) && idx + 1 < total {
+                    if should_mark_account_exhausted(&msg) {
+                        mark_account_exhausted(&auth.provider, &auth.account_id);
+                    }
+                    continue;
+                }
+                return Json(json!({
+                    "error": {
+                        "message": format!("Codex API error: {}", msg),
+                        "type": "api_error",
+                        "code": 500
+                    }
+                }))
+                .into_response();
+            }
+        }
+    }
+
+    Json(json!({
+        "error": {
+            "message": format!("Codex API error: {}", last_error.unwrap_or_else(|| "unknown error".to_string())),
+            "type": "api_error",
+            "code": 500
+        }
+    }))
+    .into_response()
+}
+
+pub async fn responses(State(_state): State<AppState>, Json(mut raw): Json<Value>) -> Response {
+    let raw_model = match raw.get("model").and_then(|v| v.as_str()) {
+        Some(model) if !model.trim().is_empty() => model.trim().to_string(),
+        _ => {
             return Json(json!({
                 "error": {
-                    "message": "No valid Codex credentials found. Please login first.",
-                    "type": "authentication_error",
-                    "code": 401
+                    "message": "Missing required field: model",
+                    "type": "invalid_request_error",
+                    "code": 400
                 }
             }))
             .into_response();
         }
     };
-    
-    let resp = forward_openai_compatible(payload, "https://api.openai.com/v1", &auth.access_token, is_stream, "Codex").await;
-    with_log_info(resp, &auth.provider, &auth.account_id, model)
+
+    let (resolved_provider, resolved_model) = resolve_responses_provider_and_model(&raw_model);
+
+    if resolved_provider.as_deref() != Some("codex") {
+        return Json(json!({
+            "error": {
+                "message": "OpenAI Responses is currently supported for Codex models only. Use a model like 'codex/gpt-5-codex'.",
+                "type": "invalid_request_error",
+                "code": 400
+            }
+        }))
+        .into_response();
+    }
+
+    let (actual_model, reasoning_effort) = parse_codex_model_with_effort(&resolved_model);
+    let auths = get_codex_auths(&actual_model).await;
+    if auths.is_empty() {
+        return Json(json!({
+            "error": {
+                "message": "No valid Codex credentials found. Please login with Codex first.",
+                "type": "authentication_error",
+                "code": 401
+            }
+        }))
+        .into_response();
+    }
+
+    if let Some(effort) = reasoning_effort {
+        if raw.get("reasoning").is_none() {
+            raw["reasoning"] = json!({});
+        }
+        raw["reasoning"]["effort"] = json!(effort);
+    }
+
+    let is_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let codex_request = codex::openai_responses_to_codex_request(&raw, &actual_model);
+    let mut last_error: Option<String> = None;
+    let total = auths.len();
+
+    for (idx, auth) in auths.into_iter().enumerate() {
+        let client = CodexClient::new(auth.access_token.clone());
+
+        if is_stream {
+            match client.stream_responses(&codex_request, true).await {
+                Ok(response) => {
+                    clear_account_exhausted(&auth.provider, &auth.account_id);
+                    let stream = codex::codex_stream_to_openai_responses_events(response);
+                    return with_log_info(
+                        Sse::new(stream),
+                        &auth.provider,
+                        &auth.account_id,
+                        &actual_model,
+                    );
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::error!("Codex Responses API error: {}", msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_codex_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(&auth.provider, &auth.account_id);
+                        }
+                        continue;
+                    }
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Codex Responses API error: {}", msg),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            }
+        }
+
+        match client.stream_responses(&codex_request, true).await {
+            Ok(response) => match codex::collect_non_stream_responses_response(response).await {
+                Ok(response_payload) => {
+                    clear_account_exhausted(&auth.provider, &auth.account_id);
+                    return with_log_info(
+                        Json(response_payload),
+                        &auth.provider,
+                        &auth.account_id,
+                        &actual_model,
+                    );
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::error!("Codex Responses API error: {}", msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_codex_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(&auth.provider, &auth.account_id);
+                        }
+                        continue;
+                    }
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Codex Responses API error: {}", msg),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
+            },
+            Err(e) => {
+                let msg = e.to_string();
+                tracing::error!("Codex Responses API error: {}", msg);
+                last_error = Some(msg.clone());
+                if should_rotate_codex_error(&msg) && idx + 1 < total {
+                    if should_mark_account_exhausted(&msg) {
+                        mark_account_exhausted(&auth.provider, &auth.account_id);
+                    }
+                    continue;
+                }
+                return Json(json!({
+                    "error": {
+                        "message": format!("Codex Responses API error: {}", msg),
+                        "type": "api_error",
+                        "code": 500
+                    }
+                }))
+                .into_response();
+            }
+        }
+    }
+
+    Json(json!({
+        "error": {
+            "message": format!("Codex Responses API error: {}", last_error.unwrap_or_else(|| "unknown error".to_string())),
+            "type": "api_error",
+            "code": 500
+        }
+    }))
+    .into_response()
 }
 
+pub async fn responses_websocket(State(_state): State<AppState>, ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(handle_responses_websocket_session)
+}
+
+fn resolve_responses_provider_and_model(raw_model: &str) -> (Option<String>, String) {
+    let (provider_override, model) = parse_provider_prefix(raw_model);
+    if provider_override.is_some() {
+        return (provider_override, model);
+    }
+
+    use super::model_router::{resolve_model, ResolvedModel};
+    match resolve_model(raw_model, None) {
+        ResolvedModel::Explicit { provider, model } => (Some(provider), model),
+        ResolvedModel::Aggregated {
+            provider,
+            model,
+            fallbacks: _,
+        } => (Some(provider), model),
+        ResolvedModel::NoProvider { model } => (None, model),
+    }
+}
+
+fn responses_error_payload(status: u16, message: &str, error_type: &str) -> String {
+    json!({
+        "type": "error",
+        "status": status,
+        "error": {
+            "message": message,
+            "type": error_type,
+            "code": status
+        }
+    })
+    .to_string()
+}
+
+async fn send_responses_websocket_error(
+    socket: &mut WebSocket,
+    status: u16,
+    message: &str,
+    error_type: &str,
+) -> bool {
+    socket
+        .send(Message::Text(
+            responses_error_payload(status, message, error_type).into(),
+        ))
+        .await
+        .is_ok()
+}
+
+async fn handle_responses_websocket_session(mut socket: WebSocket) {
+    let mut last_request: Option<Value> = None;
+    let mut last_response_output = json!([]);
+
+    while let Some(message) = socket.recv().await {
+        let payload_text = match message {
+            Ok(Message::Text(text)) => text.to_string(),
+            Ok(Message::Binary(bytes)) => match String::from_utf8(bytes.to_vec()) {
+                Ok(text) => text,
+                Err(_) => {
+                    if !send_responses_websocket_error(
+                        &mut socket,
+                        400,
+                        "websocket payload must be valid UTF-8",
+                        "invalid_request_error",
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    continue;
+                }
+            },
+            Ok(Message::Ping(payload)) => {
+                if socket.send(Message::Pong(payload)).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            Ok(Message::Pong(_)) => continue,
+            Ok(Message::Close(_)) => return,
+            Err(_) => return,
+        };
+
+        let raw: Value = match serde_json::from_str(&payload_text) {
+            Ok(value) => value,
+            Err(err) => {
+                if !send_responses_websocket_error(
+                    &mut socket,
+                    400,
+                    &format!("invalid websocket JSON payload: {}", err),
+                    "invalid_request_error",
+                )
+                .await
+                {
+                    return;
+                }
+                continue;
+            }
+        };
+
+        let (mut normalized_request, updated_last_request) =
+            match codex::normalize_responses_websocket_request(
+                &raw,
+                last_request.as_ref(),
+                &last_response_output,
+                true,
+            ) {
+                Ok(result) => result,
+                Err(err) => {
+                    if !send_responses_websocket_error(
+                        &mut socket,
+                        400,
+                        &err.to_string(),
+                        "invalid_request_error",
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    continue;
+                }
+            };
+
+        let raw_model = match normalized_request.get("model").and_then(|v| v.as_str()) {
+            Some(model) if !model.trim().is_empty() => model.trim().to_string(),
+            _ => {
+                if !send_responses_websocket_error(
+                    &mut socket,
+                    400,
+                    "Missing required field: model",
+                    "invalid_request_error",
+                )
+                .await
+                {
+                    return;
+                }
+                continue;
+            }
+        };
+
+        let (resolved_provider, resolved_model) = resolve_responses_provider_and_model(&raw_model);
+        if resolved_provider.as_deref() != Some("codex") {
+            if !send_responses_websocket_error(
+                &mut socket,
+                400,
+                "OpenAI Responses websocket is currently supported for Codex models only.",
+                "invalid_request_error",
+            )
+            .await
+            {
+                return;
+            }
+            continue;
+        }
+
+        let (actual_model, reasoning_effort) = parse_codex_model_with_effort(&resolved_model);
+        let auths = get_codex_auths(&actual_model).await;
+        if auths.is_empty() {
+            if !send_responses_websocket_error(
+                &mut socket,
+                401,
+                "No valid Codex credentials found. Please login with Codex first.",
+                "authentication_error",
+            )
+            .await
+            {
+                return;
+            }
+            continue;
+        }
+
+        if let Some(effort) = reasoning_effort {
+            if normalized_request.get("reasoning").is_none() {
+                normalized_request["reasoning"] = json!({});
+            }
+            normalized_request["reasoning"]["effort"] = json!(effort);
+        }
+
+        last_request = Some(updated_last_request);
+
+        let codex_request =
+            codex::openai_responses_to_codex_request(&normalized_request, &actual_model);
+        let mut response = None;
+        let mut last_error: Option<String> = None;
+        let total = auths.len();
+
+        for (idx, auth) in auths.into_iter().enumerate() {
+            let client = CodexClient::new(auth.access_token.clone());
+            match client.stream_responses(&codex_request, true).await {
+                Ok(stream_response) => {
+                    clear_account_exhausted(&auth.provider, &auth.account_id);
+                    response = Some(stream_response);
+                    break;
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    tracing::error!("Codex Responses API error: {}", msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_codex_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(&auth.provider, &auth.account_id);
+                        }
+                        continue;
+                    }
+                    response = None;
+                    break;
+                }
+            }
+        }
+
+        let Some(response) = response else {
+            if let Some(message) = last_error {
+                if !send_responses_websocket_error(
+                    &mut socket,
+                    500,
+                    &format!("Codex Responses API error: {}", message),
+                    "api_error",
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            continue;
+        };
+
+        let mut buffer = String::new();
+        let mut stream = response.bytes_stream();
+        let mut completed = false;
+
+        while let Some(chunk) = stream.next().await {
+            let bytes = match chunk {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    let _ = send_responses_websocket_error(
+                        &mut socket,
+                        500,
+                        &format!("Codex Responses stream error: {}", err),
+                        "api_error",
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            let text = String::from_utf8_lossy(&bytes);
+            buffer.push_str(&text);
+
+            while let Some(pos) = buffer.find('\n') {
+                let mut line = buffer[..pos].to_string();
+                buffer = buffer[pos + 1..].to_string();
+                line = line.trim_end_matches('\r').to_string();
+                if !line.starts_with("data:") {
+                    continue;
+                }
+
+                let data = line[5..].trim();
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+
+                let payload: Value = match serde_json::from_str(data) {
+                    Ok(payload) => payload,
+                    Err(_) => continue,
+                };
+
+                if payload.get("type").and_then(|v| v.as_str()) == Some("response.completed") {
+                    completed = true;
+                    last_response_output = codex::response_completed_output(&payload);
+                }
+
+                if socket
+                    .send(Message::Text(data.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+
+        if !completed
+            && !send_responses_websocket_error(
+                &mut socket,
+                408,
+                "stream closed before response.completed",
+                "api_error",
+            )
+            .await
+        {
+            return;
+        }
+    }
+}
 
 fn normalize_provider_prefix(prefix: &str) -> Option<String> {
     let lower = prefix.trim().to_lowercase();
@@ -1028,8 +1845,10 @@ async fn forward_claude_compatible(
         let body = response.bytes().await.unwrap_or_default();
         let mut resp = Response::new(Body::from(body));
         *resp.status_mut() = status;
-        resp.headers_mut()
-            .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
         return resp;
     }
 
@@ -1302,10 +2121,7 @@ fn openai_chunk_to_claude_events(
 
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                 for tool_call in tool_calls {
-                    let index = tool_call
-                        .get("index")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0) as i32;
+                    let index = tool_call.get("index").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                     let block_index = match state.tool_call_block_index.get(&index) {
                         Some(idx) => *idx,
                         None => {
@@ -1432,25 +2248,25 @@ fn finalize_claude_stream(state: &mut ClaudeStreamState) -> Vec<Event> {
     }
     tool_blocks.sort_by_key(|(index, _)| *index);
     for (block_index, tool_call) in tool_blocks {
-            let args = if tool_call.arguments.trim().is_empty() {
-                "{}".to_string()
-            } else {
-                tool_call.arguments.clone()
-            };
-            let input_delta = json!({
-                "type": "content_block_delta",
-                "index": block_index,
-                "delta": {
-                    "type": "input_json_delta",
-                    "partial_json": args
-                }
-            });
-            events.push(build_claude_event("content_block_delta", input_delta));
-            let stop_payload = json!({
-                "type": "content_block_stop",
-                "index": block_index
-            });
-            events.push(build_claude_event("content_block_stop", stop_payload));
+        let args = if tool_call.arguments.trim().is_empty() {
+            "{}".to_string()
+        } else {
+            tool_call.arguments.clone()
+        };
+        let input_delta = json!({
+            "type": "content_block_delta",
+            "index": block_index,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": args
+            }
+        });
+        events.push(build_claude_event("content_block_delta", input_delta));
+        let stop_payload = json!({
+            "type": "content_block_stop",
+            "index": block_index
+        });
+        events.push(build_claude_event("content_block_stop", stop_payload));
     }
 
     let stop_reason = map_openai_finish_reason(state.finish_reason.as_deref());
@@ -1556,7 +2372,6 @@ fn get_antigravity_models() -> Vec<ModelInfo> {
     ]
 }
 
-
 /// Get static Claude model definitions
 fn get_claude_models() -> Vec<ModelInfo> {
     vec![
@@ -1598,7 +2413,6 @@ fn get_claude_models() -> Vec<ModelInfo> {
         },
     ]
 }
-
 
 /// Get static Kimi model definitions
 fn get_kimi_models() -> Vec<ModelInfo> {
@@ -1654,15 +2468,17 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct AuthCandidate {
     id: String,
     path: PathBuf,
     priority: i32,
     provider: String,
+    codex_plan_type: Option<String>,
 }
 
-static AUTH_SELECTOR: Lazy<Mutex<HashMap<String, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static AUTH_SELECTOR: Lazy<Mutex<HashMap<String, usize>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Tracks exhausted accounts per provider: key = provider, value = set of exhausted account IDs
 /// Accounts are marked exhausted when they hit quota/rate limit errors.
@@ -1768,11 +2584,11 @@ fn get_provider_account_ids(provider: &str) -> Vec<String> {
 }
 
 /// Select the best provider in aggregation mode.
-/// 
+///
 /// This function checks providers in priority order and returns the first one that has
 /// available (non-exhausted) accounts. It always checks higher-priority providers first
 /// to ensure that if they have available accounts, they are used instead of lower-priority ones.
-/// 
+///
 /// Returns: (selected_provider, remaining_fallbacks)
 pub fn select_best_provider_for_aggregation(
     primary_provider: &str,
@@ -1812,7 +2628,7 @@ pub fn select_best_provider_for_aggregation(
                     return (higher_provider.clone(), remaining);
                 }
             }
-            
+
             // No higher priority provider has recovered, use this one
             let remaining: Vec<String> = all_providers[idx + 1..].to_vec();
             return (provider.clone(), remaining);
@@ -1871,8 +2687,14 @@ fn candidate_from_path(
         return None;
     }
 
-    let disabled = json.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
-    let enabled = json.get("enabled").and_then(|v| v.as_bool()).unwrap_or(!disabled);
+    let disabled = json
+        .get("disabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let enabled = json
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(!disabled);
     if disabled || !enabled {
         return None;
     }
@@ -1888,10 +2710,27 @@ fn candidate_from_path(
         path: path.to_path_buf(),
         priority,
         provider: json_provider,
+        codex_plan_type: if provider_key == "codex" {
+            extract_codex_plan_type(&json, path)
+        } else {
+            None
+        },
     })
 }
 
-fn select_auth_candidates(provider: &str, model: &str) -> Vec<AuthCandidate> {
+fn normalize_account_id(candidate_id: &str) -> String {
+    std::path::Path::new(candidate_id)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(candidate_id.trim_end_matches(".json"))
+        .to_string()
+}
+
+fn select_auth_candidates_internal(
+    provider: &str,
+    model: &str,
+    advance_cursor: bool,
+) -> Vec<AuthCandidate> {
     let auth_dir = crate::config::resolve_auth_dir();
     if !auth_dir.exists() {
         return Vec::new();
@@ -1907,6 +2746,11 @@ fn select_auth_candidates(provider: &str, model: &str) -> Vec<AuthCandidate> {
         }
     }
 
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    candidates.retain(|candidate| candidate_supports_requested_model(candidate, model));
     if candidates.is_empty() {
         return Vec::new();
     }
@@ -1935,7 +2779,9 @@ fn select_auth_candidates(provider: &str, model: &str) -> Vec<AuthCandidate> {
                 let mut cursor = AUTH_SELECTOR.lock().unwrap();
                 let entry = cursor.entry(key).or_insert(0);
                 let idx = *entry % available.len();
-                *entry = entry.wrapping_add(1);
+                if advance_cursor {
+                    *entry = entry.wrapping_add(1);
+                }
                 idx
             };
             available.rotate_left(start);
@@ -1985,6 +2831,14 @@ fn select_auth_candidates(provider: &str, model: &str) -> Vec<AuthCandidate> {
     }
 }
 
+fn select_auth_candidates(provider: &str, model: &str) -> Vec<AuthCandidate> {
+    select_auth_candidates_internal(provider, model, true)
+}
+
+fn preview_auth_candidates(provider: &str, model: &str) -> Vec<AuthCandidate> {
+    select_auth_candidates_internal(provider, model, false)
+}
+
 #[derive(Clone, Copy)]
 enum TokenLocation {
     Nested,
@@ -2018,7 +2872,9 @@ fn parse_token_snapshot(json: &Value) -> Option<TokenSnapshot> {
                 .get("refresh_token")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let expiry_value = token_obj.get("expires_at").or_else(|| token_obj.get("expiry"));
+            let expiry_value = token_obj
+                .get("expires_at")
+                .or_else(|| token_obj.get("expiry"));
             let expires_at = expiry_value
                 .and_then(|v| v.as_str())
                 .and_then(parse_rfc3339);
@@ -2269,99 +3125,289 @@ async fn get_claude_token(model: &str) -> Option<String> {
     None
 }
 
-/// Get a valid Codex access token from stored credentials
-async fn get_codex_auth(model: &str) -> Option<CodexAuth> {
-    let candidates = select_auth_candidates("codex", model);
-    for candidate in candidates {
-        let content = match std::fs::read_to_string(&candidate.path) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let mut json: serde_json::Value = match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+async fn load_codex_auth_from_candidate(candidate: &AuthCandidate) -> Option<CodexAuth> {
+    let content = std::fs::read_to_string(&candidate.path).ok()?;
+    let mut json: serde_json::Value = serde_json::from_str(&content).ok()?;
 
-        let snapshot = match parse_token_snapshot(&json) {
-            Some(s) => s,
-            None => continue,
-        };
+    let snapshot = parse_token_snapshot(&json)?;
 
-        if !is_expired(snapshot.expires_at) {
-            return Some(CodexAuth {
-                access_token: snapshot.access_token,
-                account_id: candidate.id.clone(),
-                provider: candidate.provider.clone(),
-            });
-        }
+    if !is_expired(snapshot.expires_at) {
+        return Some(CodexAuth {
+            access_token: snapshot.access_token,
+            account_id: candidate.id.clone(),
+            provider: candidate.provider.clone(),
+        });
+    }
 
-        let refresh_token = match snapshot.refresh_token {
-            Some(v) => v,
-            None => continue,
-        };
+    let refresh_token = snapshot.refresh_token?;
 
-        if let Ok(new_tokens) = openai::refresh_token(&refresh_token).await {
-            let new_expiry = new_tokens.expires_in.map(|secs| {
-                (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
-            });
+    if let Ok(new_tokens) = openai::refresh_token(&refresh_token).await {
+        let new_expiry = new_tokens
+            .expires_in
+            .map(|secs| (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339());
+        let identity = openai::extract_codex_identity(&new_tokens);
 
-            match snapshot.location {
-                TokenLocation::Nested => {
-                    if json.get("token").is_none() {
-                        json["token"] = json!({});
-                    }
-                    if let Some(obj) = json.get_mut("token").and_then(|v| v.as_object_mut()) {
-                        obj.insert(
-                            "access_token".to_string(),
-                            serde_json::json!(new_tokens.access_token),
-                        );
-                        if let Some(new_refresh) = &new_tokens.refresh_token {
-                            obj.insert("refresh_token".to_string(), serde_json::json!(new_refresh));
-                        }
-                        if let Some(exp) = new_expiry {
-                            let key = snapshot.expiry_key.unwrap_or("expires_at");
-                            obj.insert(key.to_string(), serde_json::json!(exp));
-                        }
-                        obj.insert(
-                            "token_type".to_string(),
-                            serde_json::json!(new_tokens.token_type),
-                        );
-                        if let Some(id_token) = &new_tokens.id_token {
-                            obj.insert("id_token".to_string(), serde_json::json!(id_token));
-                        }
-                    }
+        match snapshot.location {
+            TokenLocation::Nested => {
+                if json.get("token").is_none() {
+                    json["token"] = json!({});
                 }
-                TokenLocation::Root => {
-                    json["access_token"] = serde_json::json!(new_tokens.access_token);
+                if let Some(obj) = json.get_mut("token").and_then(|v| v.as_object_mut()) {
+                    obj.insert(
+                        "access_token".to_string(),
+                        serde_json::json!(new_tokens.access_token),
+                    );
                     if let Some(new_refresh) = &new_tokens.refresh_token {
-                        json["refresh_token"] = serde_json::json!(new_refresh);
+                        obj.insert("refresh_token".to_string(), serde_json::json!(new_refresh));
                     }
                     if let Some(exp) = new_expiry {
-                        json["expired"] = serde_json::json!(exp);
+                        let key = snapshot.expiry_key.unwrap_or("expires_at");
+                        obj.insert(key.to_string(), serde_json::json!(exp));
                     }
+                    obj.insert(
+                        "token_type".to_string(),
+                        serde_json::json!(new_tokens.token_type),
+                    );
                     if let Some(id_token) = &new_tokens.id_token {
-                        json["id_token"] = serde_json::json!(id_token);
+                        obj.insert("id_token".to_string(), serde_json::json!(id_token));
                     }
                 }
             }
-
-            if let Ok(updated_content) = serde_json::to_string_pretty(&json) {
-                let _ = std::fs::write(&candidate.path, updated_content);
+            TokenLocation::Root => {
+                json["access_token"] = serde_json::json!(new_tokens.access_token);
+                if let Some(new_refresh) = &new_tokens.refresh_token {
+                    json["refresh_token"] = serde_json::json!(new_refresh);
+                }
+                if let Some(exp) = new_expiry {
+                    json["expired"] = serde_json::json!(exp);
+                }
+                if let Some(id_token) = &new_tokens.id_token {
+                    json["id_token"] = serde_json::json!(id_token);
+                }
+                if let Some(account_id) = identity.account_id {
+                    json["account_id"] = serde_json::json!(account_id);
+                }
+                if let Some(email) = identity.email {
+                    json["email"] = serde_json::json!(email);
+                }
+                json["codex_plan_type"] = serde_json::json!(identity.plan_type);
+                json["last_refresh"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+                json["type"] = serde_json::json!("codex");
             }
-
-            return Some(CodexAuth {
-                access_token: new_tokens.access_token,
-                account_id: candidate.id.clone(),
-                provider: candidate.provider.clone(),
-            });
         }
+
+        if let Ok(updated_content) = serde_json::to_string_pretty(&json) {
+            let _ = std::fs::write(&candidate.path, updated_content);
+        }
+
+        return Some(CodexAuth {
+            access_token: new_tokens.access_token,
+            account_id: candidate.id.clone(),
+            provider: candidate.provider.clone(),
+        });
     }
+
     None
 }
 
+fn ranked_codex_candidates(
+    model: &str,
+    advance_cursor: bool,
+    apply_side_effects: bool,
+) -> Vec<RankedCodexCandidate> {
+    let candidates = if advance_cursor {
+        select_auth_candidates("codex", model)
+    } else {
+        preview_auth_candidates("codex", model)
+    };
+    let mut ranked: Vec<(usize, AuthCandidate, CodexQuotaState, bool)> = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(idx, candidate)| {
+            let quota_state = codex_candidate_quota_state(&candidate);
+            if apply_side_effects {
+                match quota_state {
+                    CodexQuotaState::Available => {
+                        clear_account_exhausted("codex", &candidate.id);
+                    }
+                    CodexQuotaState::PrimaryExhausted
+                    | CodexQuotaState::SecondaryExhausted
+                    | CodexQuotaState::FullyExhausted => {
+                        mark_account_exhausted("codex", &candidate.id);
+                    }
+                    CodexQuotaState::Unknown => {}
+                }
+            }
+            let exhausted = is_account_exhausted("codex", &candidate.id);
+            (idx, candidate, quota_state, exhausted)
+        })
+        .collect();
+    ranked.sort_by(|a, b| a.2.rank().cmp(&b.2.rank()).then_with(|| a.0.cmp(&b.0)));
+
+    ranked
+        .into_iter()
+        .map(
+            |(_, candidate, quota_state, exhausted)| RankedCodexCandidate {
+                candidate,
+                quota_state,
+                exhausted,
+            },
+        )
+        .collect()
+}
+
+async fn get_codex_auths(model: &str) -> Vec<CodexAuth> {
+    let ranked = ranked_codex_candidates(model, true, true);
+    let mut auths = Vec::new();
+    for ranked_candidate in ranked {
+        let candidate = ranked_candidate.candidate;
+        if let Some(auth) = load_codex_auth_from_candidate(&candidate).await {
+            auths.push(auth);
+        }
+    }
+    auths
+}
+
+pub fn get_codex_routing_statuses() -> HashMap<String, CodexRoutingStatusSnapshot> {
+    let ranked = ranked_codex_candidates("", false, false);
+    ranked
+        .into_iter()
+        .enumerate()
+        .map(|(idx, ranked_candidate)| {
+            let account_id = normalize_account_id(&ranked_candidate.candidate.id);
+            let snapshot = CodexRoutingStatusSnapshot {
+                account_id: account_id.clone(),
+                order: idx + 1,
+                selected: idx == 0,
+                exhausted: ranked_candidate.exhausted,
+                quota_state: ranked_candidate.quota_state.as_str().to_string(),
+            };
+            (account_id, snapshot)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_codex_candidate(plan_type: &str) -> AuthCandidate {
+        AuthCandidate {
+            id: format!("codex-{}.json", plan_type),
+            path: PathBuf::new(),
+            priority: 0,
+            provider: "codex".to_string(),
+            codex_plan_type: Some(plan_type.to_string()),
+        }
+    }
+
+    #[test]
+    fn codex_models_follow_cliproxy_tiers() {
+        let free_ids: Vec<String> = get_codex_models_for_plan(Some("free"))
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert!(!free_ids.iter().any(|id| id == "gpt-5.4"));
+        assert!(!free_ids.iter().any(|id| id == "gpt-5.3-codex-spark"));
+
+        let team_ids: Vec<String> = get_codex_models_for_plan(Some("team"))
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert!(team_ids.iter().any(|id| id == "gpt-5.4"));
+        assert!(!team_ids.iter().any(|id| id == "gpt-5.3-codex-spark"));
+
+        let plus_ids: Vec<String> = get_codex_models_for_plan(Some("plus"))
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert!(plus_ids.iter().any(|id| id == "gpt-5.4"));
+        assert!(plus_ids.iter().any(|id| id == "gpt-5.3-codex-spark"));
+    }
+
+    #[test]
+    fn codex_candidate_support_is_plan_aware() {
+        let free_candidate = make_codex_candidate("free");
+        let team_candidate = make_codex_candidate("team");
+
+        assert!(candidate_supports_requested_model(
+            &free_candidate,
+            "codex/gpt-5.2-codex"
+        ));
+        assert!(!candidate_supports_requested_model(
+            &free_candidate,
+            "codex/gpt-5.4"
+        ));
+        assert!(candidate_supports_requested_model(
+            &team_candidate,
+            "codex/gpt-5.4"
+        ));
+        assert!(!candidate_supports_requested_model(
+            &team_candidate,
+            "codex/gpt-5.3-codex-spark"
+        ));
+    }
+
+    #[test]
+    fn normalize_model_name_keeps_gpt_decimal_versions() {
+        assert_eq!(normalize_model_name("gpt-5.4"), "gpt-5.4");
+        assert_eq!(
+            normalize_model_name("claude-4.5-sonnet"),
+            "claude-sonnet-4-5"
+        );
+    }
+
+    #[test]
+    fn codex_quota_status_respects_primary_and_secondary_windows() {
+        let available = openai::CodexQuotaData {
+            plan_type: "plus".to_string(),
+            primary_used: 60.0,
+            primary_resets_at: None,
+            secondary_used: 30.0,
+            secondary_resets_at: None,
+            has_credits: false,
+            unlimited_credits: false,
+            credits_balance: None,
+            last_updated: 0,
+            is_error: false,
+            error_message: None,
+        };
+        assert_eq!(codex_quota_state(&available), CodexQuotaState::Available);
+
+        let primary_exhausted = openai::CodexQuotaData {
+            primary_used: 100.0,
+            ..available.clone()
+        };
+        assert_eq!(
+            codex_quota_state(&primary_exhausted),
+            CodexQuotaState::PrimaryExhausted
+        );
+
+        let secondary_exhausted = openai::CodexQuotaData {
+            secondary_used: 100.0,
+            ..available.clone()
+        };
+        assert_eq!(
+            codex_quota_state(&secondary_exhausted),
+            CodexQuotaState::SecondaryExhausted
+        );
+    }
+
+    #[test]
+    fn codex_rotation_detects_quota_errors() {
+        let error = "Codex request failed: 429 {\"error\":\"rate_limit_exceeded\"}";
+        assert!(should_rotate_codex_error(error));
+        assert!(should_mark_account_exhausted(error));
+    }
+}
 
 fn normalize_antigravity_model(model: &str) -> String {
-    let name = model.split('/').last().unwrap_or(model).trim().to_lowercase();
+    let name = model
+        .split('/')
+        .last()
+        .unwrap_or(model)
+        .trim()
+        .to_lowercase();
     name
 }
 
@@ -2406,8 +3452,48 @@ fn antigravity_candidate_has_quota(candidate: &AuthCandidate, model: &str) -> Op
     antigravity_quota_status(&quota, model)
 }
 
-fn parse_antigravity_status(message: &str) -> Option<u16> {
-    let needle = "Antigravity request failed:";
+fn codex_quota_state(quota: &openai::CodexQuotaData) -> CodexQuotaState {
+    if quota.is_error {
+        return CodexQuotaState::Unknown;
+    }
+
+    let primary_remaining = (100.0 - quota.primary_used).max(0.0);
+    let secondary_remaining = (100.0 - quota.secondary_used).max(0.0);
+    match (primary_remaining > 0.01, secondary_remaining > 0.01) {
+        (true, true) => CodexQuotaState::Available,
+        (false, false) => CodexQuotaState::FullyExhausted,
+        (false, true) => CodexQuotaState::PrimaryExhausted,
+        (true, false) => CodexQuotaState::SecondaryExhausted,
+    }
+}
+
+fn codex_candidate_quota_state(candidate: &AuthCandidate) -> CodexQuotaState {
+    let account_id = candidate
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string());
+
+    let Some(account_id) = account_id else {
+        return CodexQuotaState::Unknown;
+    };
+
+    let cache = match crate::db::get_quota_cache(&account_id).ok().flatten() {
+        Some(cache) => cache,
+        None => return CodexQuotaState::Unknown,
+    };
+    if cache.provider != "codex" {
+        return CodexQuotaState::Unknown;
+    }
+
+    let quota: openai::CodexQuotaData = match serde_json::from_str(&cache.quota_data).ok() {
+        Some(quota) => quota,
+        None => return CodexQuotaState::Unknown,
+    };
+    codex_quota_state(&quota)
+}
+
+fn parse_request_failed_status(message: &str, needle: &str) -> Option<u16> {
     let start = message.find(needle)?;
     let rest = &message[start + needle.len()..];
     let mut digits = String::new();
@@ -2421,6 +3507,14 @@ fn parse_antigravity_status(message: &str) -> Option<u16> {
     digits.parse().ok()
 }
 
+fn parse_antigravity_status(message: &str) -> Option<u16> {
+    parse_request_failed_status(message, "Antigravity request failed:")
+}
+
+fn parse_codex_status(message: &str) -> Option<u16> {
+    parse_request_failed_status(message, "Codex request failed:")
+}
+
 fn should_rotate_antigravity_error(message: &str) -> bool {
     match parse_antigravity_status(message) {
         Some(429 | 401 | 403 | 500) => true,
@@ -2429,6 +3523,21 @@ fn should_rotate_antigravity_error(message: &str) -> bool {
             lower.contains("quota_exhausted")
                 || lower.contains("resource_exhausted")
                 || lower.contains("rate_limit_exceeded")
+        }
+    }
+}
+
+fn should_rotate_codex_error(message: &str) -> bool {
+    match parse_codex_status(message) {
+        Some(429 | 401 | 403 | 500) => true,
+        _ => {
+            let lower = message.to_lowercase();
+            lower.contains("quota_exhausted")
+                || lower.contains("resource_exhausted")
+                || lower.contains("rate_limit_exceeded")
+                || lower.contains("quota exceeded")
+                || lower.contains("rate limit")
+                || lower.contains("too many requests")
         }
     }
 }
@@ -2444,6 +3553,7 @@ fn should_mark_account_exhausted(message: &str) -> bool {
         || lower.contains("rate limit")
         // 429 Too Many Requests typically means quota/rate limit
         || parse_antigravity_status(message) == Some(429)
+        || parse_codex_status(message) == Some(429)
 }
 
 /// Get a valid Antigravity access token from stored credentials
@@ -2451,7 +3561,9 @@ async fn get_antigravity_auth(model: &str) -> Option<AntigravityAuth> {
     get_antigravity_auths(model).await.into_iter().next()
 }
 
-async fn load_antigravity_auth_from_candidate(candidate: &AuthCandidate) -> Option<AntigravityAuth> {
+async fn load_antigravity_auth_from_candidate(
+    candidate: &AuthCandidate,
+) -> Option<AntigravityAuth> {
     let content = std::fs::read_to_string(&candidate.path).ok()?;
     let mut json: serde_json::Value = serde_json::from_str(&content).ok()?;
 
@@ -2495,9 +3607,9 @@ async fn load_antigravity_auth_from_candidate(candidate: &AuthCandidate) -> Opti
             return None;
         }
     };
-    let new_expiry = new_tokens.expires_in.map(|secs| {
-        (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
-    });
+    let new_expiry = new_tokens
+        .expires_in
+        .map(|secs| (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339());
 
     match snapshot.location {
         TokenLocation::Nested => {
@@ -2578,7 +3690,10 @@ async fn get_antigravity_auths(model: &str) -> Vec<AntigravityAuth> {
             })
             .collect();
         ranked.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
-        ranked.into_iter().map(|(_, candidate, _)| candidate).collect()
+        ranked
+            .into_iter()
+            .map(|(_, candidate, _)| candidate)
+            .collect()
     };
 
     let mut auths = Vec::new();
@@ -2603,13 +3718,17 @@ async fn get_kiro_auth(model: &str) -> Option<KiroAuthWithAccount> {
         let email = std::fs::read_to_string(&candidate.path)
             .ok()
             .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .and_then(|json| json.get("email").and_then(|v| v.as_str()).map(|s| s.to_string()));
+            .and_then(|json| {
+                json.get("email")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
         let account_id = email.unwrap_or_else(|| candidate.id.clone());
 
         if !is_expired(snapshot.expires_at) && !snapshot.access_token.trim().is_empty() {
             if let Ok(auth) = kiro::snapshot_to_auth(snapshot) {
-                return Some(KiroAuthWithAccount { 
-                    auth, 
+                return Some(KiroAuthWithAccount {
+                    auth,
                     account_id,
                     provider: candidate.provider.clone(),
                 });
@@ -2623,8 +3742,8 @@ async fn get_kiro_auth(model: &str) -> Option<KiroAuthWithAccount> {
 
         if let Ok(updated) = kiro::refresh_kiro_auth(&candidate.path, &snapshot).await {
             if let Ok(auth) = kiro::snapshot_to_auth(updated) {
-                return Some(KiroAuthWithAccount { 
-                    auth, 
+                return Some(KiroAuthWithAccount {
+                    auth,
                     account_id,
                     provider: candidate.provider.clone(),
                 });
@@ -2633,7 +3752,6 @@ async fn get_kiro_auth(model: &str) -> Option<KiroAuthWithAccount> {
     }
     None
 }
-
 
 /// Get a Kimi API key from stored credentials
 async fn get_kimi_token(model: &str) -> Option<String> {
@@ -2688,7 +3806,8 @@ enum CustomProviderType {
 }
 
 /// API key selector state for custom providers (round-robin)
-static CUSTOM_PROVIDER_KEY_SELECTOR: Lazy<Mutex<HashMap<String, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static CUSTOM_PROVIDER_KEY_SELECTOR: Lazy<Mutex<HashMap<String, usize>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Get custom provider info by prefix
 fn get_custom_provider_info(provider_key: &str) -> Option<CustomProviderInfo> {
@@ -2794,8 +3913,10 @@ async fn forward_openai_compatible(
         let body = response.bytes().await.unwrap_or_default();
         let mut resp = Response::new(Body::from(body));
         *resp.status_mut() = status;
-        resp.headers_mut()
-            .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
         return resp;
     }
 
@@ -2818,12 +3939,13 @@ async fn forward_openai_compatible(
     Json(json_body).into_response()
 }
 
-pub async fn chat_completions(
-    State(_state): State<AppState>,
-    Json(raw): Json<Value>,
-) -> Response {
+pub async fn chat_completions(State(_state): State<AppState>, Json(raw): Json<Value>) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
-    let raw_model = raw.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let raw_model = raw
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let is_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let (provider_override, model) = parse_provider_prefix(&raw_model);
 
@@ -2831,19 +3953,21 @@ pub async fn chat_completions(
     let (resolved_provider, resolved_model, fallback_providers) = if provider_override.is_some() {
         (provider_override, model, Vec::new())
     } else {
-        use super::model_router::{resolve_model, ResolvedModel, get_provider_model_name};
+        use super::model_router::{get_provider_model_name, resolve_model, ResolvedModel};
         match resolve_model(&raw_model, None) {
-            ResolvedModel::Explicit { provider, model } => {
-                (Some(provider), model, Vec::new())
-            }
-            ResolvedModel::Aggregated { provider, model, fallbacks } => {
+            ResolvedModel::Explicit { provider, model } => (Some(provider), model, Vec::new()),
+            ResolvedModel::Aggregated {
+                provider,
+                model,
+                fallbacks,
+            } => {
                 // Use smart provider selection that checks for recovered high-priority providers
-                let (selected_provider, remaining_fallbacks) = 
+                let (selected_provider, remaining_fallbacks) =
                     select_best_provider_for_aggregation(&provider, &fallbacks);
-                
+
                 // Convert model name to the selected provider's format
                 let actual_model = get_provider_model_name(&raw_model, &selected_provider);
-                
+
                 tracing::info!(
                     "[ModelAggregation] Selected provider '{}' for model '{}' (original: '{}', fallbacks: {:?})",
                     selected_provider,
@@ -2946,24 +4070,21 @@ pub async fn chat_completions(
         }
     }
 
-
     if provider_override.as_deref() == Some("codex") {
         // Parse reasoning_effort from model name (e.g., "high/gpt-5-codex")
         let (actual_model, reasoning_effort) = parse_codex_model_with_effort(&model);
 
-        let auth = match get_codex_auth(&actual_model).await {
-            Some(a) => a,
-            None => {
-                return Json(json!({
-                    "error": {
-                        "message": "No valid Codex credentials found. Please login with Codex first.",
-                        "type": "authentication_error",
-                        "code": 401
-                    }
-                }))
-                .into_response();
-            }
-        };
+        let auths = get_codex_auths(&actual_model).await;
+        if auths.is_empty() {
+            return Json(json!({
+                "error": {
+                    "message": "No valid Codex credentials found. Please login with Codex first.",
+                    "type": "authentication_error",
+                    "code": 401
+                }
+            }))
+            .into_response();
+        }
 
         // Inject reasoning_effort into request if parsed from model name
         let mut modified_raw = raw.clone();
@@ -2971,58 +4092,109 @@ pub async fn chat_completions(
             modified_raw["reasoning_effort"] = json!(effort);
         }
 
-        let client = CodexClient::new(auth.access_token.clone());
         let codex_request = codex::openai_to_codex_request(&modified_raw, &actual_model, true);
+        let mut last_error: Option<String> = None;
+        let total = auths.len();
 
-        if is_stream {
-            match client.stream_responses(&codex_request, true).await {
-                Ok(response) => {
-                    let stream = codex::codex_stream_to_openai_events(response, raw.clone());
-                    return with_log_info(Sse::new(stream), &auth.provider, &auth.account_id, &actual_model);
-                }
-                Err(e) => {
-                    tracing::error!("Codex API error: {}", e);
-                    return Json(json!({
-                        "error": {
-                            "message": format!("Codex API error: {}", e),
-                            "type": "api_error",
-                            "code": 500
-                        }
-                    }))
-                    .into_response();
-                }
-            }
-        }
+        for (idx, auth) in auths.into_iter().enumerate() {
+            let client = CodexClient::new(auth.access_token.clone());
 
-        match client.stream_responses(&codex_request, true).await {
-            Ok(response) => match codex::collect_non_stream_response(response, &raw).await {
-                Ok(openai_response) => return with_log_info(Json(openai_response), &auth.provider, &auth.account_id, &actual_model),
-                Err(e) => {
-                    tracing::error!("Codex API error: {}", e);
-                    return Json(json!({
-                        "error": {
-                            "message": format!("Codex API error: {}", e),
-                            "type": "api_error",
-                            "code": 500
-                        }
-                    }))
-                    .into_response();
-                }
-            },
-            Err(e) => {
-                tracing::error!("Codex API error: {}", e);
-                return Json(json!({
-                    "error": {
-                        "message": format!("Codex API error: {}", e),
-                        "type": "api_error",
-                        "code": 500
+            if is_stream {
+                match client.stream_responses(&codex_request, true).await {
+                    Ok(response) => {
+                        clear_account_exhausted(&auth.provider, &auth.account_id);
+                        let stream = codex::codex_stream_to_openai_events(response, raw.clone());
+                        return with_log_info(
+                            Sse::new(stream),
+                            &auth.provider,
+                            &auth.account_id,
+                            &actual_model,
+                        );
                     }
-                }))
-                .into_response();
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::error!("Codex API error: {}", msg);
+                        last_error = Some(msg.clone());
+                        if should_rotate_codex_error(&msg) && idx + 1 < total {
+                            if should_mark_account_exhausted(&msg) {
+                                mark_account_exhausted(&auth.provider, &auth.account_id);
+                            }
+                            continue;
+                        }
+                        return Json(json!({
+                            "error": {
+                                "message": format!("Codex API error: {}", msg),
+                                "type": "api_error",
+                                "code": 500
+                            }
+                        }))
+                        .into_response();
+                    }
+                }
+            }
+
+            match client.stream_responses(&codex_request, true).await {
+                Ok(response) => match codex::collect_non_stream_response(response, &raw).await {
+                    Ok(openai_response) => {
+                        clear_account_exhausted(&auth.provider, &auth.account_id);
+                        return with_log_info(
+                            Json(openai_response),
+                            &auth.provider,
+                            &auth.account_id,
+                            &actual_model,
+                        );
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::error!("Codex API error: {}", msg);
+                        last_error = Some(msg.clone());
+                        if should_rotate_codex_error(&msg) && idx + 1 < total {
+                            if should_mark_account_exhausted(&msg) {
+                                mark_account_exhausted(&auth.provider, &auth.account_id);
+                            }
+                            continue;
+                        }
+                        return Json(json!({
+                            "error": {
+                                "message": format!("Codex API error: {}", msg),
+                                "type": "api_error",
+                                "code": 500
+                            }
+                        }))
+                        .into_response();
+                    }
+                },
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::error!("Codex API error: {}", msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_codex_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(&auth.provider, &auth.account_id);
+                        }
+                        continue;
+                    }
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Codex API error: {}", msg),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
             }
         }
-    }
 
+        return Json(json!({
+            "error": {
+                "message": format!("Codex API error: {}", last_error.unwrap_or_else(|| "unknown error".to_string())),
+                "type": "api_error",
+                "code": 500
+            }
+        }))
+        .into_response();
+    }
 
     if provider_override.as_deref() == Some("antigravity") {
         let (actual_model, reasoning_effort) = parse_antigravity_model_with_effort(&model);
@@ -3073,11 +4245,19 @@ pub async fn chat_completions(
                 antigravity::openai_to_antigravity_request(&openai_raw, &actual_model, project_id);
 
             if is_stream {
-                match client.stream_generate_content(&antigravity_request, None).await {
+                match client
+                    .stream_generate_content(&antigravity_request, None)
+                    .await
+                {
                     Ok(response) => {
                         clear_account_exhausted(&provider, &account_id);
                         let stream = antigravity::antigravity_stream_to_openai_events(response);
-                        return with_log_info(Sse::new(stream), &provider, &account_id, &actual_model);
+                        return with_log_info(
+                            Sse::new(stream),
+                            &provider,
+                            &account_id,
+                            &actual_model,
+                        );
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -3102,13 +4282,24 @@ pub async fn chat_completions(
             }
 
             if antigravity::should_use_stream_for_non_stream(&actual_model) {
-                match client.stream_generate_content(&antigravity_request, None).await {
+                match client
+                    .stream_generate_content(&antigravity_request, None)
+                    .await
+                {
                     Ok(response) => match antigravity::collect_antigravity_stream(response).await {
                         Ok(payload) => {
                             clear_account_exhausted(&provider, &account_id);
-                            let openai_response =
-                                gemini::gemini_to_openai_response(&payload, &actual_model, &request_id);
-                            return with_log_info(Json(openai_response), &provider, &account_id, &actual_model);
+                            let openai_response = gemini::gemini_to_openai_response(
+                                &payload,
+                                &actual_model,
+                                &request_id,
+                            );
+                            return with_log_info(
+                                Json(openai_response),
+                                &provider,
+                                &account_id,
+                                &actual_model,
+                            );
                         }
                         Err(e) => {
                             tracing::error!("Antigravity API error: {}", e);
@@ -3149,7 +4340,12 @@ pub async fn chat_completions(
                     clear_account_exhausted(&provider, &account_id);
                     let openai_response =
                         gemini::gemini_to_openai_response(&response, &actual_model, &request_id);
-                    return with_log_info(Json(openai_response), &provider, &account_id, &actual_model);
+                    return with_log_info(
+                        Json(openai_response),
+                        &provider,
+                        &account_id,
+                        &actual_model,
+                    );
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -3172,7 +4368,6 @@ pub async fn chat_completions(
                 }
             }
         }
-
 
         let message = last_error.unwrap_or_else(|| "Antigravity API error".to_string());
         return Json(json!({
@@ -3282,7 +4477,9 @@ pub async fn chat_completions(
         )
         .await
         {
-            Ok(openai_response) => return with_log_info(Json(openai_response), provider, account_id, &model),
+            Ok(openai_response) => {
+                return with_log_info(Json(openai_response), provider, account_id, &model)
+            }
             Err(e) => {
                 return Json(json!({
                     "error": {
@@ -3295,8 +4492,6 @@ pub async fn chat_completions(
             }
         }
     }
-
-
 
     if matches!(provider_override.as_deref(), Some("kimi") | Some("glm")) {
         let request: ChatCompletionRequest = match serde_json::from_value(raw.clone()) {
@@ -3407,10 +4602,10 @@ pub async fn chat_completions(
 
         match client.create_message(claude_request).await {
             Ok(response) => {
-            let openai_response =
-                claude::claude_to_openai_response(&response, &model, &request_id);
-            return Json(openai_response).into_response();
-        }
+                let openai_response =
+                    claude::claude_to_openai_response(&response, &model, &request_id);
+                return Json(openai_response).into_response();
+            }
             Err(e) => {
                 tracing::error!("Claude API error: {}", e);
                 return Json(json!({
@@ -3427,7 +4622,8 @@ pub async fn chat_completions(
 
     // Handle custom providers (OpenAI-compatible and Claude Code-compatible)
     if let Some(ref provider_key) = provider_override {
-        if provider_key.starts_with("openai-compat:") || provider_key.starts_with("claude-compat:") {
+        if provider_key.starts_with("openai-compat:") || provider_key.starts_with("claude-compat:")
+        {
             let provider_info = match get_custom_provider_info(provider_key) {
                 Some(info) => info,
                 None => {
@@ -3457,7 +4653,8 @@ pub async fn chat_completions(
                         &provider_info.api_key,
                         is_stream,
                         provider_name,
-                    ).await;
+                    )
+                    .await;
                 }
                 CustomProviderType::ClaudeCodeCompat => {
                     // Convert OpenAI request to Claude format, call API, convert response back
@@ -3517,39 +4714,48 @@ pub async fn chat_completions(
                             let body = response.bytes().await.unwrap_or_default();
                             let mut resp = Response::new(Body::from(body));
                             *resp.status_mut() = status;
-                            resp.headers_mut()
-                                .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                            resp.headers_mut().insert(
+                                header::CONTENT_TYPE,
+                                HeaderValue::from_static("application/json"),
+                            );
                             return resp;
                         }
 
                         // Convert Claude stream to OpenAI stream
                         let byte_stream = response.bytes_stream();
                         let model_clone = model.clone();
-                        let stream = byte_stream
-                            .map(move |result| {
-                                match result {
-                                    Ok(bytes) => {
-                                        let text = String::from_utf8_lossy(&bytes);
-                                        let mut output = String::new();
-                                        for line in text.lines() {
-                                            if let Some(data) = line.strip_prefix("data: ") {
-                                                if data.trim().is_empty() || data.trim() == "[DONE]" {
-                                                    continue;
-                                                }
-                                                if let Ok(event) = serde_json::from_str::<Value>(data) {
-                                                    // Convert Claude event to OpenAI chunk
-                                                    let openai_chunk = claude::claude_stream_to_openai_chunk(&event, &model_clone);
-                                                    if let Some(chunk) = openai_chunk {
-                                                        output.push_str(&format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap_or_default()));
-                                                    }
+                        let stream = byte_stream.map(move |result| {
+                            match result {
+                                Ok(bytes) => {
+                                    let text = String::from_utf8_lossy(&bytes);
+                                    let mut output = String::new();
+                                    for line in text.lines() {
+                                        if let Some(data) = line.strip_prefix("data: ") {
+                                            if data.trim().is_empty() || data.trim() == "[DONE]" {
+                                                continue;
+                                            }
+                                            if let Ok(event) = serde_json::from_str::<Value>(data) {
+                                                // Convert Claude event to OpenAI chunk
+                                                let openai_chunk =
+                                                    claude::claude_stream_to_openai_chunk(
+                                                        &event,
+                                                        &model_clone,
+                                                    );
+                                                if let Some(chunk) = openai_chunk {
+                                                    output.push_str(&format!(
+                                                        "data: {}\n\n",
+                                                        serde_json::to_string(&chunk)
+                                                            .unwrap_or_default()
+                                                    ));
                                                 }
                                             }
                                         }
-                                        Ok::<_, std::io::Error>(Bytes::from(output))
                                     }
-                                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                                    Ok::<_, std::io::Error>(Bytes::from(output))
                                 }
-                            });
+                                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                            }
+                        });
 
                         let mut resp = Response::new(Body::from_stream(stream));
                         *resp.status_mut() = StatusCode::OK;
@@ -3567,7 +4773,8 @@ pub async fn chat_completions(
                         &provider_info.api_key,
                         false,
                         provider_name,
-                    ).await;
+                    )
+                    .await;
 
                     // Extract the Claude response and convert to OpenAI format
                     let (parts, body) = response.into_parts();
@@ -3588,8 +4795,10 @@ pub async fn chat_completions(
                     if !parts.status.is_success() {
                         let mut resp = Response::new(Body::from(body_bytes));
                         *resp.status_mut() = parts.status;
-                        resp.headers_mut()
-                            .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                        resp.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/json"),
+                        );
                         return resp;
                     }
 
@@ -3607,7 +4816,11 @@ pub async fn chat_completions(
                         }
                     };
 
-                    let openai_response = claude::claude_value_to_openai_response(&claude_response, &model, &request_id);
+                    let openai_response = claude::claude_value_to_openai_response(
+                        &claude_response,
+                        &model,
+                        &request_id,
+                    );
                     return Json(openai_response).into_response();
                 }
             }
@@ -3624,33 +4837,36 @@ pub async fn chat_completions(
     .into_response()
 }
 
-pub async fn completions(
-    State(_state): State<AppState>,
-    Json(raw): Json<Value>,
-) -> Response {
+pub async fn completions(State(_state): State<AppState>, Json(raw): Json<Value>) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
     let is_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let chat_request = convert_completions_request_to_chat(&raw);
-    let raw_model = chat_request.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let raw_model = chat_request
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let (provider_override, model) = parse_provider_prefix(&raw_model);
 
     // Use model router to resolve provider in aggregation mode
     let (resolved_provider, resolved_model, _fallback_providers) = if provider_override.is_some() {
         (provider_override, model, Vec::new())
     } else {
-        use super::model_router::{resolve_model, ResolvedModel, get_provider_model_name};
+        use super::model_router::{get_provider_model_name, resolve_model, ResolvedModel};
         match resolve_model(&raw_model, None) {
-            ResolvedModel::Explicit { provider, model } => {
-                (Some(provider), model, Vec::new())
-            }
-            ResolvedModel::Aggregated { provider, model: _, fallbacks } => {
+            ResolvedModel::Explicit { provider, model } => (Some(provider), model, Vec::new()),
+            ResolvedModel::Aggregated {
+                provider,
+                model: _,
+                fallbacks,
+            } => {
                 // Use smart provider selection that checks for recovered high-priority providers
-                let (selected_provider, remaining_fallbacks) = 
+                let (selected_provider, remaining_fallbacks) =
                     select_best_provider_for_aggregation(&provider, &fallbacks);
-                
+
                 // Convert model name to the selected provider's format
                 let actual_model = get_provider_model_name(&raw_model, &selected_provider);
-                
+
                 tracing::info!(
                     "[ModelAggregation/completions] Selected provider '{}' for model '{}' (fallbacks: {:?})",
                     selected_provider,
@@ -3765,19 +4981,17 @@ pub async fn completions(
         // Parse reasoning_effort from model name (e.g., "high/gpt-5-codex")
         let (actual_model, reasoning_effort) = parse_codex_model_with_effort(&model);
 
-        let auth = match get_codex_auth(&actual_model).await {
-            Some(a) => a,
-            None => {
-                return Json(json!({
-                    "error": {
-                        "message": "No valid Codex credentials found. Please login with Codex first.",
-                        "type": "authentication_error",
-                        "code": 401
-                    }
-                }))
-                .into_response();
-            }
-        };
+        let auths = get_codex_auths(&actual_model).await;
+        if auths.is_empty() {
+            return Json(json!({
+                "error": {
+                    "message": "No valid Codex credentials found. Please login with Codex first.",
+                    "type": "authentication_error",
+                    "code": 401
+                }
+            }))
+            .into_response();
+        }
 
         // Inject reasoning_effort into request if parsed from model name
         let mut modified_request = chat_request.clone();
@@ -3785,74 +4999,127 @@ pub async fn completions(
             modified_request["reasoning_effort"] = json!(effort);
         }
 
-        let client = CodexClient::new(auth.access_token.clone());
         let codex_request = codex::openai_to_codex_request(&modified_request, &actual_model, true);
+        let mut last_error: Option<String> = None;
+        let total = auths.len();
 
-        if is_stream {
+        for (idx, auth) in auths.into_iter().enumerate() {
+            let client = CodexClient::new(auth.access_token.clone());
+
+            if is_stream {
+                match client.stream_responses(&codex_request, true).await {
+                    Ok(response) => {
+                        clear_account_exhausted(&auth.provider, &auth.account_id);
+                        let upstream =
+                            codex::codex_stream_to_openai_chunks(response, chat_request.clone());
+                        let stream = async_stream::stream! {
+                            futures::pin_mut!(upstream);
+                            while let Some(chunk) = upstream.next().await {
+                                if chunk == "[DONE]" {
+                                    yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
+                                    return;
+                                }
+                                if let Some(converted) = convert_chat_stream_chunk_to_completions(&chunk) {
+                                    yield Ok::<Event, Infallible>(Event::default().data(converted));
+                                }
+                            }
+                            yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
+                        };
+                        return with_log_info(
+                            Sse::new(stream),
+                            &auth.provider,
+                            &auth.account_id,
+                            &actual_model,
+                        );
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::error!("Codex API error: {}", msg);
+                        last_error = Some(msg.clone());
+                        if should_rotate_codex_error(&msg) && idx + 1 < total {
+                            if should_mark_account_exhausted(&msg) {
+                                mark_account_exhausted(&auth.provider, &auth.account_id);
+                            }
+                            continue;
+                        }
+                        return Json(json!({
+                            "error": {
+                                "message": format!("Codex API error: {}", msg),
+                                "type": "api_error",
+                                "code": 500
+                            }
+                        }))
+                        .into_response();
+                    }
+                }
+            }
+
             match client.stream_responses(&codex_request, true).await {
                 Ok(response) => {
-                    let upstream = codex::codex_stream_to_openai_chunks(response, chat_request.clone());
-                    let stream = async_stream::stream! {
-                        futures::pin_mut!(upstream);
-                        while let Some(chunk) = upstream.next().await {
-                            if chunk == "[DONE]" {
-                                yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
-                                return;
+                    match codex::collect_non_stream_response(response, &chat_request).await {
+                        Ok(openai_response) => {
+                            clear_account_exhausted(&auth.provider, &auth.account_id);
+                            let completions_response =
+                                convert_chat_response_to_completions(&openai_response);
+                            return with_log_info(
+                                Json(completions_response),
+                                &auth.provider,
+                                &auth.account_id,
+                                &actual_model,
+                            );
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            tracing::error!("Codex API error: {}", msg);
+                            last_error = Some(msg.clone());
+                            if should_rotate_codex_error(&msg) && idx + 1 < total {
+                                if should_mark_account_exhausted(&msg) {
+                                    mark_account_exhausted(&auth.provider, &auth.account_id);
+                                }
+                                continue;
                             }
-                            if let Some(converted) = convert_chat_stream_chunk_to_completions(&chunk) {
-                                yield Ok::<Event, Infallible>(Event::default().data(converted));
-                            }
+                            return Json(json!({
+                                "error": {
+                                    "message": format!("Codex API error: {}", msg),
+                                    "type": "api_error",
+                                    "code": 500
+                                }
+                            }))
+                            .into_response();
                         }
-                        yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
-                    };
-                    return with_log_info(Sse::new(stream), &auth.provider, &auth.account_id, &actual_model);
-                }
-                Err(e) => {
-                    tracing::error!("Codex API error: {}", e);
-                    return Json(json!({
-                        "error": {
-                            "message": format!("Codex API error: {}", e),
-                            "type": "api_error",
-                            "code": 500
-                        }
-                    }))
-                    .into_response();
-                }
-            }
-        }
-
-        match client.stream_responses(&codex_request, true).await {
-            Ok(response) => match codex::collect_non_stream_response(response, &chat_request).await {
-                Ok(openai_response) => {
-                    let completions_response = convert_chat_response_to_completions(&openai_response);
-                    return with_log_info(Json(completions_response), &auth.provider, &auth.account_id, &actual_model);
-                }
-                Err(e) => {
-                    tracing::error!("Codex API error: {}", e);
-                    return Json(json!({
-                        "error": {
-                            "message": format!("Codex API error: {}", e),
-                            "type": "api_error",
-                            "code": 500
-                        }
-                    }))
-                    .into_response();
-                }
-            },
-            Err(e) => {
-                tracing::error!("Codex API error: {}", e);
-                return Json(json!({
-                    "error": {
-                        "message": format!("Codex API error: {}", e),
-                        "type": "api_error",
-                        "code": 500
                     }
-                }))
-                .into_response();
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::error!("Codex API error: {}", msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_codex_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(&auth.provider, &auth.account_id);
+                        }
+                        continue;
+                    }
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Codex API error: {}", msg),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
             }
         }
-    }
 
+        return Json(json!({
+            "error": {
+                "message": format!("Codex API error: {}", last_error.unwrap_or_else(|| "unknown error".to_string())),
+                "type": "api_error",
+                "code": 500
+            }
+        }))
+        .into_response();
+    }
 
     if provider_override.as_deref() == Some("antigravity") {
         let (actual_model, reasoning_effort) = parse_antigravity_model_with_effort(&model);
@@ -3903,7 +5170,10 @@ pub async fn completions(
                 antigravity::openai_to_antigravity_request(&openai_raw, &actual_model, project_id);
 
             if is_stream {
-                match client.stream_generate_content(&antigravity_request, None).await {
+                match client
+                    .stream_generate_content(&antigravity_request, None)
+                    .await
+                {
                     Ok(response) => {
                         clear_account_exhausted(&provider, &account_id);
                         let upstream = antigravity::antigravity_stream_to_openai_chunks(response);
@@ -3920,7 +5190,12 @@ pub async fn completions(
                             }
                             yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
                         };
-                        return with_log_info(Sse::new(stream), &provider, &account_id, &actual_model);
+                        return with_log_info(
+                            Sse::new(stream),
+                            &provider,
+                            &account_id,
+                            &actual_model,
+                        );
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -3945,14 +5220,26 @@ pub async fn completions(
             }
 
             if antigravity::should_use_stream_for_non_stream(&actual_model) {
-                match client.stream_generate_content(&antigravity_request, None).await {
+                match client
+                    .stream_generate_content(&antigravity_request, None)
+                    .await
+                {
                     Ok(response) => match antigravity::collect_antigravity_stream(response).await {
                         Ok(payload) => {
                             clear_account_exhausted(&provider, &account_id);
-                            let openai_response =
-                                gemini::gemini_to_openai_response(&payload, &actual_model, &request_id);
-                            let completions_response = convert_chat_response_to_completions(&openai_response);
-                            return with_log_info(Json(completions_response), &provider, &account_id, &actual_model);
+                            let openai_response = gemini::gemini_to_openai_response(
+                                &payload,
+                                &actual_model,
+                                &request_id,
+                            );
+                            let completions_response =
+                                convert_chat_response_to_completions(&openai_response);
+                            return with_log_info(
+                                Json(completions_response),
+                                &provider,
+                                &account_id,
+                                &actual_model,
+                            );
                         }
                         Err(e) => {
                             tracing::error!("Antigravity API error: {}", e);
@@ -3993,8 +5280,14 @@ pub async fn completions(
                     clear_account_exhausted(&provider, &account_id);
                     let openai_response =
                         gemini::gemini_to_openai_response(&response, &actual_model, &request_id);
-                    let completions_response = convert_chat_response_to_completions(&openai_response);
-                    return with_log_info(Json(completions_response), &provider, &account_id, &actual_model);
+                    let completions_response =
+                        convert_chat_response_to_completions(&openai_response);
+                    return with_log_info(
+                        Json(completions_response),
+                        &provider,
+                        &account_id,
+                        &actual_model,
+                    );
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -4017,7 +5310,6 @@ pub async fn completions(
                 }
             }
         }
-
 
         let message = last_error.unwrap_or_else(|| "Antigravity API error".to_string());
         return Json(json!({
@@ -4068,7 +5360,12 @@ pub async fn completions(
             None
         };
 
-        let payload = match kiro::build_kiro_payload_from_openai(&chat_request, &resolution.internal_id, conversation_id, profile_arn) {
+        let payload = match kiro::build_kiro_payload_from_openai(
+            &chat_request,
+            &resolution.internal_id,
+            conversation_id,
+            profile_arn,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 return Json(json!({
@@ -4112,7 +5409,9 @@ pub async fn completions(
             let stream = stream.map(|chunk| {
                 convert_chat_stream_chunk_to_completions(&chunk)
                     .map(|data| Ok::<Event, Infallible>(Event::default().data(data)))
-                    .unwrap_or_else(|| Ok::<Event, Infallible>(Event::default().data("{\"choices\":[]}")))
+                    .unwrap_or_else(|| {
+                        Ok::<Event, Infallible>(Event::default().data("{\"choices\":[]}"))
+                    })
             });
             let stream = stream.chain(futures::stream::once(async {
                 Ok(Event::default().data("[DONE]"))
@@ -4144,7 +5443,6 @@ pub async fn completions(
             }
         }
     }
-
 
     if matches!(provider_override.as_deref(), Some("kimi") | Some("glm")) {
         let request: ChatCompletionRequest = match serde_json::from_value(chat_request.clone()) {
@@ -4283,12 +5581,13 @@ pub async fn completions(
 }
 
 // Claude compatible endpoint
-pub async fn claude_messages(
-    State(_state): State<AppState>,
-    Json(raw): Json<Value>,
-) -> Response {
+pub async fn claude_messages(State(_state): State<AppState>, Json(raw): Json<Value>) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
-    let raw_model = raw.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let raw_model = raw
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let (provider_override, model) = parse_provider_prefix(&raw_model);
     let is_stream = raw.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -4296,19 +5595,21 @@ pub async fn claude_messages(
     let (resolved_provider, resolved_model, _fallback_providers) = if provider_override.is_some() {
         (provider_override, model, Vec::new())
     } else {
-        use super::model_router::{resolve_model, ResolvedModel, get_provider_model_name};
+        use super::model_router::{get_provider_model_name, resolve_model, ResolvedModel};
         match resolve_model(&raw_model, None) {
-            ResolvedModel::Explicit { provider, model } => {
-                (Some(provider), model, Vec::new())
-            }
-            ResolvedModel::Aggregated { provider, model: _, fallbacks } => {
+            ResolvedModel::Explicit { provider, model } => (Some(provider), model, Vec::new()),
+            ResolvedModel::Aggregated {
+                provider,
+                model: _,
+                fallbacks,
+            } => {
                 // Use smart provider selection that checks for recovered high-priority providers
-                let (selected_provider, remaining_fallbacks) = 
+                let (selected_provider, remaining_fallbacks) =
                     select_best_provider_for_aggregation(&provider, &fallbacks);
-                
+
                 // Convert model name to the selected provider's format
                 let actual_model = get_provider_model_name(&raw_model, &selected_provider);
-                
+
                 tracing::info!(
                     "[ModelAggregation/claude_messages] Selected provider '{}' for model '{}' (fallbacks: {:?})",
                     selected_provider,
@@ -4402,7 +5703,8 @@ pub async fn claude_messages(
             payload["stream"] = json!(true);
         }
 
-        return forward_claude_compatible(payload, base_url, &token, is_stream, provider_label).await;
+        return forward_claude_compatible(payload, base_url, &token, is_stream, provider_label)
+            .await;
     }
 
     let image_handling = match provider_override.as_deref() {
@@ -4413,7 +5715,8 @@ pub async fn claude_messages(
         _ => claude::ClaudeImageHandling::Base64AndUrl,
     };
     let guard_thinking = provider_override.as_deref() == Some("antigravity");
-    let mut openai_raw = claude::claude_request_to_openai_chat(&raw, &model, image_handling, guard_thinking);
+    let mut openai_raw =
+        claude::claude_request_to_openai_chat(&raw, &model, image_handling, guard_thinking);
 
     if provider_override.as_deref() == Some("gemini") {
         let auth = match get_gemini_auth(&model).await {
@@ -4483,19 +5786,17 @@ pub async fn claude_messages(
         // Parse reasoning_effort from model name (e.g., "high/gpt-5-codex")
         let (actual_model, reasoning_effort) = parse_codex_model_with_effort(&model);
 
-        let auth = match get_codex_auth(&actual_model).await {
-            Some(a) => a,
-            None => {
-                return Json(json!({
-                    "error": {
-                        "message": "No valid Codex credentials found. Please login with Codex first.",
-                        "type": "authentication_error",
-                        "code": 401
-                    }
-                }))
-                .into_response();
-            }
-        };
+        let auths = get_codex_auths(&actual_model).await;
+        if auths.is_empty() {
+            return Json(json!({
+                "error": {
+                    "message": "No valid Codex credentials found. Please login with Codex first.",
+                    "type": "authentication_error",
+                    "code": 401
+                }
+            }))
+            .into_response();
+        }
 
         // Inject reasoning_effort into request if parsed from model name
         let mut modified_openai_raw = openai_raw.clone();
@@ -4503,63 +5804,121 @@ pub async fn claude_messages(
             modified_openai_raw["reasoning_effort"] = json!(effort);
         }
 
-        let client = CodexClient::new(auth.access_token.clone());
-        let codex_request = codex::openai_to_codex_request(&modified_openai_raw, &actual_model, true);
+        let codex_request =
+            codex::openai_to_codex_request(&modified_openai_raw, &actual_model, true);
+        let mut last_error: Option<String> = None;
+        let total = auths.len();
 
-        if is_stream {
+        for (idx, auth) in auths.into_iter().enumerate() {
+            let client = CodexClient::new(auth.access_token.clone());
+
+            if is_stream {
+                match client.stream_responses(&codex_request, true).await {
+                    Ok(response) => {
+                        clear_account_exhausted(&auth.provider, &auth.account_id);
+                        let upstream = codex::codex_stream_to_openai_chunks(
+                            response,
+                            modified_openai_raw.clone(),
+                        );
+                        let stream = openai_chunks_to_claude_events(upstream, &actual_model);
+                        return with_log_info(
+                            Sse::new(stream),
+                            &auth.provider,
+                            &auth.account_id,
+                            &actual_model,
+                        );
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::error!("Codex API error: {}", msg);
+                        last_error = Some(msg.clone());
+                        if should_rotate_codex_error(&msg) && idx + 1 < total {
+                            if should_mark_account_exhausted(&msg) {
+                                mark_account_exhausted(&auth.provider, &auth.account_id);
+                            }
+                            continue;
+                        }
+                        return Json(json!({
+                            "error": {
+                                "message": format!("Codex API error: {}", msg),
+                                "type": "api_error",
+                                "code": 500
+                            }
+                        }))
+                        .into_response();
+                    }
+                }
+            }
+
             match client.stream_responses(&codex_request, true).await {
                 Ok(response) => {
-                    let upstream = codex::codex_stream_to_openai_chunks(response, modified_openai_raw.clone());
-                    let stream = openai_chunks_to_claude_events(upstream, &actual_model);
-                    return with_log_info(Sse::new(stream), &auth.provider, &auth.account_id, &actual_model);
-                }
-                Err(e) => {
-                    tracing::error!("Codex API error: {}", e);
-                    return Json(json!({
-                        "error": {
-                            "message": format!("Codex API error: {}", e),
-                            "type": "api_error",
-                            "code": 500
+                    match codex::collect_non_stream_response(response, &modified_openai_raw).await {
+                        Ok(openai_response) => {
+                            clear_account_exhausted(&auth.provider, &auth.account_id);
+                            let claude_response = claude::openai_to_claude_response(
+                                &openai_response,
+                                &actual_model,
+                                &request_id,
+                            );
+                            return with_log_info(
+                                Json(claude_response),
+                                &auth.provider,
+                                &auth.account_id,
+                                &actual_model,
+                            );
                         }
-                    }))
-                    .into_response();
-                }
-            }
-        }
-
-        match client.stream_responses(&codex_request, true).await {
-            Ok(response) => match codex::collect_non_stream_response(response, &modified_openai_raw).await {
-                Ok(openai_response) => {
-                    let claude_response =
-                        claude::openai_to_claude_response(&openai_response, &actual_model, &request_id);
-                    return with_log_info(Json(claude_response), &auth.provider, &auth.account_id, &actual_model);
-                }
-                Err(e) => {
-                    tracing::error!("Codex API error: {}", e);
-                    return Json(json!({
-                        "error": {
-                            "message": format!("Codex API error: {}", e),
-                            "type": "api_error",
-                            "code": 500
+                        Err(e) => {
+                            let msg = e.to_string();
+                            tracing::error!("Codex API error: {}", msg);
+                            last_error = Some(msg.clone());
+                            if should_rotate_codex_error(&msg) && idx + 1 < total {
+                                if should_mark_account_exhausted(&msg) {
+                                    mark_account_exhausted(&auth.provider, &auth.account_id);
+                                }
+                                continue;
+                            }
+                            return Json(json!({
+                                "error": {
+                                    "message": format!("Codex API error: {}", msg),
+                                    "type": "api_error",
+                                    "code": 500
+                                }
+                            }))
+                            .into_response();
                         }
-                    }))
-                    .into_response();
-                }
-            },
-            Err(e) => {
-                tracing::error!("Codex API error: {}", e);
-                return Json(json!({
-                    "error": {
-                        "message": format!("Codex API error: {}", e),
-                        "type": "api_error",
-                        "code": 500
                     }
-                }))
-                .into_response();
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::error!("Codex API error: {}", msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_codex_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(&auth.provider, &auth.account_id);
+                        }
+                        continue;
+                    }
+                    return Json(json!({
+                        "error": {
+                            "message": format!("Codex API error: {}", msg),
+                            "type": "api_error",
+                            "code": 500
+                        }
+                    }))
+                    .into_response();
+                }
             }
         }
-    }
 
+        return Json(json!({
+            "error": {
+                "message": format!("Codex API error: {}", last_error.unwrap_or_else(|| "unknown error".to_string())),
+                "type": "api_error",
+                "code": 500
+            }
+        }))
+        .into_response();
+    }
 
     if provider_override.as_deref() == Some("kiro") {
         let kiro_auth = match get_kiro_auth(&model).await {
@@ -4675,8 +6034,6 @@ pub async fn claude_messages(
         }
     }
 
-
-
     if provider_override.as_deref() == Some("antigravity") {
         let (actual_model, reasoning_effort) = parse_antigravity_model_with_effort(&model);
         let model_lower = actual_model.to_lowercase();
@@ -4730,7 +6087,10 @@ pub async fn claude_messages(
                 antigravity::openai_to_antigravity_request(&openai_raw, &actual_model, project_id);
 
             if is_stream {
-                match client.stream_generate_content(&antigravity_request, None).await {
+                match client
+                    .stream_generate_content(&antigravity_request, None)
+                    .await
+                {
                     Ok(response) => {
                         clear_account_exhausted(&provider, &account_id);
                         let upstream = antigravity::antigravity_stream_to_openai_chunks(response);
@@ -4739,7 +6099,12 @@ pub async fn claude_messages(
                             &actual_model,
                             reasoning_as_text,
                         );
-                        return with_log_info(Sse::new(stream), &provider, &account_id, &actual_model);
+                        return with_log_info(
+                            Sse::new(stream),
+                            &provider,
+                            &account_id,
+                            &actual_model,
+                        );
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -4751,41 +6116,62 @@ pub async fn claude_messages(
                             }
                             continue;
                         }
-                        return with_log_info(Json(json!({
-                            "error": {
-                                "message": format!("Antigravity API error: {}", msg),
-                                "type": "api_error",
-                                "code": 500
-                            }
-                        })), &provider, &account_id, &actual_model);
+                        return with_log_info(
+                            Json(json!({
+                                "error": {
+                                    "message": format!("Antigravity API error: {}", msg),
+                                    "type": "api_error",
+                                    "code": 500
+                                }
+                            })),
+                            &provider,
+                            &account_id,
+                            &actual_model,
+                        );
                     }
                 }
             }
 
             if antigravity::should_use_stream_for_non_stream(&actual_model) {
-                match client.stream_generate_content(&antigravity_request, None).await {
+                match client
+                    .stream_generate_content(&antigravity_request, None)
+                    .await
+                {
                     Ok(response) => match antigravity::collect_antigravity_stream(response).await {
                         Ok(payload) => {
                             clear_account_exhausted(&provider, &account_id);
-                            let openai_response =
-                                gemini::gemini_to_openai_response(&payload, &actual_model, &request_id);
+                            let openai_response = gemini::gemini_to_openai_response(
+                                &payload,
+                                &actual_model,
+                                &request_id,
+                            );
                             let claude_response = claude::openai_to_claude_response_with_options(
                                 &openai_response,
                                 &actual_model,
                                 &request_id,
                                 reasoning_as_text,
                             );
-                            return with_log_info(Json(claude_response), &provider, &account_id, &actual_model);
+                            return with_log_info(
+                                Json(claude_response),
+                                &provider,
+                                &account_id,
+                                &actual_model,
+                            );
                         }
                         Err(e) => {
                             tracing::error!("Antigravity API error: {}", e);
-                            return with_log_info(Json(json!({
-                                "error": {
-                                    "message": format!("Antigravity API error: {}", e),
-                                    "type": "api_error",
-                                    "code": 500
-                                }
-                            })), &provider, &account_id, &actual_model);
+                            return with_log_info(
+                                Json(json!({
+                                    "error": {
+                                        "message": format!("Antigravity API error: {}", e),
+                                        "type": "api_error",
+                                        "code": 500
+                                    }
+                                })),
+                                &provider,
+                                &account_id,
+                                &actual_model,
+                            );
                         }
                     },
                     Err(e) => {
@@ -4798,13 +6184,18 @@ pub async fn claude_messages(
                             }
                             continue;
                         }
-                        return with_log_info(Json(json!({
-                            "error": {
-                                "message": format!("Antigravity API error: {}", msg),
-                                "type": "api_error",
-                                "code": 500
-                            }
-                        })), &provider, &account_id, &actual_model);
+                        return with_log_info(
+                            Json(json!({
+                                "error": {
+                                    "message": format!("Antigravity API error: {}", msg),
+                                    "type": "api_error",
+                                    "code": 500
+                                }
+                            })),
+                            &provider,
+                            &account_id,
+                            &actual_model,
+                        );
                     }
                 }
             }
@@ -4820,7 +6211,12 @@ pub async fn claude_messages(
                         &request_id,
                         reasoning_as_text,
                     );
-                    return with_log_info(Json(claude_response), &provider, &account_id, &actual_model);
+                    return with_log_info(
+                        Json(claude_response),
+                        &provider,
+                        &account_id,
+                        &actual_model,
+                    );
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -4832,17 +6228,21 @@ pub async fn claude_messages(
                         }
                         continue;
                     }
-                    return with_log_info(Json(json!({
-                        "error": {
-                            "message": format!("Antigravity API error: {}", msg),
-                            "type": "api_error",
-                            "code": 500
-                        }
-                    })), &provider, &account_id, &actual_model);
+                    return with_log_info(
+                        Json(json!({
+                            "error": {
+                                "message": format!("Antigravity API error: {}", msg),
+                                "type": "api_error",
+                                "code": 500
+                            }
+                        })),
+                        &provider,
+                        &account_id,
+                        &actual_model,
+                    );
                 }
             }
         }
-
 
         let message = last_error.unwrap_or_else(|| "Antigravity API error".to_string());
         return Json(json!({
@@ -4887,7 +6287,8 @@ pub async fn claude_messages(
                 &provider_info.api_key,
                 is_stream,
                 provider_name,
-            ).await;
+            )
+            .await;
         }
 
         // Handle OpenAI-compatible providers for /v1/messages endpoint
@@ -4911,7 +6312,12 @@ pub async fn claude_messages(
             let provider_name = provider_key.split(':').nth(1).unwrap_or("custom");
 
             // Convert Claude request to OpenAI format
-            let openai_request = claude::claude_request_to_openai_chat(&raw, &model, claude::ClaudeImageHandling::Base64Any, false);
+            let openai_request = claude::claude_request_to_openai_chat(
+                &raw,
+                &model,
+                claude::ClaudeImageHandling::Base64Any,
+                false,
+            );
             let mut payload = openai_request;
             payload["model"] = json!(model);
             if is_stream {
@@ -4949,17 +6355,17 @@ pub async fn claude_messages(
                     let body = response.bytes().await.unwrap_or_default();
                     let mut resp = Response::new(Body::from(body));
                     *resp.status_mut() = status;
-                    resp.headers_mut()
-                        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                    resp.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
                     return resp;
                 }
 
                 // Convert OpenAI stream to Claude stream
                 let byte_stream = response.bytes_stream();
                 let upstream = byte_stream
-                    .map(|result| {
-                        result.map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-                    })
+                    .map(|result| result.map(|bytes| String::from_utf8_lossy(&bytes).to_string()))
                     .filter_map(|result| async move {
                         match result {
                             Ok(text) => {
@@ -4981,7 +6387,11 @@ pub async fn claude_messages(
                             Err(_) => None,
                         }
                     })
-                    .flat_map(|text| futures::stream::iter(text.lines().map(|s| s.to_string()).collect::<Vec<_>>()));
+                    .flat_map(|text| {
+                        futures::stream::iter(
+                            text.lines().map(|s| s.to_string()).collect::<Vec<_>>(),
+                        )
+                    });
 
                 let stream = openai_chunks_to_claude_events(upstream, &model);
                 return Sse::new(stream).into_response();
@@ -4994,7 +6404,8 @@ pub async fn claude_messages(
                 &provider_info.api_key,
                 false,
                 provider_name,
-            ).await;
+            )
+            .await;
 
             // Extract the OpenAI response and convert to Claude format
             let (parts, body) = response.into_parts();
@@ -5015,8 +6426,10 @@ pub async fn claude_messages(
             if !parts.status.is_success() {
                 let mut resp = Response::new(Body::from(body_bytes));
                 *resp.status_mut() = parts.status;
-                resp.headers_mut()
-                    .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                resp.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
                 return resp;
             }
 
@@ -5034,7 +6447,8 @@ pub async fn claude_messages(
                 }
             };
 
-            let claude_response = claude::openai_to_claude_response(&openai_response, &model, &request_id);
+            let claude_response =
+                claude::openai_to_claude_response(&openai_response, &model, &request_id);
             return Json(claude_response).into_response();
         }
     }
@@ -5053,7 +6467,11 @@ pub async fn claude_count_tokens(
     State(_state): State<AppState>,
     Json(raw): Json<Value>,
 ) -> Response {
-    let raw_model = raw.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let raw_model = raw
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let (provider_override, model) = parse_provider_prefix(&raw_model);
 
     if provider_override.as_deref() != Some("claude") {
@@ -5112,8 +6530,10 @@ pub async fn claude_count_tokens(
     let body = response.bytes().await.unwrap_or_default();
     let mut resp = Response::new(Body::from(body));
     *resp.status_mut() = status;
-    resp.headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
     resp
 }
 
@@ -5196,18 +6616,24 @@ pub async fn gemini_handler(
     // Check if this is a non-Gemini model in aggregation mode
     // If so, convert Gemini format to appropriate format and route to correct provider
     let (provider_override, resolved_model) = parse_provider_prefix(&model_name);
-    
+
     // Use model router for aggregation mode
     let (final_provider, final_model) = if provider_override.is_some() {
         (provider_override, resolved_model)
     } else {
         use super::model_router::{resolve_model, ResolvedModel};
         match resolve_model(&model_name, None) {
-            ResolvedModel::Explicit { provider, model } => {
-                (Some(provider), model)
-            }
-            ResolvedModel::Aggregated { provider, model, fallbacks: _ } => {
-                tracing::info!("[Gemini->Aggregation] Resolved {} to provider '{}'", model_name, provider);
+            ResolvedModel::Explicit { provider, model } => (Some(provider), model),
+            ResolvedModel::Aggregated {
+                provider,
+                model,
+                fallbacks: _,
+            } => {
+                tracing::info!(
+                    "[Gemini->Aggregation] Resolved {} to provider '{}'",
+                    model_name,
+                    provider
+                );
                 (Some(provider), model)
             }
             ResolvedModel::NoProvider { model } => {
@@ -5223,7 +6649,7 @@ pub async fn gemini_handler(
             // Convert Gemini format to OpenAI/Claude format and route
             let messages = convert_gemini_to_messages(&request);
             let is_stream = method == "streamGenerateContent";
-            
+
             match provider.as_str() {
                 "antigravity" => {
                     // Route to Antigravity - need to convert Gemini format to Antigravity format
@@ -5240,31 +6666,41 @@ pub async fn gemini_handler(
                             .into_response();
                         }
                     };
-                    
+
                     let account_id = auth.account_id.clone();
                     let auth_provider = auth.provider.clone();
-                    
+
                     // First convert Gemini format to OpenAI format
                     let openai_payload = json!({
                         "model": final_model,
                         "messages": messages,
                         "stream": is_stream
                     });
-                    
+
                     // Then convert OpenAI to Antigravity format
                     let antigravity_request = antigravity::openai_to_antigravity_request(
                         &openai_payload,
                         &final_model,
-                        auth.project_id.clone()
+                        auth.project_id.clone(),
                     );
-                    
-                    let client = super::antigravity::AntigravityClient::new(auth.access_token.clone());
-                    
+
+                    let client =
+                        super::antigravity::AntigravityClient::new(auth.access_token.clone());
+
                     if is_stream {
-                        match client.stream_generate_content(&antigravity_request, None).await {
+                        match client
+                            .stream_generate_content(&antigravity_request, None)
+                            .await
+                        {
                             Ok(response) => {
-                                let stream = antigravity::antigravity_stream_to_openai_events(response);
-                                return with_log_info(Sse::new(stream), &auth_provider, &account_id, &final_model);
+                                let stream =
+                                    antigravity::antigravity_stream_to_openai_events(response);
+                                return with_log_info(
+                                    Sse::new(stream),
+                                    &auth_provider,
+                                    &account_id,
+                                    &final_model,
+                                );
                             }
                             Err(e) => {
                                 return Json(json!({
@@ -5278,12 +6714,20 @@ pub async fn gemini_handler(
                             }
                         }
                     } else {
-                        match client.stream_generate_content(&antigravity_request, None).await {
+                        match client
+                            .stream_generate_content(&antigravity_request, None)
+                            .await
+                        {
                             Ok(response) => {
                                 match antigravity::collect_antigravity_stream(response).await {
                                     Ok(payload) => {
                                         // Convert back to Gemini format for response
-                                        return with_log_info(Json(payload), &auth_provider, &account_id, &final_model);
+                                        return with_log_info(
+                                            Json(payload),
+                                            &auth_provider,
+                                            &account_id,
+                                            &final_model,
+                                        );
                                     }
                                     Err(e) => {
                                         return Json(json!({
@@ -5322,11 +6766,16 @@ pub async fn gemini_handler(
                         "messages": messages,
                         "stream": is_stream
                     });
-                    
+
                     if provider == "kiro" {
                         return handle_kiro_claude_request(claude_payload, is_stream).await;
                     } else {
-                        return handle_native_claude_request(claude_payload, is_stream, &final_model).await;
+                        return handle_native_claude_request(
+                            claude_payload,
+                            is_stream,
+                            &final_model,
+                        )
+                        .await;
                     }
                 }
                 "codex" => {
@@ -5336,7 +6785,8 @@ pub async fn gemini_handler(
                         "messages": messages,
                         "stream": is_stream
                     });
-                    return handle_codex_openai_request(openai_payload, is_stream, &final_model).await;
+                    return handle_codex_openai_request(openai_payload, is_stream, &final_model)
+                        .await;
                 }
                 _ => {
                     // Unknown provider, try gemini anyway
@@ -5361,7 +6811,7 @@ pub async fn gemini_handler(
 
     let account_id = auth.account_id.clone();
     let provider = auth.provider.clone();
-    
+
     let mut payload = json!({
         "model": final_model,
         "request": request
@@ -5397,19 +6847,20 @@ pub async fn gemini_handler(
                     } else {
                         "application/json"
                     };
-                    resp.headers_mut().insert(
-                        header::CONTENT_TYPE,
-                        HeaderValue::from_static(content_type),
-                    );
+                    resp.headers_mut()
+                        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
                     // Add logging headers
                     if let Ok(header_value) = HeaderValue::from_str(&account_id) {
-                        resp.headers_mut().insert(super::X_ONEPROXY_ACCOUNT_ID, header_value);
+                        resp.headers_mut()
+                            .insert(super::X_ONEPROXY_ACCOUNT_ID, header_value);
                     }
                     if let Ok(header_value) = HeaderValue::from_str(&provider) {
-                        resp.headers_mut().insert(super::X_ONEPROXY_PROVIDER, header_value);
+                        resp.headers_mut()
+                            .insert(super::X_ONEPROXY_PROVIDER, header_value);
                     }
                     if let Ok(header_value) = HeaderValue::from_str(&final_model) {
-                        resp.headers_mut().insert(super::X_ONEPROXY_MODEL, header_value);
+                        resp.headers_mut()
+                            .insert(super::X_ONEPROXY_MODEL, header_value);
                     }
                     resp.into_response()
                 }
@@ -5448,10 +6899,8 @@ pub async fn gemini_handler(
             }
         }))
         .into_response(),
-
     }
 }
-
 
 // OAuth callback handlers
 const OAUTH_SUCCESS_HTML: &str = r#"
@@ -5581,20 +7030,29 @@ pub async fn google_callback(
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("Failed to serialize auth file: {}", e);
-                    return Html(OAUTH_ERROR_HTML.replace("{{ERROR}}", &format!("Failed to save credentials: {}", e)));
+                    return Html(
+                        OAUTH_ERROR_HTML
+                            .replace("{{ERROR}}", &format!("Failed to save credentials: {}", e)),
+                    );
                 }
             };
 
             if let Some(parent) = path.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     tracing::error!("Failed to create auth dir: {}", e);
-                    return Html(OAUTH_ERROR_HTML.replace("{{ERROR}}", &format!("Failed to save credentials: {}", e)));
+                    return Html(
+                        OAUTH_ERROR_HTML
+                            .replace("{{ERROR}}", &format!("Failed to save credentials: {}", e)),
+                    );
                 }
             }
 
             if let Err(e) = std::fs::write(&path, content) {
                 tracing::error!("Failed to save auth file: {}", e);
-                return Html(OAUTH_ERROR_HTML.replace("{{ERROR}}", &format!("Failed to save credentials: {}", e)));
+                return Html(
+                    OAUTH_ERROR_HTML
+                        .replace("{{ERROR}}", &format!("Failed to save credentials: {}", e)),
+                );
             }
 
             tracing::info!("Saved Google auth file to {:?}", path);
@@ -5646,9 +7104,9 @@ pub async fn anthropic_callback(
                 .and_then(|a| a.email_address.clone());
 
             // Calculate expiry time
-            let expires_at = token_response.expires_in.map(|secs| {
-                chrono::Utc::now() + chrono::Duration::seconds(secs as i64)
-            });
+            let expires_at = token_response
+                .expires_in
+                .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
 
             // Create auth file
             let auth_file = AuthFile {
@@ -5671,7 +7129,10 @@ pub async fn anthropic_callback(
 
             if let Err(e) = auth::save_auth_file(&auth_file, &path) {
                 tracing::error!("Failed to save auth file: {}", e);
-                return Html(OAUTH_ERROR_HTML.replace("{{ERROR}}", &format!("Failed to save credentials: {}", e)));
+                return Html(
+                    OAUTH_ERROR_HTML
+                        .replace("{{ERROR}}", &format!("Failed to save credentials: {}", e)),
+                );
             }
 
             tracing::info!("Saved Anthropic auth file to {:?}", path);
@@ -5716,7 +7177,10 @@ pub async fn codex_callback(
         Some(v) => v,
         None => {
             tracing::error!("No PKCE verifier found for state: {}", state);
-            return Html(OAUTH_ERROR_HTML.replace("{{ERROR}}", "Invalid or expired OAuth session. Please try again."));
+            return Html(OAUTH_ERROR_HTML.replace(
+                "{{ERROR}}",
+                "Invalid or expired OAuth session. Please try again.",
+            ));
         }
     };
 
@@ -5724,40 +7188,23 @@ pub async fn codex_callback(
     match openai::exchange_code(&code, &code_verifier).await {
         Ok(token_response) => {
             tracing::info!("Successfully exchanged code for Codex tokens");
-
-            // Extract email from ID token
-            let email = openai::extract_email(&token_response);
-
-            // Calculate expiry time
-            let expires_at = token_response.expires_in.map(|secs| {
-                chrono::Utc::now() + chrono::Duration::seconds(secs as i64)
-            });
-
-            // Create auth file
-            let auth_file = AuthFile {
-                provider: "codex".to_string(),
-                email: email.clone(),
-                token: TokenInfo {
-                    access_token: token_response.access_token,
-                    refresh_token: token_response.refresh_token,
-                    expires_at,
-                    token_type: token_response.token_type,
-                },
-                project_id: None,
-                enabled: true,
-                prefix: None,
+            let identity = openai::extract_codex_identity(&token_response);
+            let result = openai::OAuthResult {
+                token_response,
+                email: identity.email,
+                account_id: identity.account_id,
+                plan_type: identity.plan_type,
             };
 
-            // Save auth file
-            let identifier = email.as_deref().unwrap_or("default");
-            let path = auth::get_auth_file_path("codex", identifier);
-
-            if let Err(e) = auth::save_auth_file(&auth_file, &path) {
+            if let Err(e) = auth::save_codex_oauth_result(&result) {
                 tracing::error!("Failed to save auth file: {}", e);
-                return Html(OAUTH_ERROR_HTML.replace("{{ERROR}}", &format!("Failed to save credentials: {}", e)));
+                return Html(
+                    OAUTH_ERROR_HTML
+                        .replace("{{ERROR}}", &format!("Failed to save credentials: {}", e)),
+                );
             }
 
-            tracing::info!("Saved Codex auth file to {:?}", path);
+            tracing::info!("Saved Codex auth file");
             Html(OAUTH_SUCCESS_HTML.to_string())
         }
         Err(e) => {
@@ -5809,19 +7256,20 @@ pub async fn antigravity_callback(
             };
 
             // Calculate expiry time
-            let expires_at = token_response.expires_in.map(|secs| {
-                chrono::Utc::now() + chrono::Duration::seconds(secs as i64)
-            });
+            let expires_at = token_response
+                .expires_in
+                .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
 
             // Create auth file
-            let project_id = match antigravity_oauth::fetch_project_id(&token_response.access_token).await {
-                Ok(pid) if !pid.trim().is_empty() => Some(pid),
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::warn!("Failed to fetch Antigravity project id: {}", e);
-                    None
-                }
-            };
+            let project_id =
+                match antigravity_oauth::fetch_project_id(&token_response.access_token).await {
+                    Ok(pid) if !pid.trim().is_empty() => Some(pid),
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch Antigravity project id: {}", e);
+                        None
+                    }
+                };
 
             let auth_file = AuthFile {
                 provider: "antigravity".to_string(),
@@ -5843,7 +7291,10 @@ pub async fn antigravity_callback(
 
             if let Err(e) = auth::save_auth_file(&auth_file, &path) {
                 tracing::error!("Failed to save auth file: {}", e);
-                return Html(OAUTH_ERROR_HTML.replace("{{ERROR}}", &format!("Failed to save credentials: {}", e)));
+                return Html(
+                    OAUTH_ERROR_HTML
+                        .replace("{{ERROR}}", &format!("Failed to save credentials: {}", e)),
+                );
             }
 
             tracing::info!("Saved Antigravity auth file to {:?}", path);

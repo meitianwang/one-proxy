@@ -160,7 +160,11 @@ async fn refresh_token_desktop(refresh_token: &str) -> Result<RefreshTokenRespon
     tracing::info!("Kiro Desktop refresh token response status: {}", status);
 
     if !status.is_success() {
-        return Err(anyhow::anyhow!("Refresh token failed ({}): {}", status, text));
+        return Err(anyhow::anyhow!(
+            "Refresh token failed ({}): {}",
+            status,
+            text
+        ));
     }
 
     serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("Parse refresh response failed: {}", e))
@@ -201,10 +205,15 @@ async fn refresh_token_idc(
     tracing::info!("Kiro IdC refresh token response status: {}", status);
 
     if !status.is_success() {
-        return Err(anyhow::anyhow!("IdC refresh token failed ({}): {}", status, text));
+        return Err(anyhow::anyhow!(
+            "IdC refresh token failed ({}): {}",
+            status,
+            text
+        ));
     }
 
-    serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("Parse IdC refresh response failed: {}", e))
+    serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("Parse IdC refresh response failed: {}", e))
 }
 
 /// Get usage limits and user info from Desktop API (for social accounts)
@@ -232,7 +241,11 @@ async fn get_usage_limits(access_token: &str) -> Result<UsageLimitsResponse> {
     tracing::info!("Kiro usage limits response status: {}", status);
 
     if !status.is_success() {
-        return Err(anyhow::anyhow!("Get usage limits failed ({}): {}", status, text));
+        return Err(anyhow::anyhow!(
+            "Get usage limits failed ({}): {}",
+            status,
+            text
+        ));
     }
 
     serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("Parse usage response failed: {}", e))
@@ -279,10 +292,15 @@ async fn get_usage_limits_idc(access_token: &str) -> Result<UsageLimitsResponse>
     println!("[Kiro] IdC usage limits response status: {}", status);
 
     if !status.is_success() {
-        return Err(anyhow::anyhow!("Get IdC usage limits failed ({}): {}", status, text));
+        return Err(anyhow::anyhow!(
+            "Get IdC usage limits failed ({}): {}",
+            status,
+            text
+        ));
     }
 
-    serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("Parse IdC usage response failed: {}", e))
+    serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("Parse IdC usage response failed: {}", e))
 }
 
 /// Import Kiro credentials from kiro-auth-token.json
@@ -300,39 +318,48 @@ pub async fn import_local_credentials() -> Result<KiroImportResult> {
 
     let content = std::fs::read_to_string(&token_path)?;
     let json: serde_json::Value = serde_json::from_str(&content)?;
-    let obj = json.as_object()
+    let obj = json
+        .as_object()
         .ok_or_else(|| anyhow::anyhow!("Invalid kiro-auth-token.json format"))?;
 
     // Extract main token fields
-    let access_token = obj.get("accessToken")
+    let access_token = obj
+        .get("accessToken")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let refresh_token = obj.get("refreshToken")
+    let refresh_token = obj
+        .get("refreshToken")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let expires_at = obj.get("expiresAt")
+    let expires_at = obj
+        .get("expiresAt")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let region = obj.get("region")
+    let region = obj
+        .get("region")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let provider = obj.get("provider")
+    let provider = obj
+        .get("provider")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let auth_method = obj.get("authMethod")
+    let auth_method = obj
+        .get("authMethod")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let profile_arn = obj.get("profileArn")
+    let profile_arn = obj
+        .get("profileArn")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let client_id_hash = obj.get("clientIdHash")
+    let client_id_hash = obj
+        .get("clientIdHash")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
@@ -374,7 +401,9 @@ pub async fn import_local_credentials() -> Result<KiroImportResult> {
                 }
             } else {
                 println!("[Kiro] IdC account missing clientId or clientSecret");
-                Err(anyhow::anyhow!("IdC account missing clientId or clientSecret"))
+                Err(anyhow::anyhow!(
+                    "IdC account missing clientId or clientSecret"
+                ))
             }
         } else {
             // Social account: use Desktop Auth API
@@ -412,25 +441,35 @@ pub async fn import_local_credentials() -> Result<KiroImportResult> {
                         println!("[Kiro] Usage limits fetched successfully");
 
                         // Debug: print the full response
-                        println!("[Kiro] subscription_info: {:?}", usage_resp.subscription_info);
-                        println!("[Kiro] usage_breakdown_list: {:?}", usage_resp.usage_breakdown_list);
+                        println!(
+                            "[Kiro] subscription_info: {:?}",
+                            usage_resp.subscription_info
+                        );
+                        println!(
+                            "[Kiro] usage_breakdown_list: {:?}",
+                            usage_resp.usage_breakdown_list
+                        );
                         println!("[Kiro] days_until_reset: {:?}", usage_resp.days_until_reset);
 
                         // Extract email
-                        email = usage_resp.user_info.as_ref()
-                            .and_then(|u| u.email.clone());
+                        email = usage_resp.user_info.as_ref().and_then(|u| u.email.clone());
 
                         println!("[Kiro] Email: {:?}", email);
 
                         // Extract usage info
-                        let breakdown = usage_resp.usage_breakdown_list
+                        let breakdown = usage_resp
+                            .usage_breakdown_list
                             .as_ref()
                             .and_then(|list| list.first());
 
                         usage_info = Some(KiroUsageInfo {
-                            subscription_title: usage_resp.subscription_info.as_ref()
+                            subscription_title: usage_resp
+                                .subscription_info
+                                .as_ref()
                                 .and_then(|s| s.subscription_title.clone()),
-                            subscription_type: usage_resp.subscription_info.as_ref()
+                            subscription_type: usage_resp
+                                .subscription_info
+                                .as_ref()
                                 .and_then(|s| s.subscription_type.clone()),
                             usage_limit: breakdown.and_then(|b| b.usage_limit),
                             current_usage: breakdown.and_then(|b| b.current_usage),
@@ -490,11 +529,13 @@ fn load_device_registration(client_id_hash: &str) -> Result<(Option<String>, Opt
     let content = std::fs::read_to_string(&reg_path)?;
     let json: serde_json::Value = serde_json::from_str(&content)?;
 
-    let client_id = json.get("clientId")
+    let client_id = json
+        .get("clientId")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let client_secret = json.get("clientSecret")
+    let client_secret = json
+        .get("clientSecret")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
@@ -547,7 +588,10 @@ pub async fn start_oauth() -> Result<String> {
 
     tracing::info!("Saved Kiro auth file to {:?}", path);
 
-    Ok(format!("Kiro account imported successfully: {}", identifier))
+    Ok(format!(
+        "Kiro account imported successfully: {}",
+        identifier
+    ))
 }
 
 /// Fetch Kiro quota by calling API for fresh data
@@ -574,42 +618,54 @@ pub async fn fetch_quota(account_id: &str) -> Result<KiroQuotaData> {
     let mut json: serde_json::Value = serde_json::from_str(&content)?;
 
     // Read credentials from saved auth file
-    let refresh_token = json.get("refresh_token")
+    let refresh_token = json
+        .get("refresh_token")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let auth_method = json.get("auth_method")
+    let auth_method = json
+        .get("auth_method")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let region = json.get("region")
+    let region = json
+        .get("region")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let client_id = json.get("client_id")
+    let client_id = json
+        .get("client_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let client_secret = json.get("client_secret")
+    let client_secret = json
+        .get("client_secret")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
     let is_idc = auth_method.as_deref() == Some("IdC");
-    println!("[Kiro fetch_quota] auth_method: {:?}, is_idc: {}", auth_method, is_idc);
+    println!(
+        "[Kiro fetch_quota] auth_method: {:?}, is_idc: {}",
+        auth_method, is_idc
+    );
 
     // Check if this is an Enterprise account by kiro_provider field
-    let kiro_provider = json.get("kiro_provider")
+    let kiro_provider = json
+        .get("kiro_provider")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    
+
     let is_enterprise = kiro_provider.as_ref().map_or(false, |p| p == "Enterprise");
-    println!("[Kiro fetch_quota] kiro_provider: {:?}, is_enterprise: {}", kiro_provider, is_enterprise);
-    
+    println!(
+        "[Kiro fetch_quota] kiro_provider: {:?}, is_enterprise: {}",
+        kiro_provider, is_enterprise
+    );
+
     // For Enterprise accounts, skip usage limits API as it returns 403 FEATURE_NOT_SUPPORTED
     // Enterprise accounts have unlimited quota
     if is_enterprise {
         println!("[Kiro fetch_quota] Enterprise account detected, returning unlimited quota");
-        
+
         return Ok(KiroQuotaData {
             subscription_title: Some("KIRO ENTERPRISE".to_string()),
             subscription_type: Some("ENTERPRISE".to_string()),
-            usage_limit: Some(-1),  // -1 indicates unlimited
+            usage_limit: Some(-1), // -1 indicates unlimited
             current_usage: Some(0),
             days_until_reset: None,
             free_trial_limit: None,
@@ -625,7 +681,10 @@ pub async fn fetch_quota(account_id: &str) -> Result<KiroQuotaData> {
         let refresh_result: Result<(String, String)> = if is_idc {
             let region_str = region.as_deref().unwrap_or("us-east-1");
             if let (Some(ref cid), Some(ref csec)) = (&client_id, &client_secret) {
-                println!("[Kiro fetch_quota] Using IdC refresh with region: {}", region_str);
+                println!(
+                    "[Kiro fetch_quota] Using IdC refresh with region: {}",
+                    region_str
+                );
                 match refresh_token_idc(region_str, cid, csec, rt).await {
                     Ok(resp) => Ok((resp.access_token, resp.refresh_token)),
                     Err(e) => {
@@ -634,7 +693,9 @@ pub async fn fetch_quota(account_id: &str) -> Result<KiroQuotaData> {
                     }
                 }
             } else {
-                Err(anyhow::anyhow!("IdC account missing clientId or clientSecret"))
+                Err(anyhow::anyhow!(
+                    "IdC account missing clientId or clientSecret"
+                ))
             }
         } else {
             println!("[Kiro fetch_quota] Using Desktop Auth refresh");
@@ -667,13 +728,18 @@ pub async fn fetch_quota(account_id: &str) -> Result<KiroQuotaData> {
                     Ok(usage_resp) => {
                         println!("[Kiro fetch_quota] Usage limits fetched successfully");
 
-                        let breakdown = usage_resp.usage_breakdown_list
+                        let breakdown = usage_resp
+                            .usage_breakdown_list
                             .as_ref()
                             .and_then(|list| list.first());
 
-                        let subscription_title = usage_resp.subscription_info.as_ref()
+                        let subscription_title = usage_resp
+                            .subscription_info
+                            .as_ref()
                             .and_then(|s| s.subscription_title.clone());
-                        let subscription_type = usage_resp.subscription_info.as_ref()
+                        let subscription_type = usage_resp
+                            .subscription_info
+                            .as_ref()
                             .and_then(|s| s.subscription_type.clone());
                         let usage_limit = breakdown.and_then(|b| b.usage_limit);
                         let current_usage = breakdown.and_then(|b| b.current_usage);
@@ -747,25 +813,32 @@ pub async fn fetch_quota(account_id: &str) -> Result<KiroQuotaData> {
     }
 
     // Fallback: read from saved file if no refresh token
-    let subscription_title = json.get("subscription_title")
+    let subscription_title = json
+        .get("subscription_title")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let subscription_type = json.get("subscription_type")
+    let subscription_type = json
+        .get("subscription_type")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let usage_limit = json.get("usage_limit")
+    let usage_limit = json
+        .get("usage_limit")
         .and_then(|v| v.as_i64())
         .map(|v| v as i32);
-    let current_usage = json.get("current_usage")
+    let current_usage = json
+        .get("current_usage")
         .and_then(|v| v.as_i64())
         .map(|v| v as i32);
-    let days_until_reset = json.get("days_until_reset")
+    let days_until_reset = json
+        .get("days_until_reset")
         .and_then(|v| v.as_i64())
         .map(|v| v as i32);
-    let free_trial_limit = json.get("free_trial_limit")
+    let free_trial_limit = json
+        .get("free_trial_limit")
         .and_then(|v| v.as_i64())
         .map(|v| v as i32);
-    let free_trial_usage = json.get("free_trial_usage")
+    let free_trial_usage = json
+        .get("free_trial_usage")
         .and_then(|v| v.as_i64())
         .map(|v| v as i32);
 

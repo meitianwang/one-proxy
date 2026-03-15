@@ -7,7 +7,7 @@ use std::convert::Infallible;
 use uuid::Uuid;
 
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-const DEFAULT_USER_AGENT: &str = "codex_cli_rs/0.50.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464";
+const DEFAULT_USER_AGENT: &str = "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464";
 
 #[derive(Debug, Clone)]
 pub struct CodexClient {
@@ -23,7 +23,11 @@ impl CodexClient {
         }
     }
 
-    pub async fn stream_responses(&self, payload: &Value, stream: bool) -> Result<reqwest::Response> {
+    pub async fn stream_responses(
+        &self,
+        payload: &Value,
+        stream: bool,
+    ) -> Result<reqwest::Response> {
         let url = format!("{}/responses", CODEX_BASE_URL.trim_end_matches('/'));
         let mut req = self
             .http_client
@@ -52,6 +56,203 @@ impl CodexClient {
         }
         Ok(response)
     }
+}
+
+pub fn normalize_responses_websocket_request(
+    raw: &Value,
+    last_request: Option<&Value>,
+    last_response_output: &Value,
+    allow_incremental_previous_response: bool,
+) -> Result<(Value, Value)> {
+    match raw.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "response.create" => {
+            if let Some(previous) = last_request {
+                normalize_response_subsequent_request(
+                    raw,
+                    previous,
+                    last_response_output,
+                    allow_incremental_previous_response,
+                )
+            } else {
+                normalize_response_create_request(raw)
+            }
+        }
+        "response.append" => {
+            let previous = last_request
+                .ok_or_else(|| anyhow!("websocket request received before response.create"))?;
+            normalize_response_subsequent_request(
+                raw,
+                previous,
+                last_response_output,
+                allow_incremental_previous_response,
+            )
+        }
+        other => Err(anyhow!("unsupported websocket request type: {}", other)),
+    }
+}
+
+pub fn should_handle_responses_websocket_prewarm(
+    raw: &Value,
+    last_request: Option<&Value>,
+    allow_incremental_previous_response: bool,
+) -> bool {
+    if allow_incremental_previous_response || last_request.is_some() {
+        return false;
+    }
+
+    raw.get("type").and_then(|v| v.as_str()) == Some("response.create")
+        && raw.get("generate").and_then(|v| v.as_bool()) == Some(false)
+}
+
+pub fn synthetic_responses_websocket_prewarm_payloads(request: &Value) -> Result<Vec<String>> {
+    let response_id = format!("resp_prewarm_{}", Uuid::new_v4());
+    let created_at = chrono::Utc::now().timestamp();
+    let model_name = request
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let mut created = json!({
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "in_progress",
+            "background": false,
+            "error": null,
+            "output": []
+        }
+    });
+    if !model_name.is_empty() {
+        created["response"]["model"] = json!(model_name);
+    }
+
+    let mut completed = json!({
+        "type": "response.completed",
+        "sequence_number": 1,
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "completed",
+            "background": false,
+            "error": null,
+            "output": [],
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0
+            }
+        }
+    });
+    if !model_name.is_empty() {
+        completed["response"]["model"] = json!(model_name);
+    }
+
+    Ok(vec![created.to_string(), completed.to_string()])
+}
+
+pub fn response_completed_output(payload: &Value) -> Value {
+    payload
+        .get("response")
+        .and_then(|v| v.get("output"))
+        .filter(|v| v.is_array())
+        .cloned()
+        .unwrap_or_else(|| json!([]))
+}
+
+fn normalize_response_create_request(raw: &Value) -> Result<(Value, Value)> {
+    let mut normalized = raw.clone();
+    if let Some(obj) = normalized.as_object_mut() {
+        obj.remove("type");
+    }
+    normalized["stream"] = json!(true);
+    if !normalized.get("input").is_some() {
+        normalized["input"] = json!([]);
+    }
+
+    let model_name = normalized
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if model_name.is_empty() {
+        return Err(anyhow!("missing model in response.create request"));
+    }
+
+    Ok((normalized.clone(), normalized))
+}
+
+fn normalize_response_subsequent_request(
+    raw: &Value,
+    last_request: &Value,
+    last_response_output: &Value,
+    allow_incremental_previous_response: bool,
+) -> Result<(Value, Value)> {
+    let next_input = raw
+        .get("input")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("websocket request requires array field: input"))?;
+
+    if allow_incremental_previous_response
+        && raw
+            .get("previous_response_id")
+            .and_then(|v| v.as_str())
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    {
+        let mut normalized = raw.clone();
+        if let Some(obj) = normalized.as_object_mut() {
+            obj.remove("type");
+        }
+        if normalized.get("model").is_none() {
+            if let Some(model) = last_request.get("model") {
+                normalized["model"] = model.clone();
+            }
+        }
+        if normalized.get("instructions").is_none() {
+            if let Some(instructions) = last_request.get("instructions") {
+                normalized["instructions"] = instructions.clone();
+            }
+        }
+        normalized["stream"] = json!(true);
+        return Ok((normalized.clone(), normalized));
+    }
+
+    let mut merged = last_request
+        .get("input")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(previous_output) = last_response_output.as_array() {
+        merged.extend(previous_output.iter().cloned());
+    }
+    merged.extend(next_input.iter().cloned());
+
+    let mut normalized = raw.clone();
+    if let Some(obj) = normalized.as_object_mut() {
+        obj.remove("type");
+        obj.remove("previous_response_id");
+    }
+    normalized["input"] = Value::Array(merged);
+    if normalized.get("model").is_none() {
+        if let Some(model) = last_request.get("model") {
+            normalized["model"] = model.clone();
+        }
+    }
+    if normalized.get("instructions").is_none() {
+        if let Some(instructions) = last_request.get("instructions") {
+            normalized["instructions"] = instructions.clone();
+        }
+    }
+    normalized["stream"] = json!(true);
+
+    Ok((normalized.clone(), normalized))
 }
 
 pub fn openai_to_codex_request(raw: &Value, model: &str, stream: bool) -> Value {
@@ -109,7 +310,11 @@ pub fn openai_to_codex_request(raw: &Value, model: &str, stream: bool) -> Value 
                 let content = m.get("content").unwrap_or(&Value::Null);
                 if let Some(text) = content.as_str() {
                     if !text.is_empty() {
-                        let part_type = if role == "assistant" { "output_text" } else { "input_text" };
+                        let part_type = if role == "assistant" {
+                            "output_text"
+                        } else {
+                            "input_text"
+                        };
                         content_arr.push(json!({ "type": part_type, "text": text }));
                     }
                 } else if let Some(items) = content.as_array() {
@@ -117,7 +322,11 @@ pub fn openai_to_codex_request(raw: &Value, model: &str, stream: bool) -> Value 
                         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
                         match item_type {
                             "text" => {
-                                let part_type = if role == "assistant" { "output_text" } else { "input_text" };
+                                let part_type = if role == "assistant" {
+                                    "output_text"
+                                } else {
+                                    "input_text"
+                                };
                                 let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
                                 content_arr.push(json!({ "type": part_type, "text": text }));
                             }
@@ -128,11 +337,36 @@ pub fn openai_to_codex_request(raw: &Value, model: &str, stream: bool) -> Value 
                                         .and_then(|v| v.get("url"))
                                         .and_then(|v| v.as_str())
                                     {
-                                        content_arr.push(json!({ "type": "input_image", "image_url": url }));
+                                        content_arr.push(
+                                            json!({ "type": "input_image", "image_url": url }),
+                                        );
                                     }
                                 }
                             }
-                            "file" => {}
+                            "file" => {
+                                if role == "user" {
+                                    let file_data = item
+                                        .get("file")
+                                        .and_then(|v| v.get("file_data"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let filename = item
+                                        .get("file")
+                                        .and_then(|v| v.get("filename"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if !file_data.is_empty() {
+                                        let mut part = json!({
+                                            "type": "input_file",
+                                            "file_data": file_data,
+                                        });
+                                        if !filename.is_empty() {
+                                            part["filename"] = json!(filename);
+                                        }
+                                        content_arr.push(part);
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -159,7 +393,10 @@ pub fn openai_to_codex_request(raw: &Value, model: &str, stream: bool) -> Value 
                         } else {
                             name = shorten_name_if_needed(&name);
                         }
-                        let args_value = tc.get("function").and_then(|v| v.get("arguments")).unwrap_or(&Value::Null);
+                        let args_value = tc
+                            .get("function")
+                            .and_then(|v| v.get("arguments"))
+                            .unwrap_or(&Value::Null);
                         let args = string_from_json_value(args_value);
                         let func_call = json!({
                             "type": "function_call",
@@ -259,7 +496,10 @@ pub fn openai_to_codex_request(raw: &Value, model: &str, stream: bool) -> Value 
         if tool_choice.is_string() {
             out["tool_choice"] = tool_choice.clone();
         } else if tool_choice.is_object() {
-            let tc_type = tool_choice.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let tc_type = tool_choice
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if tc_type == "function" {
                 let mut name = tool_choice
                     .get("function")
@@ -288,6 +528,52 @@ pub fn openai_to_codex_request(raw: &Value, model: &str, stream: bool) -> Value 
     out
 }
 
+pub fn openai_responses_to_codex_request(raw: &Value, model: &str) -> Value {
+    let mut out = raw.clone();
+
+    if let Some(input_text) = out.get("input").and_then(|v| v.as_str()) {
+        out["input"] = json!([{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": input_text
+            }]
+        }]);
+    }
+
+    out["model"] = json!(model);
+    out["stream"] = json!(true);
+    out["store"] = json!(false);
+    out["parallel_tool_calls"] = json!(true);
+    out["include"] = json!(["reasoning.encrypted_content"]);
+
+    if let Some(service_tier) = out.get("service_tier").and_then(|v| v.as_str()) {
+        if service_tier != "priority" {
+            if let Some(obj) = out.as_object_mut() {
+                obj.remove("service_tier");
+            }
+        }
+    }
+
+    if let Some(obj) = out.as_object_mut() {
+        for key in [
+            "max_output_tokens",
+            "max_completion_tokens",
+            "temperature",
+            "top_p",
+            "truncation",
+            "context_management",
+            "user",
+        ] {
+            obj.remove(key);
+        }
+    }
+
+    convert_system_role_to_developer(&mut out);
+    out
+}
+
 pub fn codex_stream_to_openai_chunks(
     response: reqwest::Response,
     original_request: Value,
@@ -299,6 +585,8 @@ pub fn codex_stream_to_openai_chunks(
             created_at: 0,
             model: String::new(),
             function_call_index: -1,
+            has_received_arguments_delta: false,
+            has_tool_call_announced: false,
             reverse_tool_names: reverse_map,
         };
         let mut buffer = String::new();
@@ -345,6 +633,38 @@ pub fn codex_stream_to_openai_events(
         .map(|chunk| Ok(Event::default().data(chunk)))
 }
 
+pub fn codex_stream_to_openai_responses_events(
+    response: reqwest::Response,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    async_stream::stream! {
+        let mut buffer = String::new();
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let bytes = match chunk {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            buffer.push_str(&text);
+
+            while let Some(pos) = buffer.find('\n') {
+                let mut line = buffer[..pos].to_string();
+                buffer = buffer[pos + 1..].to_string();
+                line = line.trim_end_matches('\r').to_string();
+                if !line.starts_with("data:") {
+                    continue;
+                }
+                let data = line[5..].trim();
+                if data.is_empty() {
+                    continue;
+                }
+                yield Ok(Event::default().data(data.to_string()));
+            }
+        }
+    }
+}
+
 pub async fn collect_non_stream_response(
     response: reqwest::Response,
     original_request: &Value,
@@ -386,11 +706,53 @@ pub async fn collect_non_stream_response(
         .ok_or_else(|| anyhow!("invalid response.completed payload"))
 }
 
+pub async fn collect_non_stream_responses_response(response: reqwest::Response) -> Result<Value> {
+    let mut buffer = String::new();
+    let mut stream = response.bytes_stream();
+    let mut completed: Option<Value> = None;
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk?;
+        let text = String::from_utf8_lossy(&bytes);
+        buffer.push_str(&text);
+
+        while let Some(pos) = buffer.find('\n') {
+            let mut line = buffer[..pos].to_string();
+            buffer = buffer[pos + 1..].to_string();
+            line = line.trim_end_matches('\r').to_string();
+            if !line.starts_with("data:") {
+                continue;
+            }
+            let data = line[5..].trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            if let Ok(parsed) = serde_json::from_str::<Value>(data) {
+                if parsed.get("type").and_then(|v| v.as_str()) == Some("response.completed") {
+                    completed = Some(parsed);
+                    break;
+                }
+            }
+        }
+        if completed.is_some() {
+            break;
+        }
+    }
+
+    let completed = completed.ok_or_else(|| anyhow!("stream closed before response.completed"))?;
+    completed
+        .get("response")
+        .cloned()
+        .ok_or_else(|| anyhow!("invalid response.completed payload"))
+}
+
 struct CodexStreamState {
     response_id: String,
     created_at: i64,
     model: String,
     function_call_index: i32,
+    has_received_arguments_delta: bool,
+    has_tool_call_announced: bool,
     reverse_tool_names: HashMap<String, String>,
 }
 
@@ -436,28 +798,16 @@ fn convert_codex_stream_chunk(data: &str, state: &mut CodexStreamState) -> Vec<S
 
     if let Some(model) = parsed.get("model").and_then(|v| v.as_str()) {
         template["model"] = json!(model);
+    } else if !state.model.is_empty() {
+        template["model"] = json!(state.model.clone());
     }
     template["created"] = json!(state.created_at);
     template["id"] = json!(state.response_id.clone());
 
-    if let Some(usage) = parsed.get("response").and_then(|v| v.get("usage")) {
-        if let Some(output_tokens) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
-            template["usage"]["completion_tokens"] = json!(output_tokens);
-        }
-        if let Some(total_tokens) = usage.get("total_tokens").and_then(|v| v.as_i64()) {
-            template["usage"]["total_tokens"] = json!(total_tokens);
-        }
-        if let Some(input_tokens) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
-            template["usage"]["prompt_tokens"] = json!(input_tokens);
-        }
-        if let Some(reasoning_tokens) = usage
-            .get("output_tokens_details")
-            .and_then(|v| v.get("reasoning_tokens"))
-            .and_then(|v| v.as_i64())
-        {
-            template["usage"]["completion_tokens_details"]["reasoning_tokens"] = json!(reasoning_tokens);
-        }
-    }
+    apply_usage_to_openai(
+        &mut template,
+        parsed.get("response").and_then(|v| v.get("usage")),
+    );
 
     match data_type {
         "response.reasoning_summary_text.delta" => {
@@ -485,18 +835,81 @@ fn convert_codex_stream_chunk(data: &str, state: &mut CodexStreamState) -> Vec<S
             template["choices"][0]["finish_reason"] = json!(finish_reason);
             template["choices"][0]["native_finish_reason"] = json!(finish_reason);
         }
+        "response.output_item.added" => {
+            let Some(item) = parsed.get("item") else {
+                return Vec::new();
+            };
+            if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
+                return Vec::new();
+            }
+
+            state.function_call_index += 1;
+            state.has_received_arguments_delta = false;
+            state.has_tool_call_announced = true;
+
+            let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+            let name = restore_original_tool_name(
+                item.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                &state.reverse_tool_names,
+            );
+
+            template["choices"][0]["delta"]["role"] = json!("assistant");
+            template["choices"][0]["delta"]["tool_calls"] = json!([{
+                "index": state.function_call_index,
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": ""
+                }
+            }]);
+        }
+        "response.function_call_arguments.delta" => {
+            if state.function_call_index < 0 {
+                return Vec::new();
+            }
+            let Some(delta) = parsed.get("delta").and_then(|v| v.as_str()) else {
+                return Vec::new();
+            };
+            state.has_received_arguments_delta = true;
+            template["choices"][0]["delta"]["tool_calls"] = json!([{
+                "index": state.function_call_index,
+                "function": {
+                    "arguments": delta
+                }
+            }]);
+        }
+        "response.function_call_arguments.done" => {
+            if state.function_call_index < 0 || state.has_received_arguments_delta {
+                return Vec::new();
+            }
+            let args = parsed
+                .get("arguments")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            template["choices"][0]["delta"]["tool_calls"] = json!([{
+                "index": state.function_call_index,
+                "function": {
+                    "arguments": args
+                }
+            }]);
+        }
         "response.output_item.done" => {
             if let Some(item) = parsed.get("item") {
                 if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
                     return Vec::new();
                 }
+                if state.has_tool_call_announced {
+                    state.has_tool_call_announced = false;
+                    return Vec::new();
+                }
                 state.function_call_index += 1;
                 template["choices"][0]["delta"]["tool_calls"] = json!([]);
                 let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                let mut name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if let Some(orig) = state.reverse_tool_names.get(&name) {
-                    name = orig.clone();
-                }
+                let name = restore_original_tool_name(
+                    item.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                    &state.reverse_tool_names,
+                );
                 let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
                 let tool_call = json!({
                     "index": state.function_call_index,
@@ -556,24 +969,7 @@ pub fn codex_completed_event_to_openai(event: &Value, original_request: &Value) 
         template["id"] = json!(id);
     }
 
-    if let Some(usage) = response.get("usage") {
-        if let Some(output_tokens) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
-            template["usage"]["completion_tokens"] = json!(output_tokens);
-        }
-        if let Some(total_tokens) = usage.get("total_tokens").and_then(|v| v.as_i64()) {
-            template["usage"]["total_tokens"] = json!(total_tokens);
-        }
-        if let Some(input_tokens) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
-            template["usage"]["prompt_tokens"] = json!(input_tokens);
-        }
-        if let Some(reasoning_tokens) = usage
-            .get("output_tokens_details")
-            .and_then(|v| v.get("reasoning_tokens"))
-            .and_then(|v| v.as_i64())
-        {
-            template["usage"]["completion_tokens_details"]["reasoning_tokens"] = json!(reasoning_tokens);
-        }
-    }
+    apply_usage_to_openai(&mut template, response.get("usage"));
 
     let reverse_map = build_reverse_map_from_original_openai(original_request);
     let mut content_text = String::new();
@@ -587,8 +983,12 @@ pub fn codex_completed_event_to_openai(event: &Value, original_request: &Value) 
                 "reasoning" => {
                     if let Some(summary) = item.get("summary").and_then(|v| v.as_array()) {
                         for summary_item in summary {
-                            if summary_item.get("type").and_then(|v| v.as_str()) == Some("summary_text") {
-                                if let Some(text) = summary_item.get("text").and_then(|v| v.as_str()) {
+                            if summary_item.get("type").and_then(|v| v.as_str())
+                                == Some("summary_text")
+                            {
+                                if let Some(text) =
+                                    summary_item.get("text").and_then(|v| v.as_str())
+                                {
                                     reasoning_text = text.to_string();
                                     break;
                                 }
@@ -599,8 +999,12 @@ pub fn codex_completed_event_to_openai(event: &Value, original_request: &Value) 
                 "message" => {
                     if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
                         for content_item in content {
-                            if content_item.get("type").and_then(|v| v.as_str()) == Some("output_text") {
-                                if let Some(text) = content_item.get("text").and_then(|v| v.as_str()) {
+                            if content_item.get("type").and_then(|v| v.as_str())
+                                == Some("output_text")
+                            {
+                                if let Some(text) =
+                                    content_item.get("text").and_then(|v| v.as_str())
+                                {
                                     content_text = text.to_string();
                                     break;
                                 }
@@ -610,10 +1014,10 @@ pub fn codex_completed_event_to_openai(event: &Value, original_request: &Value) 
                 }
                 "function_call" => {
                     let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let mut name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    if let Some(orig) = reverse_map.get(&name) {
-                        name = orig.clone();
-                    }
+                    let name = restore_original_tool_name(
+                        item.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                        &reverse_map,
+                    );
                     let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
                     let tool_call = json!({
                         "id": call_id,
@@ -645,12 +1049,66 @@ pub fn codex_completed_event_to_openai(event: &Value, original_request: &Value) 
 
     if let Some(status) = response.get("status").and_then(|v| v.as_str()) {
         if status == "completed" {
-            template["choices"][0]["finish_reason"] = json!("stop");
-            template["choices"][0]["native_finish_reason"] = json!("stop");
+            let finish_reason = if tool_calls.is_empty() {
+                "stop"
+            } else {
+                "tool_calls"
+            };
+            template["choices"][0]["finish_reason"] = json!(finish_reason);
+            template["choices"][0]["native_finish_reason"] = json!(finish_reason);
         }
     }
 
     Some(template)
+}
+
+fn restore_original_tool_name(name: &str, reverse_map: &HashMap<String, String>) -> String {
+    reverse_map
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn apply_usage_to_openai(target: &mut Value, usage: Option<&Value>) {
+    let Some(usage) = usage else {
+        return;
+    };
+
+    if let Some(output_tokens) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
+        target["usage"]["completion_tokens"] = json!(output_tokens);
+    }
+    if let Some(total_tokens) = usage.get("total_tokens").and_then(|v| v.as_i64()) {
+        target["usage"]["total_tokens"] = json!(total_tokens);
+    }
+    if let Some(input_tokens) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
+        target["usage"]["prompt_tokens"] = json!(input_tokens);
+    }
+    if let Some(cached_tokens) = usage
+        .get("input_tokens_details")
+        .and_then(|v| v.get("cached_tokens"))
+        .and_then(|v| v.as_i64())
+    {
+        target["usage"]["prompt_tokens_details"]["cached_tokens"] = json!(cached_tokens);
+    }
+    if let Some(reasoning_tokens) = usage
+        .get("output_tokens_details")
+        .and_then(|v| v.get("reasoning_tokens"))
+        .and_then(|v| v.as_i64())
+    {
+        target["usage"]["completion_tokens_details"]["reasoning_tokens"] = json!(reasoning_tokens);
+    }
+}
+
+fn convert_system_role_to_developer(out: &mut Value) {
+    let Some(items) = out.get_mut("input").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+
+    for item in items {
+        if item.get("role").and_then(|v| v.as_str()) == Some("system") {
+            item["role"] = json!("developer");
+        }
+    }
 }
 
 fn build_reverse_map_from_original_openai(original: &Value) -> HashMap<String, String> {
@@ -781,5 +1239,241 @@ fn ensure_text_object(out: &mut Value) {
 fn set_text_format(out: &mut Value, format: Value) {
     if let Some(text) = out.get_mut("text") {
         text["format"] = format;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openai_to_codex_request_maps_input_file_parts() {
+        let raw = json!({
+            "model": "gpt-5-codex",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "file",
+                    "file": {
+                        "file_data": "data:text/plain;base64,SGVsbG8=",
+                        "filename": "hello.txt"
+                    }
+                }]
+            }]
+        });
+
+        let result = openai_to_codex_request(&raw, "gpt-5-codex", false);
+        let parts = result["input"][0]["content"]
+            .as_array()
+            .expect("content array");
+
+        assert_eq!(parts[0]["type"], "input_file");
+        assert_eq!(parts[0]["file_data"], "data:text/plain;base64,SGVsbG8=");
+        assert_eq!(parts[0]["filename"], "hello.txt");
+    }
+
+    #[test]
+    fn convert_codex_stream_chunk_handles_incremental_tool_calls() {
+        let mut state = CodexStreamState {
+            response_id: String::new(),
+            created_at: 0,
+            model: String::new(),
+            function_call_index: -1,
+            has_received_arguments_delta: false,
+            has_tool_call_announced: false,
+            reverse_tool_names: HashMap::new(),
+        };
+
+        assert!(convert_codex_stream_chunk(
+            r#"{"type":"response.created","response":{"id":"resp_1","created_at":123,"model":"gpt-5-codex"}}"#,
+            &mut state,
+        )
+        .is_empty());
+
+        let added = convert_codex_stream_chunk(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"tool_a"}}"#,
+            &mut state,
+        );
+        let added_chunk: Value = serde_json::from_str(&added[0]).expect("valid tool-call chunk");
+        assert_eq!(
+            added_chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "tool_a"
+        );
+        assert_eq!(
+            added_chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            ""
+        );
+
+        let delta = convert_codex_stream_chunk(
+            r#"{"type":"response.function_call_arguments.delta","delta":"{\"foo\":"}"#,
+            &mut state,
+        );
+        let delta_chunk: Value =
+            serde_json::from_str(&delta[0]).expect("valid tool-call delta chunk");
+        assert_eq!(
+            delta_chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "{\"foo\":"
+        );
+
+        assert!(convert_codex_stream_chunk(
+            r#"{"type":"response.function_call_arguments.done","arguments":"{\"foo\":\"bar\"}"}"#,
+            &mut state,
+        )
+        .is_empty());
+
+        assert!(convert_codex_stream_chunk(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"tool_a","arguments":"{\"foo\":\"bar\"}"}}"#,
+            &mut state,
+        )
+        .is_empty());
+
+        let completed = convert_codex_stream_chunk(r#"{"type":"response.completed"}"#, &mut state);
+        let completed_chunk: Value =
+            serde_json::from_str(&completed[0]).expect("valid completion chunk");
+        assert_eq!(completed_chunk["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn codex_completed_event_to_openai_preserves_cached_usage_and_tool_finish_reason() {
+        let original_request = json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "tool_a"
+                }
+            }]
+        });
+        let event = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "created_at": 123,
+                "model": "gpt-5-codex",
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15,
+                    "input_tokens_details": {
+                        "cached_tokens": 3
+                    },
+                    "output_tokens_details": {
+                        "reasoning_tokens": 2
+                    }
+                },
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "tool_a",
+                    "arguments": "{\"ok\":true}"
+                }]
+            }
+        });
+
+        let converted = codex_completed_event_to_openai(&event, &original_request)
+            .expect("response.completed should convert");
+
+        assert_eq!(
+            converted["usage"]["prompt_tokens_details"]["cached_tokens"],
+            3
+        );
+        assert_eq!(
+            converted["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            2
+        );
+        assert_eq!(converted["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            converted["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"ok\":true}"
+        );
+    }
+
+    #[test]
+    fn openai_responses_to_codex_request_compacts_for_codex_upstream() {
+        let raw = json!({
+            "model": "codex/gpt-5-codex",
+            "input": "hello",
+            "max_output_tokens": 128,
+            "temperature": 0.7,
+            "context_management": {
+                "compaction": "auto"
+            },
+            "user": "alice"
+        });
+
+        let converted = openai_responses_to_codex_request(&raw, "gpt-5-codex");
+
+        assert_eq!(converted["model"], "gpt-5-codex");
+        assert_eq!(converted["stream"], true);
+        assert_eq!(converted["store"], false);
+        assert_eq!(converted["input"][0]["content"][0]["text"], "hello");
+        assert!(converted.get("max_output_tokens").is_none());
+        assert!(converted.get("temperature").is_none());
+        assert!(converted.get("context_management").is_none());
+        assert!(converted.get("user").is_none());
+    }
+
+    #[test]
+    fn normalize_responses_websocket_request_initializes_create_payload() {
+        let raw = json!({
+            "type": "response.create",
+            "model": "codex/gpt-5-codex"
+        });
+
+        let (normalized, next_last_request) =
+            normalize_responses_websocket_request(&raw, None, &json!([]), true)
+                .expect("response.create should normalize");
+
+        assert_eq!(normalized["stream"], true);
+        assert_eq!(normalized["input"], json!([]));
+        assert!(normalized.get("type").is_none());
+        assert_eq!(next_last_request, normalized);
+    }
+
+    #[test]
+    fn normalize_responses_websocket_request_merges_append_input_without_previous_response_id() {
+        let last_request = json!({
+            "model": "gpt-5-codex",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "hello"
+                }]
+            }],
+            "instructions": "be concise"
+        });
+        let last_output = json!([{
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": "world"
+            }]
+        }]);
+        let raw = json!({
+            "type": "response.append",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "again"
+                }]
+            }]
+        });
+
+        let (normalized, _) =
+            normalize_responses_websocket_request(&raw, Some(&last_request), &last_output, false)
+                .expect("response.append should normalize");
+
+        assert_eq!(normalized["model"], "gpt-5-codex");
+        assert_eq!(normalized["instructions"], "be concise");
+        assert_eq!(
+            normalized["input"].as_array().expect("input array").len(),
+            3
+        );
+        assert!(normalized.get("previous_response_id").is_none());
     }
 }

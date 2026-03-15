@@ -30,12 +30,16 @@ pub async fn save_config(config: AppConfig) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_auth_accounts() -> Result<Vec<AuthAccount>, String> {
-    crate::auth::list_accounts().await.map_err(|e| e.to_string())
+    crate::auth::list_accounts()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn get_auth_summary() -> Result<AuthSummary, String> {
-    let accounts = crate::auth::list_accounts().await.map_err(|e| e.to_string())?;
+    let accounts = crate::auth::list_accounts()
+        .await
+        .map_err(|e| e.to_string())?;
 
     let mut by_provider: HashMap<String, i32> = HashMap::new();
     let mut enabled = 0;
@@ -56,7 +60,9 @@ pub async fn get_auth_summary() -> Result<AuthSummary, String> {
 
 #[tauri::command]
 pub async fn start_server(app: tauri::AppHandle) -> Result<(), String> {
-    crate::api::start_server(app).await.map_err(|e| e.to_string())
+    crate::api::start_server(app)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -122,6 +128,21 @@ pub async fn start_oauth_login(
 }
 
 #[tauri::command]
+pub async fn start_codex_device_login(
+) -> Result<crate::auth::providers::openai::DeviceOAuthStart, String> {
+    crate::auth::start_codex_device_oauth()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn finish_codex_device_login(session_id: String) -> Result<String, String> {
+    crate::auth::finish_codex_device_oauth(&session_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn save_api_key_account(
     provider: String,
     api_key: String,
@@ -147,23 +168,39 @@ pub async fn set_gemini_project_id(account_id: String, project_id: String) -> Re
 }
 
 #[tauri::command]
-pub async fn fetch_antigravity_quota(account_id: String) -> Result<crate::auth::providers::antigravity::QuotaData, String> {
-    crate::auth::fetch_antigravity_quota(&account_id).await.map_err(|e| e.to_string())
+pub async fn fetch_antigravity_quota(
+    account_id: String,
+) -> Result<crate::auth::providers::antigravity::QuotaData, String> {
+    crate::auth::fetch_antigravity_quota(&account_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn fetch_codex_quota(account_id: String) -> Result<crate::auth::providers::openai::CodexQuotaData, String> {
-    crate::auth::fetch_codex_quota(&account_id).await.map_err(|e| e.to_string())
+pub async fn fetch_codex_quota(
+    account_id: String,
+) -> Result<crate::auth::providers::openai::CodexQuotaData, String> {
+    crate::auth::fetch_codex_quota(&account_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn fetch_gemini_quota(account_id: String) -> Result<crate::auth::providers::google::GeminiQuotaData, String> {
-    crate::auth::fetch_gemini_quota(&account_id).await.map_err(|e| e.to_string())
+pub async fn fetch_gemini_quota(
+    account_id: String,
+) -> Result<crate::auth::providers::google::GeminiQuotaData, String> {
+    crate::auth::fetch_gemini_quota(&account_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn fetch_kiro_quota(account_id: String) -> Result<crate::auth::providers::kiro::KiroQuotaData, String> {
-    crate::auth::fetch_kiro_quota(&account_id).await.map_err(|e| e.to_string())
+pub async fn fetch_kiro_quota(
+    account_id: String,
+) -> Result<crate::auth::providers::kiro::KiroQuotaData, String> {
+    crate::auth::fetch_kiro_quota(&account_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -192,6 +229,35 @@ pub async fn get_cached_quotas() -> Result<HashMap<String, crate::db::CachedQuot
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexRoutingStatusData {
+    pub account_id: String,
+    pub order: usize,
+    pub selected: bool,
+    pub exhausted: bool,
+    pub quota_state: String,
+}
+
+#[tauri::command]
+pub async fn get_codex_routing_statuses() -> Result<HashMap<String, CodexRoutingStatusData>, String>
+{
+    Ok(crate::api::get_codex_routing_statuses()
+        .into_iter()
+        .map(|(account_id, status)| {
+            (
+                account_id,
+                CodexRoutingStatusData {
+                    account_id: status.account_id,
+                    order: status.order,
+                    selected: status.selected,
+                    exhausted: status.exhausted,
+                    quota_state: status.quota_state,
+                },
+            )
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettingsData {
     pub quota_refresh_interval: u32,
     pub model_routing_mode: String,
@@ -213,13 +279,16 @@ pub async fn get_settings() -> Result<SettingsData, String> {
     Ok(SettingsData {
         quota_refresh_interval: config.quota_refresh_interval,
         model_routing_mode: config.model_routing.mode.clone(),
-        provider_priorities: config.model_routing.provider_priorities.iter().map(|p| {
-            ProviderPriorityData {
+        provider_priorities: config
+            .model_routing
+            .provider_priorities
+            .iter()
+            .map(|p| ProviderPriorityData {
                 provider: p.provider.clone(),
                 priority: p.priority,
                 enabled: p.enabled,
-            }
-        }).collect(),
+            })
+            .collect(),
         account_routing_strategy: config.routing.strategy.clone(),
     })
 }
@@ -229,13 +298,15 @@ pub async fn save_settings(settings: SettingsData) -> Result<(), String> {
     let mut config = config::get_config().ok_or_else(|| "Config not initialized".to_string())?;
     config.quota_refresh_interval = settings.quota_refresh_interval;
     config.model_routing.mode = settings.model_routing_mode;
-    config.model_routing.provider_priorities = settings.provider_priorities.iter().map(|p| {
-        config::ProviderPriority {
+    config.model_routing.provider_priorities = settings
+        .provider_priorities
+        .iter()
+        .map(|p| config::ProviderPriority {
             provider: p.provider.clone(),
             priority: p.priority,
             enabled: p.enabled,
-        }
-    }).collect();
+        })
+        .collect();
     config.routing.strategy = settings.account_routing_strategy;
     config::update_config(config).map_err(|e| e.to_string())
 }
@@ -289,15 +360,18 @@ pub async fn get_claude_code_config() -> Result<Option<ClaudeCodeConfig>, String
 
     if let Some(env) = env {
         Ok(Some(ClaudeCodeConfig {
-            opus_model: env.get("ANTHROPIC_DEFAULT_OPUS_MODEL")
+            opus_model: env
+                .get("ANTHROPIC_DEFAULT_OPUS_MODEL")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
-            sonnet_model: env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+            sonnet_model: env
+                .get("ANTHROPIC_DEFAULT_SONNET_MODEL")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
-            haiku_model: env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+            haiku_model: env
+                .get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
@@ -320,7 +394,9 @@ pub async fn save_claude_code_config(claude_config: ClaudeCodeConfig) -> Result<
     // Get current config for base URL and API key
     let app_config = config::get_config().unwrap_or_default();
     let base_url = format!("http://127.0.0.1:{}", app_config.port);
-    let api_key = app_config.api_keys.first()
+    let api_key = app_config
+        .api_keys
+        .first()
         .cloned()
         .unwrap_or_else(|| "sk-oneproxy".to_string());
 
@@ -377,21 +453,37 @@ pub struct CustomProvidersData {
 pub async fn get_custom_providers() -> Result<CustomProvidersData, String> {
     let config = config::get_config().ok_or_else(|| "Config not initialized".to_string())?;
 
-    let openai_compat = config.openai_compatibility.iter().map(|e| CustomProviderEntry {
-        name: e.name.clone(),
-        prefix: e.prefix.clone(),
-        base_url: e.base_url.clone(),
-        api_keys: e.api_key_entries.iter().map(|k| k.api_key.clone()).collect(),
-        models: e.models.clone(),
-    }).collect();
+    let openai_compat = config
+        .openai_compatibility
+        .iter()
+        .map(|e| CustomProviderEntry {
+            name: e.name.clone(),
+            prefix: e.prefix.clone(),
+            base_url: e.base_url.clone(),
+            api_keys: e
+                .api_key_entries
+                .iter()
+                .map(|k| k.api_key.clone())
+                .collect(),
+            models: e.models.clone(),
+        })
+        .collect();
 
-    let claude_compat = config.claude_code_compatibility.iter().map(|e| CustomProviderEntry {
-        name: e.name.clone(),
-        prefix: e.prefix.clone(),
-        base_url: e.base_url.clone(),
-        api_keys: e.api_key_entries.iter().map(|k| k.api_key.clone()).collect(),
-        models: e.models.clone(),
-    }).collect();
+    let claude_compat = config
+        .claude_code_compatibility
+        .iter()
+        .map(|e| CustomProviderEntry {
+            name: e.name.clone(),
+            prefix: e.prefix.clone(),
+            base_url: e.base_url.clone(),
+            api_keys: e
+                .api_key_entries
+                .iter()
+                .map(|k| k.api_key.clone())
+                .collect(),
+            models: e.models.clone(),
+        })
+        .collect();
 
     Ok(CustomProvidersData {
         openai_compatibility: openai_compat,
@@ -403,7 +495,14 @@ pub async fn get_custom_providers() -> Result<CustomProvidersData, String> {
 pub async fn save_custom_providers(data: CustomProvidersData) -> Result<(), String> {
     // Reserved provider names that cannot be used
     const RESERVED_NAMES: &[&str] = &[
-        "gemini", "codex", "openai", "claude", "antigravity", "kimi", "glm", "kiro"
+        "gemini",
+        "codex",
+        "openai",
+        "claude",
+        "antigravity",
+        "kimi",
+        "glm",
+        "kiro",
     ];
 
     // Collect all prefixes for duplicate checking
@@ -424,10 +523,7 @@ pub async fn save_custom_providers(data: CustomProvidersData) -> Result<(), Stri
 
         // Check duplicates
         if all_prefixes.contains(&prefix) {
-            return Err(format!(
-                "供应商前缀 '{}' 已存在，不能重复添加",
-                prefix
-            ));
+            return Err(format!("供应商前缀 '{}' 已存在，不能重复添加", prefix));
         }
         all_prefixes.push(prefix);
     }
@@ -447,45 +543,54 @@ pub async fn save_custom_providers(data: CustomProvidersData) -> Result<(), Stri
 
         // Check duplicates
         if all_prefixes.contains(&prefix) {
-            return Err(format!(
-                "供应商前缀 '{}' 已存在，不能重复添加",
-                prefix
-            ));
+            return Err(format!("供应商前缀 '{}' 已存在，不能重复添加", prefix));
         }
         all_prefixes.push(prefix);
     }
 
     let mut config = config::get_config().ok_or_else(|| "Config not initialized".to_string())?;
 
-    config.openai_compatibility = data.openai_compatibility.iter().map(|e| {
-        config::OpenAICompatEntry {
+    config.openai_compatibility = data
+        .openai_compatibility
+        .iter()
+        .map(|e| config::OpenAICompatEntry {
             name: e.name.clone(),
             prefix: e.prefix.clone(),
             base_url: e.base_url.clone(),
-            api_key_entries: e.api_keys.iter().map(|k| config::ApiKeyEntry {
-                api_key: k.clone(),
-                prefix: None,
-                base_url: None,
-                proxy_url: None,
-            }).collect(),
+            api_key_entries: e
+                .api_keys
+                .iter()
+                .map(|k| config::ApiKeyEntry {
+                    api_key: k.clone(),
+                    prefix: None,
+                    base_url: None,
+                    proxy_url: None,
+                })
+                .collect(),
             models: e.models.clone(),
-        }
-    }).collect();
+        })
+        .collect();
 
-    config.claude_code_compatibility = data.claude_code_compatibility.iter().map(|e| {
-        config::ClaudeCodeCompatEntry {
+    config.claude_code_compatibility = data
+        .claude_code_compatibility
+        .iter()
+        .map(|e| config::ClaudeCodeCompatEntry {
             name: e.name.clone(),
             prefix: e.prefix.clone(),
             base_url: e.base_url.clone(),
-            api_key_entries: e.api_keys.iter().map(|k| config::ApiKeyEntry {
-                api_key: k.clone(),
-                prefix: None,
-                base_url: None,
-                proxy_url: None,
-            }).collect(),
+            api_key_entries: e
+                .api_keys
+                .iter()
+                .map(|k| config::ApiKeyEntry {
+                    api_key: k.clone(),
+                    prefix: None,
+                    base_url: None,
+                    proxy_url: None,
+                })
+                .collect(),
             models: e.models.clone(),
-        }
-    }).collect();
+        })
+        .collect();
 
     config::update_config(config).map_err(|e| e.to_string())
 }

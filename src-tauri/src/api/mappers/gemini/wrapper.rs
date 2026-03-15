@@ -39,8 +39,9 @@ pub fn wrap_request(
                         if part.get("functionCall").is_some() {
                             // Only inject if it doesn't already have one
                             if part.get("thoughtSignature").is_none() {
-                                if let Some(sig) = crate::api::signature_cache::SignatureCache::global()
-                                    .get_session_signature(s_id)
+                                if let Some(sig) =
+                                    crate::api::signature_cache::SignatureCache::global()
+                                        .get_session_signature(s_id)
                                 {
                                     if let Some(obj) = part.as_object_mut() {
                                         obj.insert("thoughtSignature".to_string(), json!(sig));
@@ -152,9 +153,7 @@ pub fn wrap_request(
                                     decl_obj.remove("parametersJsonSchema")
                                 {
                                     let mut params = params_json_schema;
-                                    crate::api::common::json_schema::clean_json_schema(
-                                        &mut params,
-                                    );
+                                    crate::api::common::json_schema::clean_json_schema(&mut params);
                                     decl_obj.insert("parameters".to_string(), params);
                                 } else if let Some(params) = decl_obj.get_mut("parameters") {
                                     // 标准 parameters 字段

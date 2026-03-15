@@ -59,11 +59,7 @@ fn convert_refs_to_hints(value: &mut Value) {
     match value {
         Value::Object(map) => {
             if let Some(ref_val) = map.get("$ref").and_then(|v| v.as_str()) {
-                let def_name = ref_val
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(ref_val)
-                    .to_string();
+                let def_name = ref_val.rsplit('/').next().unwrap_or(ref_val).to_string();
                 let mut hint = format!("See: {}", def_name);
                 if let Some(existing) = map.get("description").and_then(|v| v.as_str()) {
                     if !existing.is_empty() {
@@ -248,9 +244,7 @@ fn merge_all_of(value: &mut Value) {
                     map.insert("properties".to_string(), json!({}));
                 }
 
-                let mut props_map_opt = map
-                    .get_mut("properties")
-                    .and_then(|v| v.as_object_mut());
+                let mut props_map_opt = map.get_mut("properties").and_then(|v| v.as_object_mut());
 
                 for item in items {
                     if let Value::Object(item_map) = item {
@@ -365,11 +359,7 @@ fn flatten_type_arrays(value: &mut Value) {
                 if let Some(Value::Array(req_arr)) = map.get_mut("required") {
                     let filtered: Vec<Value> = req_arr
                         .iter()
-                        .filter(|v| {
-                            v.as_str()
-                                .map(|s| !fields.contains(s))
-                                .unwrap_or(true)
-                        })
+                        .filter(|v| v.as_str().map(|s| !fields.contains(s)).unwrap_or(true))
                         .cloned()
                         .collect();
                     if filtered.is_empty() {
@@ -465,8 +455,8 @@ fn remove_unsupported_keywords(value: &mut Value, in_properties_map: bool) {
             let keys: Vec<String> = map.keys().cloned().collect();
             for key in keys {
                 let is_extension = key.starts_with("x-");
-                let should_remove = !in_properties_map
-                    && (keywords.contains(&key.as_str()) || is_extension);
+                let should_remove =
+                    !in_properties_map && (keywords.contains(&key.as_str()) || is_extension);
                 if should_remove {
                     map.remove(&key);
                 }
@@ -630,7 +620,9 @@ fn add_empty_schema_placeholder(value: &mut Value, path: &mut Vec<PathSegment>) 
                 .unwrap_or(false);
 
             if props_exists.is_none() || props_empty {
-                let props = map.entry("properties".to_string()).or_insert_with(|| json!({}));
+                let props = map
+                    .entry("properties".to_string())
+                    .or_insert_with(|| json!({}));
                 if let Value::Object(props_map) = props {
                     props_map.insert(
                         "reason".to_string(),
@@ -675,7 +667,10 @@ fn value_to_string(value: &Value) -> String {
 }
 
 fn append_hint_to_obj(map: &mut Map<String, Value>, hint: &str) {
-    let existing = map.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let existing = map
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let new_desc = if existing.is_empty() {
         hint.to_string()
     } else {
@@ -695,9 +690,15 @@ fn merge_description_in_value(value: &mut Value, parent_desc: &str) {
         return;
     }
     if let Value::Object(map) = value {
-        let child_desc = map.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        let child_desc = map
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if child_desc.is_empty() {
-            map.insert("description".to_string(), Value::String(parent_desc.to_string()));
+            map.insert(
+                "description".to_string(),
+                Value::String(parent_desc.to_string()),
+            );
         } else if child_desc != parent_desc {
             map.insert(
                 "description".to_string(),

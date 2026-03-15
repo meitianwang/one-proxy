@@ -316,7 +316,8 @@ pub fn claude_stream_to_openai_chunk(event: &Value, model: &str) -> Option<Value
         }
         "message_delta" => {
             // Final chunk with finish_reason
-            let stop_reason = event.get("delta")
+            let stop_reason = event
+                .get("delta")
                 .and_then(|d| d.get("stop_reason"))
                 .and_then(|v| v.as_str())
                 .map(|r| match r {
@@ -364,20 +365,27 @@ fn extract_base64_image(source: &Value) -> Option<(String, String)> {
         .get("data")
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
-        .or_else(|| source.get("base64").and_then(|v| v.as_str()).filter(|v| !v.is_empty()))?;
+        .or_else(|| {
+            source
+                .get("base64")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+        })?;
     let mime_type = source
         .get("media_type")
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
-        .or_else(|| source.get("mime_type").and_then(|v| v.as_str()).filter(|v| !v.is_empty()))
+        .or_else(|| {
+            source
+                .get("mime_type")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+        })
         .unwrap_or("application/octet-stream");
     Some((mime_type.to_string(), data.to_string()))
 }
 
-fn convert_claude_content_part(
-    part: &Value,
-    image_handling: ClaudeImageHandling,
-) -> Option<Value> {
+fn convert_claude_content_part(part: &Value, image_handling: ClaudeImageHandling) -> Option<Value> {
     let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match part_type {
         "text" => {
@@ -388,47 +396,37 @@ fn convert_claude_content_part(
                 Some(json!({ "type": "text", "text": text }))
             }
         }
-        "image" => {
-            match image_handling {
-                ClaudeImageHandling::Drop => None,
-                ClaudeImageHandling::Base64Any => {
-                    let source = part.get("source")?;
-                    let (mime, data) = extract_base64_image(source)?;
-                    Some(json!({
-                        "type": "image_url",
-                        "image_url": { "url": format!("data:{};base64,{}", mime, data) }
-                    }))
+        "image" => match image_handling {
+            ClaudeImageHandling::Drop => None,
+            ClaudeImageHandling::Base64Any => {
+                let source = part.get("source")?;
+                let (mime, data) = extract_base64_image(source)?;
+                Some(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{};base64,{}", mime, data) }
+                }))
+            }
+            ClaudeImageHandling::Base64TypeOnly => {
+                let source = part.get("source")?;
+                let source_type = source.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if source_type != "base64" {
+                    return None;
                 }
-                ClaudeImageHandling::Base64TypeOnly => {
-                    let source = part.get("source")?;
-                    let source_type = source.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    if source_type != "base64" {
-                        return None;
+                let (mime, data) = extract_base64_image(source)?;
+                Some(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{};base64,{}", mime, data) }
+                }))
+            }
+            ClaudeImageHandling::Base64AndUrl => {
+                if let Some(source) = part.get("source") {
+                    if let Some((mime, data)) = extract_base64_image(source) {
+                        return Some(json!({
+                            "type": "image_url",
+                            "image_url": { "url": format!("data:{};base64,{}", mime, data) }
+                        }));
                     }
-                    let (mime, data) = extract_base64_image(source)?;
-                    Some(json!({
-                        "type": "image_url",
-                        "image_url": { "url": format!("data:{};base64,{}", mime, data) }
-                    }))
-                }
-                ClaudeImageHandling::Base64AndUrl => {
-                    if let Some(source) = part.get("source") {
-                        if let Some((mime, data)) = extract_base64_image(source) {
-                            return Some(json!({
-                                "type": "image_url",
-                                "image_url": { "url": format!("data:{};base64,{}", mime, data) }
-                            }));
-                        }
-                        if let Some(url) = source.get("url").and_then(|v| v.as_str()) {
-                            if !url.is_empty() {
-                                return Some(json!({
-                                    "type": "image_url",
-                                    "image_url": { "url": url }
-                                }));
-                            }
-                        }
-                    }
-                    if let Some(url) = part.get("url").and_then(|v| v.as_str()) {
+                    if let Some(url) = source.get("url").and_then(|v| v.as_str()) {
                         if !url.is_empty() {
                             return Some(json!({
                                 "type": "image_url",
@@ -436,10 +434,18 @@ fn convert_claude_content_part(
                             }));
                         }
                     }
-                    None
                 }
+                if let Some(url) = part.get("url").and_then(|v| v.as_str()) {
+                    if !url.is_empty() {
+                        return Some(json!({
+                            "type": "image_url",
+                            "image_url": { "url": url }
+                        }));
+                    }
+                }
+                None
             }
-        }
+        },
         _ => None,
     }
 }
@@ -542,7 +548,8 @@ pub fn claude_request_to_openai_chat(
             if let Some(Value::String(tt)) = thinking.get("type") {
                 match tt.as_str() {
                     "enabled" => {
-                        if let Some(budget) = thinking.get("budget_tokens").and_then(|v| v.as_i64()) {
+                        if let Some(budget) = thinking.get("budget_tokens").and_then(|v| v.as_i64())
+                        {
                             if let Some(level) = convert_budget_to_level(budget) {
                                 out["reasoning_effort"] = json!(level);
                             }
@@ -628,7 +635,8 @@ pub fn claude_request_to_openai_chat(
                                     id.to_string()
                                 };
                                 let input = part.get("input").cloned().unwrap_or_else(|| json!({}));
-                                let args = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                                let args = serde_json::to_string(&input)
+                                    .unwrap_or_else(|_| "{}".to_string());
                                 tool_calls.push(json!({
                                     "id": tool_id,
                                     "type": "function",
@@ -640,12 +648,16 @@ pub fn claude_request_to_openai_chat(
                             }
                         }
                         "tool_result" => {
-                            let tool_call_id = part.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
+                            let tool_call_id = part
+                                .get("tool_use_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
                             if tool_call_id.is_empty() {
                                 continue;
                             }
                             let tool_content = part.get("content").unwrap_or(&Value::Null);
-                            let content_str = convert_claude_tool_result_content_to_string(tool_content);
+                            let content_str =
+                                convert_claude_tool_result_content_to_string(tool_content);
                             tool_results.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_call_id,
@@ -710,7 +722,10 @@ pub fn claude_request_to_openai_chat(
             if name.is_empty() {
                 continue;
             }
-            let description = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let description = tool
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let mut tool_def = json!({
                 "type": "function",
                 "function": {
@@ -729,7 +744,11 @@ pub fn claude_request_to_openai_chat(
     }
 
     if let Some(tool_choice) = raw.get("tool_choice") {
-        match tool_choice.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        match tool_choice
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+        {
             "auto" => {
                 out["tool_choice"] = json!("auto");
             }
@@ -767,11 +786,7 @@ fn map_openai_finish_reason(reason: Option<&str>) -> Option<&'static str> {
     }
 }
 
-pub fn openai_to_claude_response(
-    openai_response: &Value,
-    model: &str,
-    request_id: &str,
-) -> Value {
+pub fn openai_to_claude_response(openai_response: &Value, model: &str, request_id: &str) -> Value {
     openai_to_claude_response_with_options(openai_response, model, request_id, false)
 }
 
@@ -822,12 +837,15 @@ pub fn openai_to_claude_response_with_options(
                         "reasoning" => {
                             if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                                 if !text.is_empty() {
-                                    content_blocks.push(json!({ "type": "thinking", "thinking": text }));
+                                    content_blocks
+                                        .push(json!({ "type": "thinking", "thinking": text }));
                                 }
                             }
                         }
                         "tool_calls" => {
-                            if let Some(tool_calls) = item.get("tool_calls").and_then(|v| v.as_array()) {
+                            if let Some(tool_calls) =
+                                item.get("tool_calls").and_then(|v| v.as_array())
+                            {
                                 for tool_call in tool_calls {
                                     if let Some(tool_use) = convert_openai_tool_call(tool_call) {
                                         has_tool_call = true;
@@ -866,17 +884,18 @@ pub fn openai_to_claude_response_with_options(
     let finish_reason = choice.get("finish_reason").and_then(|v| v.as_str());
     let mut stop_reason = map_openai_finish_reason(finish_reason);
     if stop_reason.is_none() {
-        stop_reason = if has_tool_call { Some("tool_use") } else { Some("end_turn") };
+        stop_reason = if has_tool_call {
+            Some("tool_use")
+        } else {
+            Some("end_turn")
+        };
     }
 
     let (input_tokens, output_tokens) = openai_response
         .get("usage")
         .and_then(|v| v.as_object())
         .map(|u| {
-            let prompt = u
-                .get("prompt_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
+            let prompt = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let completion = u
                 .get("completion_tokens")
                 .and_then(|v| v.as_u64())

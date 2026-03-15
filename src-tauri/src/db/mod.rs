@@ -81,7 +81,7 @@ pub fn init_db(app_data_dir: PathBuf) -> Result<()> {
         )",
         [],
     )?;
-    
+
     // Add provider column if it doesn't exist (migration for existing databases)
     let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN provider TEXT", []);
 
@@ -155,9 +155,8 @@ pub fn get_all_quota_cache() -> Result<HashMap<String, CachedQuota>> {
 
     let conn = conn.lock();
 
-    let mut stmt = conn.prepare(
-        "SELECT account_id, provider, quota_data, last_updated FROM quota_cache",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT account_id, provider, quota_data, last_updated FROM quota_cache")?;
 
     let rows = stmt.query_map([], |row| {
         Ok(CachedQuota {
@@ -227,9 +226,12 @@ pub fn save_request_log(
     Ok(())
 }
 
-
 /// Get request logs with optional filtering
-pub fn get_request_logs(limit: u32, offset: u32, filter: Option<LogFilter>) -> Result<Vec<RequestLogEntry>> {
+pub fn get_request_logs(
+    limit: u32,
+    offset: u32,
+    filter: Option<LogFilter>,
+) -> Result<Vec<RequestLogEntry>> {
     let conn = DB_CONNECTION
         .get()
         .ok_or_else(|| anyhow::anyhow!("Database not initialized"))?;
@@ -297,7 +299,6 @@ pub fn get_request_logs(limit: u32, offset: u32, filter: Option<LogFilter>) -> R
 
     Ok(result)
 }
-
 
 /// Get count of request logs with optional filtering
 pub fn get_request_logs_count(filter: Option<LogFilter>) -> Result<i64> {

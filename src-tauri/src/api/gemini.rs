@@ -1,15 +1,15 @@
 // Gemini API client for proxying requests
 // Uses Cloud Code Assist endpoint for OAuth tokens (same as CLIProxyAPI)
 
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
+use super::mime_types::mime_type_for_extension;
+use anyhow::{anyhow, Result};
 use axum::response::sse::Event;
 use futures::{Stream, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::convert::Infallible;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
-use super::mime_types::mime_type_for_extension;
 
 // Cloud Code Assist endpoint for OAuth tokens (same as CLIProxyAPI gemini_cli_executor.go)
 const CODE_ASSIST_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
@@ -128,8 +128,7 @@ impl GeminiClient {
         // Use Cloud Code Assist endpoint like CLIProxyAPI gemini_cli_executor.go
         let url = format!(
             "{}/{}:generateContent",
-            CODE_ASSIST_ENDPOINT,
-            CODE_ASSIST_VERSION
+            CODE_ASSIST_ENDPOINT, CODE_ASSIST_VERSION
         );
 
         let response = self
@@ -140,7 +139,10 @@ impl GeminiClient {
             .header("Accept", "application/json")
             .header("User-Agent", "google-api-nodejs-client/9.15.1")
             .header("X-Goog-Api-Client", "gl-node/22.17.0")
-            .header("Client-Metadata", "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI")
+            .header(
+                "Client-Metadata",
+                "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+            )
             .json(payload)
             .send()
             .await?;
@@ -168,9 +170,7 @@ impl GeminiClient {
         let alt_param = alt.filter(|v| !v.trim().is_empty()).unwrap_or("sse");
         let url = format!(
             "{}/{}:streamGenerateContent?alt={}",
-            CODE_ASSIST_ENDPOINT,
-            CODE_ASSIST_VERSION,
-            alt_param
+            CODE_ASSIST_ENDPOINT, CODE_ASSIST_VERSION, alt_param
         );
 
         let response = self
@@ -188,7 +188,10 @@ impl GeminiClient {
             )
             .header("User-Agent", "google-api-nodejs-client/9.15.1")
             .header("X-Goog-Api-Client", "gl-node/22.17.0")
-            .header("Client-Metadata", "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI")
+            .header(
+                "Client-Metadata",
+                "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+            )
             .json(payload)
             .send()
             .await?;
@@ -196,7 +199,11 @@ impl GeminiClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Gemini streaming request failed: {} {}", status, body));
+            return Err(anyhow!(
+                "Gemini streaming request failed: {} {}",
+                status,
+                body
+            ));
         }
 
         Ok(response)
@@ -205,8 +212,7 @@ impl GeminiClient {
     pub async fn count_tokens(&self, payload: &Value) -> Result<Value> {
         let url = format!(
             "{}/{}:countTokens",
-            CODE_ASSIST_ENDPOINT,
-            CODE_ASSIST_VERSION
+            CODE_ASSIST_ENDPOINT, CODE_ASSIST_VERSION
         );
 
         let response = self
@@ -217,7 +223,10 @@ impl GeminiClient {
             .header("Accept", "application/json")
             .header("User-Agent", "google-api-nodejs-client/9.15.1")
             .header("X-Goog-Api-Client", "gl-node/22.17.0")
-            .header("Client-Metadata", "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI")
+            .header(
+                "Client-Metadata",
+                "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+            )
             .json(payload)
             .send()
             .await?;
@@ -281,8 +290,7 @@ fn normalize_thinking_level_for_model(model: &str, level: &str) -> Option<String
     }
 
     let model_lower = model.to_lowercase();
-    if model_lower.starts_with("gemini-3-pro-high")
-        || model_lower.starts_with("gemini-3-pro-image")
+    if model_lower.starts_with("gemini-3-pro-high") || model_lower.starts_with("gemini-3-pro-image")
     {
         let mapped = match normalized.as_str() {
             "minimal" | "low" => "low",
@@ -330,7 +338,8 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                 }
             }
             if !thinking_config.is_empty() {
-                generation_config.insert("thinkingConfig".to_string(), Value::Object(thinking_config));
+                generation_config
+                    .insert("thinkingConfig".to_string(), Value::Object(thinking_config));
             }
         }
     }
@@ -345,9 +354,7 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
         generation_config.insert("topK".to_string(), json!(top_k));
     }
     if let Some(n_val) = raw.get("n") {
-        let n = n_val
-            .as_i64()
-            .or_else(|| n_val.as_f64().map(|v| v as i64));
+        let n = n_val.as_i64().or_else(|| n_val.as_f64().map(|v| v as i64));
         if let Some(n) = n {
             if n > 1 {
                 generation_config.insert("candidateCount".to_string(), json!(n));
@@ -382,7 +389,10 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
         }
     }
     if !generation_config.is_empty() {
-        request.insert("generationConfig".to_string(), Value::Object(generation_config));
+        request.insert(
+            "generationConfig".to_string(),
+            Value::Object(generation_config),
+        );
     }
 
     let mut contents: Vec<Value> = Vec::new();
@@ -449,7 +459,8 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                 continue;
             }
 
-            if role == "user" || ((role == "system" || role == "developer") && !has_multiple_messages)
+            if role == "user"
+                || ((role == "system" || role == "developer") && !has_multiple_messages)
             {
                 let mut parts = Vec::new();
                 if let Some(content) = content {
@@ -459,8 +470,7 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                         for item in items {
                             match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
                                 "text" => {
-                                    if let Some(text) = item.get("text").and_then(|v| v.as_str())
-                                    {
+                                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                                         parts.push(json!({ "text": text }));
                                     }
                                 }
@@ -488,10 +498,8 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                                         .and_then(|v| v.get("file_data"))
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
-                                    let ext = filename
-                                        .rsplit_once('.')
-                                        .map(|(_, e)| e)
-                                        .unwrap_or("");
+                                    let ext =
+                                        filename.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
                                     if let Some(mime_type) = mime_type_for_extension(ext) {
                                         parts.push(json!({
                                             "inlineData": { "mime_type": mime_type, "data": file_data }
@@ -521,8 +529,7 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                         for item in items {
                             match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
                                 "text" => {
-                                    if let Some(text) = item.get("text").and_then(|v| v.as_str())
-                                    {
+                                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                                         parts.push(json!({ "text": text }));
                                     }
                                 }
@@ -559,7 +566,8 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
                         let fargs_raw = tc.get("function").and_then(|v| v.get("arguments"));
-                        let args_value = if let Some(args_str) = fargs_raw.and_then(|v| v.as_str()) {
+                        let args_value = if let Some(args_str) = fargs_raw.and_then(|v| v.as_str())
+                        {
                             if args_str.is_empty() {
                                 Value::String(String::new())
                             } else {
@@ -670,7 +678,10 @@ pub fn openai_to_gemini_cli_request(raw: &Value, model: &str) -> Value {
     }
 
     if !request.contains_key("safetySettings") {
-        request.insert("safetySettings".to_string(), json!(default_safety_settings()));
+        request.insert(
+            "safetySettings".to_string(),
+            json!(default_safety_settings()),
+        );
     }
 
     json!({
@@ -755,8 +766,7 @@ pub fn gemini_cli_stream_to_openai_chunks(
 pub fn gemini_cli_stream_to_openai_events(
     response: reqwest::Response,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    gemini_cli_stream_to_openai_chunks(response)
-        .map(|chunk| Ok(Event::default().data(chunk)))
+    gemini_cli_stream_to_openai_chunks(response).map(|chunk| Ok(Event::default().data(chunk)))
 }
 
 fn convert_gemini_cli_stream_chunk(data: &str, state: &mut GeminiCliStreamState) -> Vec<String> {
@@ -823,8 +833,14 @@ fn convert_gemini_cli_stream_chunk(data: &str, state: &mut GeminiCliStreamState)
         if let Some(total) = usage.get("totalTokenCount").and_then(|v| v.as_i64()) {
             template["usage"]["total_tokens"] = json!(total);
         }
-        let prompt = usage.get("promptTokenCount").and_then(|v| v.as_i64()).unwrap_or(0);
-        let thoughts = usage.get("thoughtsTokenCount").and_then(|v| v.as_i64()).unwrap_or(0);
+        let prompt = usage
+            .get("promptTokenCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let thoughts = usage
+            .get("thoughtsTokenCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         template["usage"]["prompt_tokens"] = json!(prompt + thoughts);
         if thoughts > 0 {
             template["usage"]["completion_tokens_details"]["reasoning_tokens"] = json!(thoughts);
@@ -859,7 +875,11 @@ fn convert_gemini_cli_stream_chunk(data: &str, state: &mut GeminiCliStreamState)
             }
 
             if let Some(text) = part_text {
-                if part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if part
+                    .get("thought")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     template["choices"][0]["delta"]["reasoning_content"] = json!(text);
                 } else {
                     template["choices"][0]["delta"]["content"] = json!(text);
@@ -876,7 +896,10 @@ fn convert_gemini_cli_stream_chunk(data: &str, state: &mut GeminiCliStreamState)
                 } else {
                     template["choices"][0]["delta"]["tool_calls"] = json!([]);
                 }
-                let fc_name = function_call.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let fc_name = function_call
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let counter = FUNCTION_CALL_ID_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
                 let nanos = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -903,7 +926,10 @@ fn convert_gemini_cli_stream_chunk(data: &str, state: &mut GeminiCliStreamState)
             }
 
             if let Some(inline_data) = inline_data {
-                let data = inline_data.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                let data = inline_data
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if data.is_empty() {
                     continue;
                 }
@@ -959,7 +985,10 @@ pub fn gemini_to_openai_response(
 ) -> Value {
     if let Some(error) = gemini_response.get("error") {
         let message = error.get("message").and_then(|v| v.as_str()).unwrap_or("");
-        let status = error.get("status").and_then(|v| v.as_str()).unwrap_or("api_error");
+        let status = error
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("api_error");
         let code = error.get("code").and_then(|v| v.as_i64()).unwrap_or(500);
         return json!({
             "error": {
@@ -1004,13 +1033,22 @@ fn convert_gemini_response_to_openai(root: &Value) -> Value {
         if let Some(total) = usage.get("totalTokenCount").and_then(|v| v.as_i64()) {
             template["usage"]["total_tokens"] = json!(total);
         }
-        let prompt = usage.get("promptTokenCount").and_then(|v| v.as_i64()).unwrap_or(0);
-        let thoughts = usage.get("thoughtsTokenCount").and_then(|v| v.as_i64()).unwrap_or(0);
+        let prompt = usage
+            .get("promptTokenCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let thoughts = usage
+            .get("thoughtsTokenCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         template["usage"]["prompt_tokens"] = json!(prompt + thoughts);
         if thoughts > 0 {
             template["usage"]["completion_tokens_details"]["reasoning_tokens"] = json!(thoughts);
         }
-        let cached = usage.get("cachedContentTokenCount").and_then(|v| v.as_i64()).unwrap_or(0);
+        let cached = usage
+            .get("cachedContentTokenCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         if cached > 0 {
             template["usage"]["prompt_tokens_details"]["cached_tokens"] = json!(cached);
         }
@@ -1049,9 +1087,16 @@ fn convert_gemini_response_to_openai(root: &Value) -> Value {
             {
                 for part in parts {
                     if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                        if part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false) {
-                            let current = choice["message"]["reasoning_content"].as_str().unwrap_or("");
-                            choice["message"]["reasoning_content"] = json!(format!("{}{}", current, text));
+                        if part
+                            .get("thought")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                        {
+                            let current = choice["message"]["reasoning_content"]
+                                .as_str()
+                                .unwrap_or("");
+                            choice["message"]["reasoning_content"] =
+                                json!(format!("{}{}", current, text));
                         } else {
                             let current = choice["message"]["content"].as_str().unwrap_or("");
                             choice["message"]["content"] = json!(format!("{}{}", current, text));
@@ -1065,7 +1110,10 @@ fn convert_gemini_response_to_openai(root: &Value) -> Value {
                         if !choice["message"]["tool_calls"].is_array() {
                             choice["message"]["tool_calls"] = json!([]);
                         }
-                        let name = function_call.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let name = function_call
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
                         let counter = FUNCTION_CALL_ID_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
                         let nanos = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -1091,13 +1139,24 @@ fn convert_gemini_response_to_openai(root: &Value) -> Value {
 
                     let inline_data = part.get("inlineData").or_else(|| part.get("inline_data"));
                     if let Some(inline_data) = inline_data {
-                        let data = inline_data.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                        let data = inline_data
+                            .get("data")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
                         if data.is_empty() {
                             continue;
                         }
-                        let mut mime_type = inline_data.get("mimeType").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let mut mime_type = inline_data
+                            .get("mimeType")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         if mime_type.is_empty() {
-                            mime_type = inline_data.get("mime_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            mime_type = inline_data
+                                .get("mime_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                         }
                         if mime_type.is_empty() {
                             mime_type = "image/png".to_string();
@@ -1106,7 +1165,10 @@ fn convert_gemini_response_to_openai(root: &Value) -> Value {
                         if !choice["message"]["images"].is_array() {
                             choice["message"]["images"] = json!([]);
                         }
-                        let index = choice["message"]["images"].as_array().map(|a| a.len()).unwrap_or(0);
+                        let index = choice["message"]["images"]
+                            .as_array()
+                            .map(|a| a.len())
+                            .unwrap_or(0);
                         let image_payload = json!({
                             "type": "image_url",
                             "image_url": { "url": image_url },

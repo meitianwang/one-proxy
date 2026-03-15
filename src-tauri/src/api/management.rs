@@ -1,46 +1,48 @@
 // Management API handlers
 
-use axum::{
-    extract::State,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, response::IntoResponse, Json};
 use serde::Deserialize;
 use serde_json::json;
 
 use super::AppState;
-use crate::auth::{self, AuthFile};
 use crate::config;
 
 /// Parse auth file content (supports both new and legacy formats)
 fn parse_auth_info(content: &str) -> Option<(String, Option<String>, bool)> {
-    // Try new format first
-    if let Ok(auth_file) = serde_json::from_str::<AuthFile>(content) {
-        return Some((auth_file.provider, auth_file.email, auth_file.enabled));
-    }
-
-    // Try parsing as generic JSON for legacy formats
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
         let obj = json.as_object()?;
 
-        // Must have access_token to be valid
-        if !obj.contains_key("access_token") {
+        let has_access_token = obj.contains_key("access_token")
+            || obj
+                .get("token")
+                .and_then(|value| value.as_object())
+                .map(|token| token.contains_key("access_token"))
+                .unwrap_or(false);
+
+        if !has_access_token {
             return None;
         }
 
-        let provider = obj.get("type")
+        let provider = obj
+            .get("type")
             .or_else(|| obj.get("provider"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        let email = obj.get("email")
+        let email = obj
+            .get("email")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let enabled = obj.get("enabled")
+        let enabled = obj
+            .get("enabled")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+            .unwrap_or_else(|| {
+                !obj.get("disabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            });
 
         return Some((provider, email, enabled));
     }
@@ -193,20 +195,26 @@ pub async fn patch_auth_status(
         }
     };
 
-    let mut auth_file: AuthFile = match serde_json::from_str(&content) {
+    let mut json: serde_json::Value = match serde_json::from_str(&content) {
         Ok(f) => f,
         Err(e) => {
             return Json(json!({ "error": format!("invalid auth file: {}", e) }));
         }
     };
 
-    // Update enabled status
-    auth_file.enabled = request.enabled;
+    if !json.is_object() {
+        return Json(json!({ "error": "invalid auth file: expected object" }));
+    }
 
-    // Save back
-    match auth::save_auth_file(&auth_file, &path) {
-        Ok(_) => Json(json!({ "status": "ok", "enabled": request.enabled })),
-        Err(e) => Json(json!({ "error": format!("failed to save: {}", e) })),
+    json["enabled"] = json!(request.enabled);
+    json["disabled"] = json!(!request.enabled);
+
+    match serde_json::to_string_pretty(&json) {
+        Ok(content) => match std::fs::write(&path, content) {
+            Ok(_) => Json(json!({ "status": "ok", "enabled": request.enabled })),
+            Err(e) => Json(json!({ "error": format!("failed to save: {}", e) })),
+        },
+        Err(e) => Json(json!({ "error": format!("failed to serialize: {}", e) })),
     }
 }
 

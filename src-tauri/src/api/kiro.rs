@@ -30,9 +30,10 @@ static FIRST_TOKEN_TIMEOUT: Lazy<Duration> = Lazy::new(|| {
 });
 static FIRST_TOKEN_MAX_RETRIES: Lazy<usize> = Lazy::new(|| env_usize("FIRST_TOKEN_MAX_RETRIES", 3));
 static FAKE_REASONING_ENABLED: Lazy<bool> = Lazy::new(env_fake_reasoning_enabled);
-static FAKE_REASONING_MAX_TOKENS: Lazy<usize> = Lazy::new(|| env_usize("FAKE_REASONING_MAX_TOKENS", 4000));
-static FAKE_REASONING_HANDLING: Lazy<String> = Lazy::new(|| {
-    match std::env::var("FAKE_REASONING_HANDLING") {
+static FAKE_REASONING_MAX_TOKENS: Lazy<usize> =
+    Lazy::new(|| env_usize("FAKE_REASONING_MAX_TOKENS", 4000));
+static FAKE_REASONING_HANDLING: Lazy<String> =
+    Lazy::new(|| match std::env::var("FAKE_REASONING_HANDLING") {
         Ok(raw) => {
             let value = raw.trim().to_lowercase();
             match value.as_str() {
@@ -41,8 +42,7 @@ static FAKE_REASONING_HANDLING: Lazy<String> = Lazy::new(|| {
             }
         }
         Err(_) => "as_reasoning_content".to_string(),
-    }
-});
+    });
 static FAKE_REASONING_OPEN_TAGS: Lazy<Vec<String>> = Lazy::new(|| {
     vec![
         "<thinking>".to_string(),
@@ -51,7 +51,8 @@ static FAKE_REASONING_OPEN_TAGS: Lazy<Vec<String>> = Lazy::new(|| {
         "<thought>".to_string(),
     ]
 });
-static FAKE_REASONING_INITIAL_BUFFER_SIZE: Lazy<usize> = Lazy::new(|| env_usize("FAKE_REASONING_INITIAL_BUFFER_SIZE", 20));
+static FAKE_REASONING_INITIAL_BUFFER_SIZE: Lazy<usize> =
+    Lazy::new(|| env_usize("FAKE_REASONING_INITIAL_BUFFER_SIZE", 20));
 
 static HIDDEN_MODELS: Lazy<HashMap<String, String>> = Lazy::new(|| {
     let mut map = HashMap::new();
@@ -75,7 +76,6 @@ static HIDDEN_FROM_LIST: Lazy<HashSet<String>> = Lazy::new(|| {
     set.insert("claude-3.7-sonnet".to_string());
     set
 });
-
 
 static FALLBACK_MODELS: Lazy<Vec<Value>> = Lazy::new(|| {
     vec![
@@ -141,7 +141,8 @@ struct KiroModelCache {
     last_update: Option<Instant>,
 }
 
-static MODEL_CACHE: Lazy<RwLock<KiroModelCache>> = Lazy::new(|| RwLock::new(KiroModelCache::default()));
+static MODEL_CACHE: Lazy<RwLock<KiroModelCache>> =
+    Lazy::new(|| RwLock::new(KiroModelCache::default()));
 
 #[derive(Clone, Debug)]
 struct KiroEvent {
@@ -204,12 +205,7 @@ struct ThinkingParser {
 impl ThinkingParser {
     fn new() -> Self {
         let open_tags = FAKE_REASONING_OPEN_TAGS.clone();
-        let max_tag_length = open_tags
-            .iter()
-            .map(|tag| tag.len())
-            .max()
-            .unwrap_or(0)
-            * 2;
+        let max_tag_length = open_tags.iter().map(|tag| tag.len()).max().unwrap_or(0) * 2;
         Self {
             handling_mode: FAKE_REASONING_HANDLING.clone(),
             open_tags,
@@ -250,7 +246,9 @@ impl ThinkingParser {
         let mut result = ThinkingParseResult::default();
         self.initial_buffer.push_str(content);
 
-        let stripped = self.initial_buffer.trim_start_matches(|c: char| c.is_whitespace());
+        let stripped = self
+            .initial_buffer
+            .trim_start_matches(|c: char| c.is_whitespace());
 
         for tag in &self.open_tags {
             if stripped.starts_with(tag) {
@@ -281,7 +279,9 @@ impl ThinkingParser {
             }
         }
 
-        if self.initial_buffer.len() > self.initial_buffer_size || !self.could_be_tag_prefix(stripped) {
+        if self.initial_buffer.len() > self.initial_buffer_size
+            || !self.could_be_tag_prefix(stripped)
+        {
             self.state = ParserState::Streaming;
             result.state_changed = true;
             result.regular_content = Some(self.initial_buffer.clone());
@@ -352,7 +352,9 @@ impl ThinkingParser {
         if self.thinking_buffer.len() > self.max_tag_length {
             let split_at = clamp_to_char_boundary(
                 &self.thinking_buffer,
-                self.thinking_buffer.len().saturating_sub(self.max_tag_length),
+                self.thinking_buffer
+                    .len()
+                    .saturating_sub(self.max_tag_length),
             );
             if split_at == 0 {
                 return result;
@@ -392,7 +394,12 @@ impl ThinkingParser {
         result
     }
 
-    fn process_for_output(&self, content: Option<String>, is_first: bool, is_last: bool) -> Option<String> {
+    fn process_for_output(
+        &self,
+        content: Option<String>,
+        is_first: bool,
+        is_last: bool,
+    ) -> Option<String> {
         let text = content?;
         if self.handling_mode == "remove" {
             return None;
@@ -498,26 +505,29 @@ impl AwsEventStreamParser {
             }
             EventKind::ToolStart => {
                 self.finalize_tool_call();
-                let input = data.get("input").cloned().unwrap_or(Value::String(String::new()));
+                let input = data
+                    .get("input")
+                    .cloned()
+                    .unwrap_or(Value::String(String::new()));
                 let input_str = if input.is_object() || input.is_array() {
                     serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
                 } else {
                     input.as_str().unwrap_or("").to_string()
                 };
 
-        let tool_use_id = data
-            .get("toolUseId")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(generate_tool_call_id);
-        let tool_call = json!({
-            "id": tool_use_id,
-            "type": "function",
-            "function": {
-                "name": data.get("name").and_then(|v| v.as_str()).unwrap_or(""),
-                "arguments": input_str
-            }
-        });
+                let tool_use_id = data
+                    .get("toolUseId")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(generate_tool_call_id);
+                let tool_call = json!({
+                    "id": tool_use_id,
+                    "type": "function",
+                    "function": {
+                        "name": data.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                        "arguments": input_str
+                    }
+                });
                 self.current_tool_call = Some(tool_call);
                 if data.get("stop").and_then(|v| v.as_bool()).unwrap_or(false) {
                     self.finalize_tool_call();
@@ -526,13 +536,19 @@ impl AwsEventStreamParser {
             }
             EventKind::ToolInput => {
                 if let Some(tool_call) = self.current_tool_call.as_mut() {
-                    let input = data.get("input").cloned().unwrap_or(Value::String(String::new()));
+                    let input = data
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(Value::String(String::new()));
                     let input_str = if input.is_object() || input.is_array() {
                         serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
                     } else {
                         input.as_str().unwrap_or("").to_string()
                     };
-                    if let Some(args) = tool_call.get_mut("function").and_then(|v| v.get_mut("arguments")) {
+                    if let Some(args) = tool_call
+                        .get_mut("function")
+                        .and_then(|v| v.get_mut("arguments"))
+                    {
                         let existing = args.as_str().unwrap_or("");
                         *args = Value::String(format!("{}{}", existing, input_str));
                     }
@@ -545,37 +561,35 @@ impl AwsEventStreamParser {
                 }
                 None
             }
-            EventKind::Usage => {
-                Some(KiroEvent {
-                    kind: KiroEventType::Usage,
-                    content: None,
-                    thinking_content: None,
-                    tool_use: None,
-                    usage: data.get("usage").cloned(),
-                    context_usage_percentage: None,
-                    is_first_thinking_chunk: false,
-                    is_last_thinking_chunk: false,
-                })
-            }
-            EventKind::ContextUsage => {
-                Some(KiroEvent {
-                    kind: KiroEventType::ContextUsage,
-                    content: None,
-                    thinking_content: None,
-                    tool_use: None,
-                    usage: None,
-                    context_usage_percentage: data
-                        .get("contextUsagePercentage")
-                        .and_then(|v| v.as_f64()),
-                    is_first_thinking_chunk: false,
-                    is_last_thinking_chunk: false,
-                })
-            }
+            EventKind::Usage => Some(KiroEvent {
+                kind: KiroEventType::Usage,
+                content: None,
+                thinking_content: None,
+                tool_use: None,
+                usage: data.get("usage").cloned(),
+                context_usage_percentage: None,
+                is_first_thinking_chunk: false,
+                is_last_thinking_chunk: false,
+            }),
+            EventKind::ContextUsage => Some(KiroEvent {
+                kind: KiroEventType::ContextUsage,
+                content: None,
+                thinking_content: None,
+                tool_use: None,
+                usage: None,
+                context_usage_percentage: data
+                    .get("contextUsagePercentage")
+                    .and_then(|v| v.as_f64()),
+                is_first_thinking_chunk: false,
+                is_last_thinking_chunk: false,
+            }),
         }
     }
 
     fn finalize_tool_call(&mut self) {
-        let Some(mut tool_call) = self.current_tool_call.take() else { return };
+        let Some(mut tool_call) = self.current_tool_call.take() else {
+            return;
+        };
         if let Some(func) = tool_call.get_mut("function") {
             if let Some(args) = func.get_mut("arguments") {
                 let args_str = args.as_str().unwrap_or("");
@@ -669,7 +683,8 @@ fn parse_bracket_tool_calls(text: &str) -> Vec<Value> {
     if !text.contains("[Called") {
         return Vec::new();
     }
-    static PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\[Called\s+(\w+)\s+with\s+args:\s*").unwrap());
+    static PATTERN: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\[Called\s+(\w+)\s+with\s+args:\s*").unwrap());
 
     let mut tool_calls = Vec::new();
     for cap in PATTERN.captures_iter(text) {
@@ -701,7 +716,11 @@ fn deduplicate_tool_calls(tool_calls: &[Value]) -> Vec<Value> {
     let mut no_id: Vec<Value> = Vec::new();
 
     for tc in tool_calls {
-        let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let id = tc
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if id.is_empty() {
             no_id.push(tc.clone());
             continue;
@@ -717,7 +736,9 @@ fn deduplicate_tool_calls(tool_calls: &[Value]) -> Vec<Value> {
                 .and_then(|v| v.get("arguments"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("{}");
-            if current_args != "{}" && (existing_args == "{}" || current_args.len() > existing_args.len()) {
+            if current_args != "{}"
+                && (existing_args == "{}" || current_args.len() > existing_args.len())
+            {
                 by_id.insert(id.clone(), tc.clone());
             }
         } else {
@@ -731,7 +752,10 @@ fn deduplicate_tool_calls(tool_calls: &[Value]) -> Vec<Value> {
     for tc in by_id.values().chain(no_id.iter()) {
         let func = tc.get("function").unwrap_or(&Value::Null);
         let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let args = func.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+        let args = func
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or("{}");
         let key = format!("{}-{}", name, args);
         if seen.insert(key) {
             result.push(tc.clone());
@@ -780,10 +804,7 @@ fn get_machine_fingerprint() -> String {
 
 fn get_kiro_headers(auth: &KiroAuth, token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", token)) {
         headers.insert("Authorization", value);
     }
@@ -791,10 +812,7 @@ fn get_kiro_headers(auth: &KiroAuth, token: &str) -> HeaderMap {
         "aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-0.7.45-{}",
         auth.fingerprint
     );
-    let x_amz_user_agent = format!(
-        "aws-sdk-js/1.0.27 KiroIDE-0.7.45-{}",
-        auth.fingerprint
-    );
+    let x_amz_user_agent = format!("aws-sdk-js/1.0.27 KiroIDE-0.7.45-{}", auth.fingerprint);
     if let Ok(value) = HeaderValue::from_str(&user_agent) {
         headers.insert("User-Agent", value);
     }
@@ -805,10 +823,7 @@ fn get_kiro_headers(auth: &KiroAuth, token: &str) -> HeaderMap {
         "x-amzn-codewhisperer-optout",
         HeaderValue::from_static("true"),
     );
-    headers.insert(
-        "x-amzn-kiro-agent-mode",
-        HeaderValue::from_static("vibe"),
-    );
+    headers.insert("x-amzn-kiro-agent-mode", HeaderValue::from_static("vibe"));
     if let Ok(value) = HeaderValue::from_str(&Uuid::new_v4().to_string()) {
         headers.insert("amz-sdk-invocation-id", value);
     }
@@ -893,13 +908,22 @@ pub async fn load_kiro_auth(path: &Path) -> Result<KiroAuthSnapshot> {
         .and_then(|v| v.as_str())
         .unwrap_or(DEFAULT_REGION)
         .to_string();
-    let profile_arn = json.get("profile_arn").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let client_id = json.get("client_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let profile_arn = json
+        .get("profile_arn")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let client_id = json
+        .get("client_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let client_secret = json
         .get("client_secret")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let auth_method = json.get("auth_method").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let auth_method = json
+        .get("auth_method")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     Ok(KiroAuthSnapshot {
         access_token,
@@ -913,7 +937,10 @@ pub async fn load_kiro_auth(path: &Path) -> Result<KiroAuthSnapshot> {
     })
 }
 
-pub async fn refresh_kiro_auth(path: &Path, snapshot: &KiroAuthSnapshot) -> Result<KiroAuthSnapshot> {
+pub async fn refresh_kiro_auth(
+    path: &Path,
+    snapshot: &KiroAuthSnapshot,
+) -> Result<KiroAuthSnapshot> {
     let refresh_token = snapshot
         .refresh_token
         .as_ref()
@@ -1035,17 +1062,20 @@ pub fn snapshot_to_auth(snapshot: KiroAuthSnapshot) -> Result<KiroAuth> {
 pub async fn ensure_model_cache(auth: &KiroAuth) -> Result<()> {
     let needs_refresh = {
         let cache = MODEL_CACHE.read();
-        cache.models.is_empty() || cache
-            .last_update
-            .map(|t| t.elapsed() > Duration::from_secs(MODEL_CACHE_TTL_SECS))
-            .unwrap_or(true)
+        cache.models.is_empty()
+            || cache
+                .last_update
+                .map(|t| t.elapsed() > Duration::from_secs(MODEL_CACHE_TTL_SECS))
+                .unwrap_or(true)
     };
 
     if !needs_refresh {
         return Ok(());
     }
 
-    let models = fetch_models(auth).await.unwrap_or_else(|_| FALLBACK_MODELS.clone());
+    let models = fetch_models(auth)
+        .await
+        .unwrap_or_else(|_| FALLBACK_MODELS.clone());
     let mut cache = MODEL_CACHE.write();
     cache.models.clear();
     for model in models {
@@ -1101,14 +1131,23 @@ async fn fetch_models(auth: &KiroAuth) -> Result<Vec<Value>> {
         }
     }
 
-    let response = client.get(url).headers(headers.clone()).query(&params).send().await?;
+    let response = client
+        .get(url)
+        .headers(headers.clone())
+        .query(&params)
+        .send()
+        .await?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(anyhow!("ListAvailableModels failed: {} {}", status, body));
     }
     let data: Value = response.json().await?;
-    let models = data.get("models").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let models = data
+        .get("models")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     Ok(models)
 }
 
@@ -1149,7 +1188,10 @@ pub struct ModelResolution {
 }
 
 pub fn resolve_model(model: &str) -> ModelResolution {
-    let resolved_model = MODEL_ALIASES.get(model).cloned().unwrap_or_else(|| model.to_string());
+    let resolved_model = MODEL_ALIASES
+        .get(model)
+        .cloned()
+        .unwrap_or_else(|| model.to_string());
     let normalized = normalize_model_name(&resolved_model);
 
     let cache = MODEL_CACHE.read();
@@ -1179,18 +1221,16 @@ pub fn resolve_model(model: &str) -> ModelResolution {
 static STANDARD_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^(claude-(?:haiku|sonnet|opus)-\d+)-(\d{1,2})(?:-(?:\d{8}|latest|\d+))?$").unwrap()
 });
-static NO_MINOR_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^(claude-(?:haiku|sonnet|opus)-\d+)(?:-\d{8})?$").unwrap()
-});
+static NO_MINOR_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^(claude-(?:haiku|sonnet|opus)-\d+)(?:-\d{8})?$").unwrap());
 static LEGACY_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^(claude)-(\d+)-(\d+)-(haiku|sonnet|opus)(?:-(?:\d{8}|latest|\d+))?$").unwrap()
 });
 static DOT_WITH_DATE_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^(claude-(?:\d+\.\d+-)?(?:haiku|sonnet|opus)(?:-\d+\.\d+)?)-\d{8}$").unwrap()
 });
-static INVERTED_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^claude-(\d+)\.(\d+)-(haiku|sonnet|opus)-(.+)$").unwrap()
-});
+static INVERTED_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^claude-(\d+)\.(\d+)-(haiku|sonnet|opus)-(.+)$").unwrap());
 
 fn normalize_model_name(name: &str) -> String {
     if name.is_empty() {
@@ -1261,7 +1301,9 @@ fn extract_text_content(content: &Value) -> String {
 
 fn extract_images_from_content(content: &Value) -> Vec<Value> {
     let mut images = Vec::new();
-    let Some(items) = content.as_array() else { return images };
+    let Some(items) = content.as_array() else {
+        return images;
+    };
 
     for item in items {
         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1312,7 +1354,11 @@ fn convert_images_to_kiro_format(images: &[Value]) -> Vec<Value> {
             .get("media_type")
             .and_then(|v| v.as_str())
             .unwrap_or("image/jpeg");
-        let mut data = img.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mut data = img
+            .get("data")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if data.is_empty() {
             continue;
         }
@@ -1347,7 +1393,11 @@ fn convert_tool_results_to_kiro_format(results: &[Value]) -> Vec<Value> {
         } else {
             extract_text_content(&content)
         };
-        let content_text = if text.is_empty() { "(empty result)".to_string() } else { text };
+        let content_text = if text.is_empty() {
+            "(empty result)".to_string()
+        } else {
+            text
+        };
         let tool_use_id = result
             .get("tool_use_id")
             .and_then(|v| v.as_str())
@@ -1363,7 +1413,9 @@ fn convert_tool_results_to_kiro_format(results: &[Value]) -> Vec<Value> {
 
 fn extract_tool_results_from_content(content: &Value) -> Vec<Value> {
     let mut out = Vec::new();
-    let Some(items) = content.as_array() else { return out };
+    let Some(items) = content.as_array() else {
+        return out;
+    };
     for item in items {
         if item.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
             let tool_use_id = item
@@ -1372,7 +1424,11 @@ fn extract_tool_results_from_content(content: &Value) -> Vec<Value> {
                 .unwrap_or("");
             let content_val = item.get("content").cloned().unwrap_or(Value::Null);
             let content_text = extract_text_content(&content_val);
-            let text = if content_text.is_empty() { "(empty result)".to_string() } else { content_text };
+            let text = if content_text.is_empty() {
+                "(empty result)".to_string()
+            } else {
+                content_text
+            };
             out.push(json!({
                 "content": [{"text": text}],
                 "status": "success",
@@ -1424,8 +1480,14 @@ fn tool_calls_to_text(tool_calls: &[Value]) -> String {
     let mut parts = Vec::new();
     for tc in tool_calls {
         let func = tc.get("function").unwrap_or(&Value::Null);
-        let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-        let args = func.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+        let name = func
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let args = func
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or("{}");
         let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
         if id.is_empty() {
             parts.push(format!("[Tool: {}]\n{}", name, args));
@@ -1445,7 +1507,11 @@ fn tool_results_to_text(tool_results: &[Value]) -> String {
         } else {
             extract_text_content(&content)
         };
-        let content_text = if text.is_empty() { "(empty result)".to_string() } else { text };
+        let content_text = if text.is_empty() {
+            "(empty result)".to_string()
+        } else {
+            text
+        };
         let tool_use_id = tr.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
         if tool_use_id.is_empty() {
             parts.push(format!("[Tool Result]\n{}", content_text));
@@ -1461,8 +1527,16 @@ fn strip_all_tool_content(messages: &[UnifiedMessage]) -> (Vec<UnifiedMessage>, 
     let mut had_tool_content = false;
 
     for msg in messages {
-        let has_tool_calls = msg.tool_calls.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
-        let has_tool_results = msg.tool_results.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+        let has_tool_calls = msg
+            .tool_calls
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let has_tool_results = msg
+            .tool_results
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
         if has_tool_calls || has_tool_results {
             had_tool_content = true;
             let mut parts = Vec::new();
@@ -1482,7 +1556,11 @@ fn strip_all_tool_content(messages: &[UnifiedMessage]) -> (Vec<UnifiedMessage>, 
                     parts.push(text);
                 }
             }
-            let content = if parts.is_empty() { "(empty)".to_string() } else { parts.join("\n\n") };
+            let content = if parts.is_empty() {
+                "(empty)".to_string()
+            } else {
+                parts.join("\n\n")
+            };
             result.push(UnifiedMessage {
                 role: msg.role.clone(),
                 content: Value::String(content),
@@ -1498,7 +1576,9 @@ fn strip_all_tool_content(messages: &[UnifiedMessage]) -> (Vec<UnifiedMessage>, 
     (result, had_tool_content)
 }
 
-fn ensure_assistant_before_tool_results(messages: &[UnifiedMessage]) -> (Vec<UnifiedMessage>, bool) {
+fn ensure_assistant_before_tool_results(
+    messages: &[UnifiedMessage],
+) -> (Vec<UnifiedMessage>, bool) {
     let mut result = Vec::new();
     let mut converted_any = false;
 
@@ -1508,7 +1588,10 @@ fn ensure_assistant_before_tool_results(messages: &[UnifiedMessage]) -> (Vec<Uni
                 .last()
                 .map(|m: &UnifiedMessage| {
                     m.role == "assistant"
-                        && m.tool_calls.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+                        && m.tool_calls
+                            .as_ref()
+                            .map(|v| !v.is_empty())
+                            .unwrap_or(false)
                 })
                 .unwrap_or(false);
             if !has_prev_assistant {
@@ -1608,7 +1691,10 @@ fn build_kiro_history(messages: &[UnifiedMessage], model_id: &str) -> Vec<Value>
                 "origin": "AI_EDITOR"
             });
 
-            let images = msg.images.clone().unwrap_or_else(|| extract_images_from_content(&msg.content));
+            let images = msg
+                .images
+                .clone()
+                .unwrap_or_else(|| extract_images_from_content(&msg.content));
             if !images.is_empty() {
                 let kiro_images = convert_images_to_kiro_format(&images);
                 if !kiro_images.is_empty() {
@@ -1650,8 +1736,12 @@ fn build_kiro_history(messages: &[UnifiedMessage], model_id: &str) -> Vec<Value>
 }
 
 fn sanitize_json_schema(schema: Option<&Value>) -> Value {
-    let Some(schema) = schema else { return json!({}) };
-    let Value::Object(map) = schema else { return schema.clone() };
+    let Some(schema) = schema else {
+        return json!({});
+    };
+    let Value::Object(map) = schema else {
+        return schema.clone();
+    };
     let mut result = serde_json::Map::new();
     for (key, value) in map {
         if key == "required" {
@@ -1683,7 +1773,13 @@ fn sanitize_json_schema(schema: Option<&Value>) -> Value {
                 .as_array()
                 .unwrap_or(&Vec::new())
                 .iter()
-                .map(|item| if item.is_object() { sanitize_json_schema(Some(item)) } else { item.clone() })
+                .map(|item| {
+                    if item.is_object() {
+                        sanitize_json_schema(Some(item))
+                    } else {
+                        item.clone()
+                    }
+                })
                 .collect::<Vec<_>>();
             result.insert(key.clone(), Value::Array(arr));
         } else {
@@ -1693,8 +1789,12 @@ fn sanitize_json_schema(schema: Option<&Value>) -> Value {
     Value::Object(result)
 }
 
-fn process_tools_with_long_descriptions(tools: Option<Vec<UnifiedTool>>) -> (Option<Vec<UnifiedTool>>, String) {
-    let Some(tools) = tools else { return (None, String::new()) };
+fn process_tools_with_long_descriptions(
+    tools: Option<Vec<UnifiedTool>>,
+) -> (Option<Vec<UnifiedTool>>, String) {
+    let Some(tools) = tools else {
+        return (None, String::new());
+    };
     if TOOL_DESCRIPTION_MAX_LENGTH == 0 {
         return (Some(tools), String::new());
     }
@@ -1717,8 +1817,10 @@ fn process_tools_with_long_descriptions(tools: Option<Vec<UnifiedTool>>) -> (Opt
             });
         } else {
             docs.push(format!("## Tool: {}\n\n{}", name, description_text));
-            let reference_description =
-                format!("[Full documentation in system prompt under '## Tool: {}']", name);
+            let reference_description = format!(
+                "[Full documentation in system prompt under '## Tool: {}']",
+                name
+            );
             processed.push(UnifiedTool {
                 name,
                 description: Some(reference_description),
@@ -1748,7 +1850,10 @@ fn validate_tool_names(tools: Option<&Vec<UnifiedTool>>) -> Result<()> {
         }
     }
     if !violations.is_empty() {
-        return Err(anyhow!("Tool name(s) exceed Kiro API limit: {}", violations.join(", ")));
+        return Err(anyhow!(
+            "Tool name(s) exceed Kiro API limit: {}",
+            violations.join(", ")
+        ));
     }
     Ok(())
 }
@@ -1775,7 +1880,9 @@ fn inject_thinking_tags(content: &str) -> String {
 }
 
 fn convert_tools_to_kiro_format(tools: Option<&Vec<UnifiedTool>>) -> Vec<Value> {
-    let Some(tools) = tools else { return Vec::new() };
+    let Some(tools) = tools else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for tool in tools {
         let mut description = tool.description.clone().unwrap_or_default();
@@ -1823,7 +1930,11 @@ fn build_kiro_payload(
         }
     }
 
-    let (messages, _converted_tool_results) = if processed_tools.as_ref().map(|t| t.is_empty()).unwrap_or(true) {
+    let (messages, _converted_tool_results) = if processed_tools
+        .as_ref()
+        .map(|t| t.is_empty())
+        .unwrap_or(true)
+    {
         strip_all_tool_content(&messages)
     } else {
         ensure_assistant_before_tool_results(&messages)
@@ -1843,7 +1954,8 @@ fn build_kiro_payload(
     if !full_system_prompt.is_empty() && !history_messages.is_empty() {
         if history_messages[0].role == "user" {
             let original = extract_text_content(&history_messages[0].content);
-            history_messages[0].content = Value::String(format!("{}\n\n{}", full_system_prompt, original));
+            history_messages[0].content =
+                Value::String(format!("{}\n\n{}", full_system_prompt, original));
         }
     }
 
@@ -1991,7 +2103,10 @@ fn convert_openai_messages_to_unified(messages: &[Value]) -> (String, Vec<Unifie
                     let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     let function = item.get("function").unwrap_or(&Value::Null);
                     let name = function.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let args = function.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                    let args = function
+                        .get("arguments")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("{}");
                     calls.push(json!({
                         "id": id,
                         "type": "function",
@@ -2037,7 +2152,9 @@ fn convert_openai_messages_to_unified(messages: &[Value]) -> (String, Vec<Unifie
 
 fn extract_tool_results_from_openai_content(content: &Value) -> Vec<Value> {
     let mut out = Vec::new();
-    let Some(items) = content.as_array() else { return out };
+    let Some(items) = content.as_array() else {
+        return out;
+    };
     for item in items {
         if item.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
             let content = extract_text_content(item.get("content").unwrap_or(&Value::Null));
@@ -2055,28 +2172,58 @@ fn convert_openai_tools_to_unified(tools: Option<&Vec<Value>>) -> Option<Vec<Uni
     let tools = tools?;
     let mut out = Vec::new();
     for tool in tools {
-        let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("function");
+        let tool_type = tool
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("function");
         if tool_type != "function" {
             continue;
         }
         if let Some(function) = tool.get("function") {
             let name = function.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let description = function.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let description = function
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let params = function.get("parameters").cloned();
             if !name.is_empty() {
-                out.push(UnifiedTool { name: name.to_string(), description, input_schema: params });
+                out.push(UnifiedTool {
+                    name: name.to_string(),
+                    description,
+                    input_schema: params,
+                });
             }
         } else if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
-            let description = tool.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let description = tool
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let params = tool.get("input_schema").cloned();
-            out.push(UnifiedTool { name: name.to_string(), description, input_schema: params });
+            out.push(UnifiedTool {
+                name: name.to_string(),
+                description,
+                input_schema: params,
+            });
         }
     }
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
-pub fn build_kiro_payload_from_openai(raw: &Value, model_id: &str, conversation_id: String, profile_arn: Option<String>) -> Result<Value> {
-    let messages = raw.get("messages").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+pub fn build_kiro_payload_from_openai(
+    raw: &Value,
+    model_id: &str,
+    conversation_id: String,
+    profile_arn: Option<String>,
+) -> Result<Value> {
+    let messages = raw
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     let tools = raw.get("tools").and_then(|v| v.as_array()).cloned();
     let (system_prompt, unified_messages) = convert_openai_messages_to_unified(&messages);
     let unified_tools = convert_openai_tools_to_unified(tools.as_ref());
@@ -2108,7 +2255,10 @@ pub fn generate_conversation_id(messages: Option<&Value>) -> String {
     };
     let mut simplified = Vec::new();
     for msg in key_messages {
-        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let role = msg
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         let content = msg.get("content").cloned().unwrap_or(Value::Null);
         let content_str = if let Some(text) = content.as_str() {
             text.chars().take(100).collect::<String>()
@@ -2163,8 +2313,14 @@ fn count_message_tokens(messages: &[Value], apply_correction: bool) -> i64 {
             for tc in tool_calls {
                 total += 4;
                 let func = tc.get("function").unwrap_or(&Value::Null);
-                total += count_tokens(func.get("name").and_then(|v| v.as_str()).unwrap_or(""), false);
-                total += count_tokens(func.get("arguments").and_then(|v| v.as_str()).unwrap_or(""), false);
+                total += count_tokens(
+                    func.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                    false,
+                );
+                total += count_tokens(
+                    func.get("arguments").and_then(|v| v.as_str()).unwrap_or(""),
+                    false,
+                );
             }
         }
         if let Some(tool_call_id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
@@ -2186,8 +2342,16 @@ fn count_tools_tokens(tools: Option<&Vec<Value>>, apply_correction: bool) -> i64
         total += 4;
         if tool.get("type").and_then(|v| v.as_str()) == Some("function") {
             let func = tool.get("function").unwrap_or(&Value::Null);
-            total += count_tokens(func.get("name").and_then(|v| v.as_str()).unwrap_or(""), false);
-            total += count_tokens(func.get("description").and_then(|v| v.as_str()).unwrap_or(""), false);
+            total += count_tokens(
+                func.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                false,
+            );
+            total += count_tokens(
+                func.get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+                false,
+            );
             if let Some(params) = func.get("parameters") {
                 let serialized = serde_json::to_string(params).unwrap_or_default();
                 total += count_tokens(&serialized, false);
@@ -2201,7 +2365,11 @@ fn count_tools_tokens(tools: Option<&Vec<Value>>, apply_correction: bool) -> i64
     }
 }
 
-fn calculate_tokens_from_context_usage(context_percentage: Option<f64>, completion_tokens: i64, model: &str) -> (i64, i64) {
+fn calculate_tokens_from_context_usage(
+    context_percentage: Option<f64>,
+    completion_tokens: i64,
+    model: &str,
+) -> (i64, i64) {
     if let Some(percent) = context_percentage {
         if percent > 0.0 {
             let max_tokens = get_max_input_tokens(model) as f64;
@@ -2213,7 +2381,11 @@ fn calculate_tokens_from_context_usage(context_percentage: Option<f64>, completi
     (0, completion_tokens)
 }
 
-pub async fn send_kiro_request(auth: &KiroAuth, payload: &Value, stream: bool) -> Result<reqwest::Response> {
+pub async fn send_kiro_request(
+    auth: &KiroAuth,
+    payload: &Value,
+    stream: bool,
+) -> Result<reqwest::Response> {
     let client = build_client()?;
     let url = format!("{}/generateAssistantResponse", get_api_host(&auth.region));
     let mut headers = get_kiro_headers(auth, &auth.access_token);
@@ -2530,7 +2702,11 @@ fn process_chunk(
                 let content = event.content.clone().unwrap_or_default();
                 if let Some(parser) = thinking_parser.as_mut() {
                     let result = parser.feed(&content);
-                    if let Some(thinking) = parser.process_for_output(result.thinking_content, result.is_first_thinking_chunk, result.is_last_thinking_chunk) {
+                    if let Some(thinking) = parser.process_for_output(
+                        result.thinking_content,
+                        result.is_first_thinking_chunk,
+                        result.is_last_thinking_chunk,
+                    ) {
                         out.push(KiroEvent {
                             kind: KiroEventType::Thinking,
                             content: None,
@@ -2634,8 +2810,13 @@ pub async fn collect_stream_response(
         message["tool_calls"] = Value::Array(cleaned);
     }
 
-    let finish_reason = if tool_calls.is_empty() { "stop" } else { "tool_calls" };
-    let usage = final_usage.unwrap_or_else(|| json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}));
+    let finish_reason = if tool_calls.is_empty() {
+        "stop"
+    } else {
+        "tool_calls"
+    };
+    let usage = final_usage
+        .unwrap_or_else(|| json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}));
 
     Ok(json!({
         "id": completion_id,
@@ -2656,7 +2837,15 @@ fn generate_completion_id() -> String {
 }
 
 fn generate_tool_call_id() -> String {
-    format!("call_{}", Uuid::new_v4().simple().to_string().chars().take(8).collect::<String>())
+    format!(
+        "call_{}",
+        Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(8)
+            .collect::<String>()
+    )
 }
 
 fn ensure_non_empty(value: String, fallback: &str) -> String {

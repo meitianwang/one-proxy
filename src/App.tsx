@@ -4,7 +4,7 @@ import { Dashboard } from "./pages/Dashboard";
 import { Accounts } from "./pages/Accounts";
 import { Settings } from "./pages/Settings";
 import { RequestLogs } from "./pages/RequestLogs";
-import { Header } from "./components/Header";
+import { Sidebar } from "./components/Sidebar";
 
 export type Page = "dashboard" | "accounts" | "logs" | "settings";
 
@@ -65,13 +65,16 @@ function App() {
   };
 
   return (
-    <div className="flex flex-col h-screen bg-gray-100 dark:bg-gray-900">
-      <Header
+    <div className="flex flex-row h-screen bg-transparent antialiased bg-[#f6f6f6] dark:bg-[#0a0a0a] text-gray-900 dark:text-gray-100 selection:bg-blue-200 dark:selection:bg-blue-900 overflow-hidden relative">
+      <div className="absolute inset-0 bg-gradient-to-br from-indigo-50/20 via-white to-blue-50/40 dark:from-gray-900 dark:via-gray-900 dark:to-blue-900/10 pointer-events-none -z-10" />
+      <Sidebar
         currentPage={currentPage}
         onPageChange={setCurrentPage}
       />
-      <main className="flex-1 overflow-auto p-6">
-        {renderPage()}
+      <main className="flex-1 overflow-y-auto overflow-x-hidden p-6 md:p-10 relative">
+        <div className="mx-auto max-w-7xl animate-in fade-in slide-in-from-bottom-4 duration-500">
+          {renderPage()}
+        </div>
       </main>
     </div>
   );

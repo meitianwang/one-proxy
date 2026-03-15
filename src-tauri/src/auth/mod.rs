@@ -4,6 +4,7 @@ use crate::commands::{AuthAccount, OAuthProvider};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 pub mod providers;
@@ -43,6 +44,31 @@ pub struct GeminiAuthFile {
     pub auth_type: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexAuthFile {
+    pub id_token: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub account_id: String,
+    pub last_refresh: String,
+    pub email: String,
+    #[serde(rename = "type")]
+    pub auth_type: String,
+    pub expired: String,
+    #[serde(default)]
+    pub codex_plan_type: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub prefix: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 fn parse_auth_file(content: &str, filename: &str) -> Option<AuthAccount> {
     // Try new format first (AuthFile with provider field)
     if let Ok(auth_file) = serde_json::from_str::<AuthFile>(content) {
@@ -74,8 +100,9 @@ fn parse_auth_file(content: &str, filename: &str) -> Option<AuthAccount> {
         let obj = json.as_object()?;
 
         // Check for access_token at root level or in nested token object
-        let has_access_token = obj.contains_key("access_token") ||
-            obj.get("token")
+        let has_access_token = obj.contains_key("access_token")
+            || obj
+                .get("token")
                 .and_then(|t| t.as_object())
                 .map(|t| t.contains_key("access_token"))
                 .unwrap_or(false);
@@ -85,7 +112,8 @@ fn parse_auth_file(content: &str, filename: &str) -> Option<AuthAccount> {
         }
 
         // Get provider from "type" or "provider" field, or from filename
-        let provider = obj.get("type")
+        let provider = obj
+            .get("type")
             .or_else(|| obj.get("provider"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
@@ -96,15 +124,15 @@ fn parse_auth_file(content: &str, filename: &str) -> Option<AuthAccount> {
             })
             .unwrap_or_else(|| "unknown".to_string());
 
-        let email = obj.get("email")
+        let email = obj
+            .get("email")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let enabled = obj.get("enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let enabled = obj.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
 
-        let prefix = obj.get("prefix")
+        let prefix = obj
+            .get("prefix")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
@@ -169,7 +197,10 @@ pub async fn start_oauth(provider: OAuthProvider, project_id: Option<String>) ->
             // Google uses a dedicated callback server on port 8085
             match providers::google::start_oauth_with_callback().await {
                 Ok(result) => {
-                    let email = result.email.clone().unwrap_or_else(|| "default".to_string());
+                    let email = result
+                        .email
+                        .clone()
+                        .unwrap_or_else(|| "default".to_string());
                     let project_id = project_id.unwrap_or_default().trim().to_string();
 
                     let token = serde_json::json!({
@@ -216,28 +247,7 @@ pub async fn start_oauth(provider: OAuthProvider, project_id: Option<String>) ->
             // OpenAI uses a special flow with its own callback server on port 1455
             match providers::openai::start_oauth_with_callback().await {
                 Ok(result) => {
-                    // Save the auth file
-                    let expires_at = result.token_response.expires_in.map(|secs| {
-                        chrono::Utc::now() + chrono::Duration::seconds(secs as i64)
-                    });
-
-                    let auth_file = AuthFile {
-                        provider: "codex".to_string(),
-                        email: result.email.clone(),
-                        token: TokenInfo {
-                            access_token: result.token_response.access_token,
-                            refresh_token: result.token_response.refresh_token,
-                            expires_at,
-                            token_type: result.token_response.token_type,
-                        },
-                        project_id: None,
-                        enabled: true,
-                        prefix: None,
-                    };
-
-                    let identifier = result.email.as_deref().unwrap_or("default");
-                    let path = get_auth_file_path("codex", identifier);
-                    save_auth_file(&auth_file, &path)?;
+                    let path = save_codex_oauth_result(&result)?;
 
                     tracing::info!("Saved Codex auth file to {:?}", path);
                     Ok("OAuth completed successfully".to_string())
@@ -250,6 +260,17 @@ pub async fn start_oauth(provider: OAuthProvider, project_id: Option<String>) ->
         OAuthProvider::Antigravity => providers::antigravity::start_oauth().await,
         OAuthProvider::Kiro => providers::kiro::start_oauth().await,
     }
+}
+
+pub async fn start_codex_device_oauth() -> Result<providers::openai::DeviceOAuthStart> {
+    providers::openai::start_device_oauth().await
+}
+
+pub async fn finish_codex_device_oauth(session_id: &str) -> Result<String> {
+    let result = providers::openai::finish_device_oauth(session_id).await?;
+    let path = save_codex_oauth_result(&result)?;
+    tracing::info!("Saved Codex device auth file to {:?}", path);
+    Ok("OAuth completed successfully".to_string())
 }
 
 pub fn set_gemini_project_id(account_id: &str, project_id: &str) -> Result<()> {
@@ -297,6 +318,98 @@ pub fn save_auth_file(auth_file: &AuthFile, path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn normalize_codex_plan_type_for_filename(plan_type: Option<&str>) -> String {
+    let Some(plan_type) = plan_type else {
+        return String::new();
+    };
+
+    let normalized = plan_type
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    normalized.trim().to_string()
+}
+
+fn codex_account_hash(account_id: &str) -> String {
+    let digest = Sha256::digest(account_id.as_bytes());
+    digest
+        .iter()
+        .take(4)
+        .map(|byte| format!("{:02x}", byte))
+        .collect::<String>()
+}
+
+fn codex_auth_file_name(email: &str, account_id: &str, plan_type: Option<&str>) -> String {
+    let email = email.trim();
+    let plan = normalize_codex_plan_type_for_filename(plan_type);
+    if plan.is_empty() {
+        return format!("codex-{}.json", email);
+    }
+    if plan == "team" && !account_id.trim().is_empty() {
+        return format!(
+            "codex-{}-{}-{}.json",
+            codex_account_hash(account_id.trim()),
+            email,
+            plan
+        );
+    }
+    format!("codex-{}-{}.json", email, plan)
+}
+
+pub fn save_codex_oauth_result(result: &providers::openai::OAuthResult) -> Result<PathBuf> {
+    let expires_at = result
+        .token_response
+        .expires_in
+        .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64))
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default();
+
+    let auth_file = CodexAuthFile {
+        id_token: result.token_response.id_token.clone().unwrap_or_default(),
+        access_token: result.token_response.access_token.clone(),
+        refresh_token: result
+            .token_response
+            .refresh_token
+            .clone()
+            .unwrap_or_default(),
+        account_id: result.account_id.clone().unwrap_or_default(),
+        last_refresh: chrono::Utc::now().to_rfc3339(),
+        email: result.email.clone().unwrap_or_default(),
+        auth_type: "codex".to_string(),
+        expired: expires_at,
+        codex_plan_type: result.plan_type.clone(),
+        enabled: true,
+        disabled: false,
+        prefix: None,
+    };
+
+    let identifier = if auth_file.email.trim().is_empty() {
+        "codex-default.json".to_string()
+    } else {
+        codex_auth_file_name(
+            &auth_file.email,
+            &auth_file.account_id,
+            result.plan_type.as_deref(),
+        )
+    };
+    let auth_dir = crate::config::resolve_auth_dir();
+    let path = if identifier.ends_with(".json") {
+        auth_dir.join(identifier)
+    } else {
+        auth_dir.join(format!("{}.json", identifier))
+    };
+
+    let content = serde_json::to_string_pretty(&auth_file)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, content)?;
+    Ok(path)
+}
+
 fn sanitize_identifier(input: &str) -> String {
     let mut out = String::new();
     for ch in input.chars() {
@@ -319,7 +432,11 @@ fn provider_display_name(provider: &str) -> &str {
     }
 }
 
-pub fn save_api_key_account(provider: &str, api_key: &str, label: Option<&str>) -> Result<AuthAccount> {
+pub fn save_api_key_account(
+    provider: &str,
+    api_key: &str,
+    label: Option<&str>,
+) -> Result<AuthAccount> {
     let provider = provider.trim().to_lowercase();
     if provider.is_empty() {
         return Err(anyhow::anyhow!("provider is required"));
@@ -417,7 +534,9 @@ pub fn set_account_enabled(account_id: &str, enabled: bool) -> Result<()> {
 }
 
 /// Fetch quota for an Antigravity account
-pub async fn fetch_antigravity_quota(account_id: &str) -> Result<providers::antigravity::QuotaData> {
+pub async fn fetch_antigravity_quota(
+    account_id: &str,
+) -> Result<providers::antigravity::QuotaData> {
     let auth_dir = crate::config::resolve_auth_dir();
     let path = auth_dir.join(format!("{}.json", account_id));
 
@@ -429,7 +548,8 @@ pub async fn fetch_antigravity_quota(account_id: &str) -> Result<providers::anti
     let json: serde_json::Value = serde_json::from_str(&content)?;
 
     // Check if it's an antigravity account
-    let provider = json.get("type")
+    let provider = json
+        .get("type")
         .or_else(|| json.get("provider"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
@@ -440,7 +560,8 @@ pub async fn fetch_antigravity_quota(account_id: &str) -> Result<providers::anti
 
     // Get access token - try to refresh if needed
     // Check both root level and nested in token object
-    let refresh_token = json.get("refresh_token")
+    let refresh_token = json
+        .get("refresh_token")
         .and_then(|v| v.as_str())
         .or_else(|| {
             json.get("token")
@@ -454,13 +575,16 @@ pub async fn fetch_antigravity_quota(account_id: &str) -> Result<providers::anti
     let access_token = token_resp.access_token;
 
     // Get cached project_id and subscription_tier if available
-    let cached_project_id = json.get("project_id")
-        .and_then(|v| v.as_str());
-    let cached_subscription_tier = json.get("subscription_tier")
-        .and_then(|v| v.as_str());
+    let cached_project_id = json.get("project_id").and_then(|v| v.as_str());
+    let cached_subscription_tier = json.get("subscription_tier").and_then(|v| v.as_str());
 
     // Fetch quota
-    let quota = providers::antigravity::fetch_quota(&access_token, cached_project_id, cached_subscription_tier).await?;
+    let quota = providers::antigravity::fetch_quota(
+        &access_token,
+        cached_project_id,
+        cached_subscription_tier,
+    )
+    .await?;
 
     // Update the auth file with new token and quota info
     let mut updated_json = json.clone();
@@ -506,7 +630,8 @@ pub async fn fetch_codex_quota(account_id: &str) -> Result<providers::openai::Co
     let json: serde_json::Value = serde_json::from_str(&content)?;
 
     // Check if it's an openai/codex account
-    let provider = json.get("type")
+    let provider = json
+        .get("type")
         .or_else(|| json.get("provider"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
@@ -516,7 +641,8 @@ pub async fn fetch_codex_quota(account_id: &str) -> Result<providers::openai::Co
     }
 
     // Get refresh token - check both root level and nested in token object
-    let refresh_token = json.get("refresh_token")
+    let refresh_token = json
+        .get("refresh_token")
         .and_then(|v| v.as_str())
         .or_else(|| {
             json.get("token")
@@ -527,11 +653,11 @@ pub async fn fetch_codex_quota(account_id: &str) -> Result<providers::openai::Co
 
     // Refresh the token to get a fresh access token
     let token_resp = providers::openai::refresh_token(refresh_token).await?;
-    let access_token = token_resp.access_token;
+    let identity = providers::openai::extract_codex_identity(&token_resp);
+    let access_token = token_resp.access_token.clone();
 
     // Get account_id for the API call (different from our internal account_id)
-    let openai_account_id = json.get("account_id")
-        .and_then(|v| v.as_str());
+    let openai_account_id = json.get("account_id").and_then(|v| v.as_str());
 
     // Fetch quota
     let quota = providers::openai::fetch_codex_quota(&access_token, openai_account_id).await?;
@@ -547,6 +673,17 @@ pub async fn fetch_codex_quota(account_id: &str) -> Result<providers::openai::Co
         let expired = chrono::Utc::now() + chrono::Duration::seconds(expires_in as i64);
         updated_json["expired"] = serde_json::json!(expired.to_rfc3339());
     }
+    if let Some(id_token) = token_resp.id_token {
+        updated_json["id_token"] = serde_json::json!(id_token);
+    }
+    if let Some(account_id) = identity.account_id {
+        updated_json["account_id"] = serde_json::json!(account_id);
+    }
+    if let Some(email) = identity.email {
+        updated_json["email"] = serde_json::json!(email);
+    }
+    updated_json["last_refresh"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+    updated_json["type"] = serde_json::json!("codex");
     updated_json["codex_quota_last_updated"] = serde_json::json!(quota.last_updated);
     updated_json["codex_plan_type"] = serde_json::json!(&quota.plan_type);
 
@@ -574,7 +711,8 @@ pub async fn fetch_gemini_quota(account_id: &str) -> Result<providers::google::G
     let json: serde_json::Value = serde_json::from_str(&content)?;
 
     // Check if it's a gemini/google account
-    let provider = json.get("type")
+    let provider = json
+        .get("type")
         .or_else(|| json.get("provider"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
@@ -584,7 +722,8 @@ pub async fn fetch_gemini_quota(account_id: &str) -> Result<providers::google::G
     }
 
     // Get refresh token - check both root level and nested in token object
-    let refresh_token = json.get("refresh_token")
+    let refresh_token = json
+        .get("refresh_token")
         .and_then(|v| v.as_str())
         .or_else(|| {
             json.get("token")
@@ -598,8 +737,7 @@ pub async fn fetch_gemini_quota(account_id: &str) -> Result<providers::google::G
     let access_token = token_resp.access_token;
 
     // Get project_id if available
-    let project_id = json.get("project_id")
-        .and_then(|v| v.as_str());
+    let project_id = json.get("project_id").and_then(|v| v.as_str());
 
     // Fetch quota
     let quota = providers::google::fetch_gemini_quota(&access_token, project_id).await?;
@@ -662,16 +800,14 @@ pub fn export_all_accounts() -> Result<String> {
 
         if path.extension().map_or(false, |ext| ext == "json") {
             match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    match serde_json::from_str::<serde_json::Value>(&content) {
-                        Ok(json) => {
-                            accounts.push(json);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to parse {:?}: {}", path, e);
-                        }
+                Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(json) => {
+                        accounts.push(json);
                     }
-                }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse {:?}: {}", path, e);
+                    }
+                },
                 Err(e) => {
                     tracing::warn!("Failed to read {:?}: {}", path, e);
                 }
@@ -679,7 +815,8 @@ pub fn export_all_accounts() -> Result<String> {
         }
     }
 
-    serde_json::to_string_pretty(&accounts).map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
+    serde_json::to_string_pretty(&accounts)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize: {}", e))
 }
 
 /// Import accounts from a JSON string containing an array of account objects
@@ -694,12 +831,14 @@ pub fn import_accounts(json_content: &str) -> Result<i32> {
 
     for account in accounts {
         // Determine filename based on provider and email/id
-        let provider = account.get("provider")
+        let provider = account
+            .get("provider")
             .or_else(|| account.get("type"))
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        let email = account.get("email")
+        let email = account
+            .get("email")
             .and_then(|v| v.as_str())
             .map(|s| s.replace(['@', '.'], "_"));
 

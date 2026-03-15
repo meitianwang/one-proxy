@@ -22,25 +22,26 @@ pub fn transform_openai_request(
         &mapped_model_lower,
         &tools_val,
         request.size.as_deref(),    // [NEW] Pass size parameter
-        request.quality.as_deref()  // [NEW] Pass quality parameter
+        request.quality.as_deref(), // [NEW] Pass quality parameter
     );
 
     // [FIX] 仅当模型名称显式包含 "-thinking" 时才视为 Gemini 思维模型
     // 避免对 gemini-3-pro (preview) 等其实不支持 thinkingConfig 的模型注入参数导致 400
-    let is_gemini_3_thinking = mapped_model_lower.contains("gemini") 
-        && mapped_model_lower.contains("-thinking") 
+    let is_gemini_3_thinking = mapped_model_lower.contains("gemini")
+        && mapped_model_lower.contains("-thinking")
         && !mapped_model_lower.contains("claude");
     // [FIX] is_claude_thinking 应该同时检查 claude 字样和 -thinking 后缀
-    let is_claude_thinking = mapped_model_lower.contains("claude") && mapped_model_lower.ends_with("-thinking");
+    let is_claude_thinking =
+        mapped_model_lower.contains("claude") && mapped_model_lower.ends_with("-thinking");
     let is_thinking_model = is_gemini_3_thinking || is_claude_thinking;
 
-
     // [NEW] 检查用户是否在请求中显式启用 thinking
-    let user_enabled_thinking = request.thinking.as_ref()
+    let user_enabled_thinking = request
+        .thinking
+        .as_ref()
         .map(|t| t.thinking_type.as_deref() == Some("enabled"))
         .unwrap_or(false);
-    let user_thinking_budget = request.thinking.as_ref()
-        .and_then(|t| t.budget_tokens);
+    let user_thinking_budget = request.thinking.as_ref().and_then(|t| t.budget_tokens);
 
     // [NEW] 检查历史消息是否兼容思维模型 (是否有 Assistant 消息缺失 reasoning_content)
     let has_incompatible_assistant_history = request.messages.iter().any(|msg| {
@@ -64,7 +65,7 @@ pub fn transform_openai_request(
         tracing::warn!("[OpenAI-Thinking] Incompatible assistant history detected for Claude thinking model without global signature. Disabling thinking for this request to avoid 400 error.");
         actual_include_thinking = false;
     }
-    
+
     // [NEW] 日志：用户显式设置 thinking
     if user_enabled_thinking {
         tracing::info!(
@@ -436,7 +437,7 @@ pub fn transform_openai_request(
     // [FIX] 移除默认的 81920 maxOutputTokens，防止非思维模型 (如 claude-sonnet-4-5) 报 400 Invalid Argument
     // 仅在用户显式提供时设置
     if let Some(max_tokens) = request.max_tokens {
-         gen_config["maxOutputTokens"] = json!(max_tokens);
+        gen_config["maxOutputTokens"] = json!(max_tokens);
     }
 
     // [NEW] 支持多候选结果数量 (n -> candidateCount)
@@ -449,7 +450,7 @@ pub fn transform_openai_request(
         // [CONFIGURABLE] 根据用户配置决定 thinking_budget 处理方式
         let tb_config = crate::api::config::get_thinking_budget_config();
         let user_budget: i64 = user_thinking_budget.map(|b| b as i64).unwrap_or(32000);
-        
+
         let budget = match tb_config.mode {
             crate::api::config::ThinkingBudgetMode::Passthrough => {
                 // 透传模式：使用用户传入的值，不做任何限制
@@ -471,10 +472,10 @@ pub fn transform_openai_request(
             }
             crate::api::config::ThinkingBudgetMode::Auto => {
                 // 自动模式：保持原有 Flash capping 逻辑 (向后兼容)
-                let is_gemini_limited = mapped_model_lower.contains("flash") 
+                let is_gemini_limited = mapped_model_lower.contains("flash")
                     || mapped_model_lower.contains("gemini-1.5")
-                    || is_claude_thinking;  // Claude thinking 模型转发到 Gemini，同样需要限流
-                
+                    || is_claude_thinking; // Claude thinking 模型转发到 Gemini，同样需要限流
+
                 if is_gemini_limited && user_budget > 24576 {
                     tracing::info!(
                         "[OpenAI-Request] Auto mode: capping thinking budget from {} to 24576 for model: {}", 
@@ -500,13 +501,16 @@ pub fn transform_openai_request(
             gen_config["maxOutputTokens"] = json!(new_max);
             tracing::debug!(
                 "[OpenAI-Request] Adjusted maxOutputTokens to {} for thinking model (budget={})",
-                new_max, budget
+                new_max,
+                budget
             );
         }
-        
+
         tracing::debug!(
             "[OpenAI-Request] Injected thinkingConfig for model {}: thinkingBudget={} (mode={:?})",
-            mapped_model, budget, tb_config.mode
+            mapped_model,
+            budget,
+            tb_config.mode
         );
     }
 
@@ -555,7 +559,10 @@ pub fn transform_openai_request(
                 func
             };
 
-            let name_opt = gemini_func.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let name_opt = gemini_func
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             if let Some(name) = &name_opt {
                 // 跳过内置联网工具名称，避免重复定义
@@ -570,9 +577,12 @@ pub fn transform_openai_request(
                     }
                 }
             } else {
-                 // [FIX] 如果工具没有名称，视为无效工具直接跳过 (防止 REQUIRED_FIELD_MISSING)
-                 tracing::warn!("[OpenAI-Request] Skipping tool without name: {:?}", gemini_func);
-                 continue;
+                // [FIX] 如果工具没有名称，视为无效工具直接跳过 (防止 REQUIRED_FIELD_MISSING)
+                tracing::warn!(
+                    "[OpenAI-Request] Skipping tool without name: {:?}",
+                    gemini_func
+                );
+                continue;
             }
 
             // [NEW CRITICAL FIX] 清除函数定义根层级的非法字段 (解决报错持久化)
@@ -798,9 +808,11 @@ mod tests {
         let max_output_tokens = gen_config["maxOutputTokens"].as_i64().unwrap();
         // budget(32000) + 8192 = 40192
         assert_eq!(max_output_tokens, 40192);
-        
+
         // Verify thinkingBudget
-        let budget = gen_config["thinkingConfig"]["thinkingBudget"].as_i64().unwrap();
+        let budget = gen_config["thinkingConfig"]["thinkingBudget"]
+            .as_i64()
+            .unwrap();
         assert_eq!(budget, 32000);
     }
 
@@ -842,9 +854,11 @@ mod tests {
         // Test with Flash model
         let result = transform_openai_request(&req, "test-p", "gemini-2.0-flash-thinking-exp");
         let gen_config = &result["request"]["generationConfig"];
-        
+
         // Should be capped at 24576
-        let budget = gen_config["thinkingConfig"]["thinkingBudget"].as_i64().unwrap();
+        let budget = gen_config["thinkingConfig"]["thinkingBudget"]
+            .as_i64()
+            .unwrap();
         assert_eq!(budget, 24576);
 
         // Max output tokens should be adjusted based on capped budget (24576 + 8192)
