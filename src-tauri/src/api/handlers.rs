@@ -942,10 +942,10 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
             }
         };
 
-        let response = match kiro::send_kiro_request(auth, &kiro_payload, true).await {
+        let response = match send_kiro_request_with_retry(auth, &kiro_payload).await {
             Ok(r) => r,
-            Err(e) => {
-                let msg = e.to_string();
+            Err(msg) => {
+                let msg = msg;
                 tracing::error!("Kiro API error (account {}): {}", account_id, msg);
                 last_error = Some(msg.clone());
                 if should_rotate_kiro_error(&msg) && idx + 1 < total {
@@ -3820,6 +3820,40 @@ async fn get_kiro_auths(model: &str) -> Vec<KiroAuthWithAccount> {
     auths
 }
 
+/// Send Kiro request with retry on 500 server errors (max 2 retries, 1s delay)
+async fn send_kiro_request_with_retry(
+    auth: &kiro::KiroAuth,
+    payload: &Value,
+) -> Result<reqwest::Response, String> {
+    const MAX_RETRIES: u32 = 2;
+    let mut last_err = String::new();
+    for attempt in 0..=MAX_RETRIES {
+        match kiro::send_kiro_request(auth, payload, true).await {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                let msg = e.to_string();
+                let is_server_error = msg.contains("500")
+                    || msg.to_lowercase().contains("internal server error")
+                    || msg.to_lowercase().contains("service unavailable")
+                    || msg.contains("503");
+                last_err = msg.clone();
+                if is_server_error && attempt < MAX_RETRIES {
+                    tracing::warn!(
+                        "Kiro server error (attempt {}/{}), retrying in 1s: {}",
+                        attempt + 1,
+                        MAX_RETRIES,
+                        msg
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+                return Err(last_err);
+            }
+        }
+    }
+    Err(last_err)
+}
+
 fn should_rotate_kiro_error(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("quota_exhausted")
@@ -4515,10 +4549,10 @@ pub async fn chat_completions(State(_state): State<AppState>, Json(raw): Json<Va
                 }
             };
 
-            let response = match kiro::send_kiro_request(auth, &payload, true).await {
+            let response = match send_kiro_request_with_retry(auth, &payload).await {
                 Ok(r) => r,
-                Err(e) => {
-                    let msg = e.to_string();
+                Err(msg) => {
+                    let msg = msg;
                     tracing::error!("Kiro API error (account {}): {}", account_id, msg);
                     last_error = Some(msg.clone());
                     if should_rotate_kiro_error(&msg) && idx + 1 < total {
@@ -5469,10 +5503,10 @@ pub async fn completions(State(_state): State<AppState>, Json(raw): Json<Value>)
                 }
             };
 
-            let response = match kiro::send_kiro_request(auth, &payload, true).await {
+            let response = match send_kiro_request_with_retry(auth, &payload).await {
                 Ok(r) => r,
-                Err(e) => {
-                    let msg = e.to_string();
+                Err(msg) => {
+                    let msg = msg;
                     tracing::error!("Kiro API error (account {}): {}", account_id, msg);
                     last_error = Some(msg.clone());
                     if should_rotate_kiro_error(&msg) && idx + 1 < total {
@@ -6080,10 +6114,10 @@ pub async fn claude_messages(State(_state): State<AppState>, Json(raw): Json<Val
                 }
             };
 
-            let response = match kiro::send_kiro_request(auth, &payload, true).await {
+            let response = match send_kiro_request_with_retry(auth, &payload).await {
                 Ok(r) => r,
-                Err(e) => {
-                    let msg = e.to_string();
+                Err(msg) => {
+                    let msg = msg;
                     tracing::error!("Kiro API error (account {}): {}", account_id, msg);
                     last_error = Some(msg.clone());
                     if should_rotate_kiro_error(&msg) && idx + 1 < total {
