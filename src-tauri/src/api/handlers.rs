@@ -894,104 +894,126 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
         .and_then(|m| m.as_str())
         .unwrap_or("claude-sonnet-4");
 
-    let kiro_auth = match get_kiro_auth(model).await {
-        Some(a) => a,
-        None => {
-            return Json(json!({
-                "error": {
-                    "message": "No valid Kiro credentials found. Please login first.",
-                    "type": "authentication_error",
-                    "code": 401
-                }
-            }))
-            .into_response();
-        }
-    };
+    let auths = get_kiro_auths(model).await;
+    if auths.is_empty() {
+        return Json(json!({
+            "error": {
+                "message": "No valid Kiro credentials found. Please login first.",
+                "type": "authentication_error",
+                "code": 401
+            }
+        }))
+        .into_response();
+    }
 
-    let auth = &kiro_auth.auth;
-    let account_id = &kiro_auth.account_id;
-    let provider = &kiro_auth.provider;
-
-    // Build Kiro payload from OpenAI-style messages
     let resolution = kiro::resolve_model(model);
     let conversation_id = kiro::generate_conversation_id(payload.get("messages"));
-    let profile_arn = if matches!(auth.auth_type, kiro::KiroAuthType::KiroDesktop) {
-        auth.profile_arn.clone()
-    } else {
-        None
-    };
 
-    let kiro_payload = match kiro::build_kiro_payload_from_openai(
-        &payload,
-        &resolution.internal_id,
-        conversation_id,
-        profile_arn,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            return error_response(
-                400,
-                &format!("Failed to build Kiro payload: {}", e),
-                "invalid_request_error",
-                provider,
-                account_id,
-                model,
-            );
-        }
-    };
+    let mut last_error: Option<String> = None;
+    let total = auths.len();
 
-    // Send request to Kiro
-    let response = match kiro::send_kiro_request(auth, &kiro_payload, true).await {
-        Ok(r) => r,
-        Err(e) => {
-            return error_response(
-                500,
-                &format!("Kiro API error: {}", e),
-                "api_error",
-                provider,
-                account_id,
-                model,
-            );
-        }
-    };
+    for (idx, kiro_auth) in auths.into_iter().enumerate() {
+        let auth = &kiro_auth.auth;
+        let account_id = &kiro_auth.account_id;
+        let provider = &kiro_auth.provider;
 
-    if is_stream {
-        let messages_for_stream = payload.get("messages").cloned();
-        let upstream = kiro::stream_kiro_to_openai(
-            response,
-            model.to_string(),
-            messages_for_stream,
-            None, // request_tools
-        );
-        let stream = upstream.filter_map(|chunk| async move {
-            match chunk {
-                Ok(data) => strip_sse_data_line(&data),
-                Err(_) => None,
+        let profile_arn = if matches!(auth.auth_type, kiro::KiroAuthType::KiroDesktop) {
+            auth.profile_arn.clone()
+        } else {
+            None
+        };
+
+        let kiro_payload = match kiro::build_kiro_payload_from_openai(
+            &payload,
+            &resolution.internal_id,
+            conversation_id.clone(),
+            profile_arn,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return error_response(
+                    400,
+                    &format!("Failed to build Kiro payload: {}", e),
+                    "invalid_request_error",
+                    provider,
+                    account_id,
+                    model,
+                );
             }
-        });
-        let stream = stream.map(|payload| Ok::<Event, Infallible>(Event::default().data(payload)));
-        return with_log_info(Sse::new(stream), provider, account_id, model);
-    } else {
+        };
+
+        let response = match kiro::send_kiro_request(auth, &kiro_payload, true).await {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                tracing::error!("Kiro API error (account {}): {}", account_id, msg);
+                last_error = Some(msg.clone());
+                if should_rotate_kiro_error(&msg) && idx + 1 < total {
+                    if should_mark_account_exhausted(&msg) {
+                        mark_account_exhausted(provider, account_id);
+                    }
+                    continue;
+                }
+                return error_response(500, &format!("Kiro API error: {}", msg), "api_error", provider, account_id, model);
+            }
+        };
+
+        clear_account_exhausted(provider, account_id);
+
+        if is_stream {
+            let messages_for_stream = payload.get("messages").cloned();
+            let upstream = kiro::stream_kiro_to_openai(
+                response,
+                model.to_string(),
+                messages_for_stream,
+                None,
+            );
+            let stream = upstream.filter_map(|chunk| async move {
+                match chunk {
+                    Ok(data) => strip_sse_data_line(&data),
+                    Err(_) => None,
+                }
+            });
+            let stream = stream.map(|p| Ok::<Event, Infallible>(Event::default().data(p)));
+            return with_log_info(Sse::new(stream), provider, account_id, model);
+        }
+
         let messages_for_stream = payload.get("messages").cloned();
         match kiro::collect_stream_response(
             response,
             model.to_string(),
             messages_for_stream,
-            None, // request_tools
+            None,
         )
         .await
         {
-            Ok(json_response) => with_log_info(Json(json_response), provider, account_id, model),
-            Err(e) => error_response(
-                500,
-                &format!("Kiro API error: {}", e),
-                "api_error",
-                provider,
-                account_id,
-                model,
-            ),
+            Ok(json_response) => {
+                return with_log_info(Json(json_response), provider, account_id, model)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                tracing::error!("Kiro collect error (account {}): {}", account_id, msg);
+                last_error = Some(msg.clone());
+                if should_rotate_kiro_error(&msg) && idx + 1 < total {
+                    if should_mark_account_exhausted(&msg) {
+                        mark_account_exhausted(provider, account_id);
+                    }
+                    continue;
+                }
+                return error_response(500, &format!("Kiro API error: {}", msg), "api_error", provider, account_id, model);
+            }
         }
     }
+
+    let message = last_error.unwrap_or_else(|| "Kiro API error".to_string());
+    Json(json!({
+        "error": {
+            "message": format!("Kiro API error: {}", message),
+            "type": "api_error",
+            "code": 500
+        }
+    }))
+    .into_response()
 }
 
 /// Handle native Claude request (converted from Gemini format)
@@ -3753,6 +3775,66 @@ async fn get_kiro_auth(model: &str) -> Option<KiroAuthWithAccount> {
     None
 }
 
+/// Get all valid Kiro credentials (for account rotation)
+async fn get_kiro_auths(model: &str) -> Vec<KiroAuthWithAccount> {
+    let candidates = select_auth_candidates("kiro", model);
+    let mut auths = Vec::new();
+    for candidate in candidates {
+        let snapshot = match kiro::load_kiro_auth(&candidate.path).await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let email = std::fs::read_to_string(&candidate.path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|json| {
+                json.get("email")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+        let account_id = email.unwrap_or_else(|| candidate.id.clone());
+
+        if !is_expired(snapshot.expires_at) && !snapshot.access_token.trim().is_empty() {
+            if let Ok(auth) = kiro::snapshot_to_auth(snapshot) {
+                auths.push(KiroAuthWithAccount {
+                    auth,
+                    account_id,
+                    provider: candidate.provider.clone(),
+                });
+            }
+            continue;
+        }
+        if snapshot.refresh_token.is_none() {
+            continue;
+        }
+        if let Ok(updated) = kiro::refresh_kiro_auth(&candidate.path, &snapshot).await {
+            if let Ok(auth) = kiro::snapshot_to_auth(updated) {
+                auths.push(KiroAuthWithAccount {
+                    auth,
+                    account_id,
+                    provider: candidate.provider.clone(),
+                });
+            }
+        }
+    }
+    auths
+}
+
+fn should_rotate_kiro_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("quota_exhausted")
+        || lower.contains("resource_exhausted")
+        || lower.contains("rate_limit_exceeded")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("429")
+        || lower.contains("500")
+}
+
 /// Get a Kimi API key from stored credentials
 async fn get_kimi_token(model: &str) -> Option<String> {
     let candidates = select_auth_candidates("kimi", model);
@@ -4381,116 +4463,128 @@ pub async fn chat_completions(State(_state): State<AppState>, Json(raw): Json<Va
     }
 
     if provider_override.as_deref() == Some("kiro") {
-        let kiro_auth = match get_kiro_auth(&model).await {
-            Some(a) => a,
-            None => {
-                return Json(json!({
-                    "error": {
-                        "message": "No valid Kiro credentials found. Please login with Kiro first.",
-                        "type": "authentication_error",
-                        "code": 401
-                    }
-                }))
-                .into_response();
-            }
-        };
-
-        let auth = &kiro_auth.auth;
-        let account_id = &kiro_auth.account_id;
-        let provider = &kiro_auth.provider;
-
-        if kiro::ensure_model_cache(auth).await.is_err() {
-            return error_response(
-                500,
-                "Failed to load Kiro models. Please try again.",
-                "api_error",
-                provider,
-                account_id,
-                &model,
-            );
+        let auths = get_kiro_auths(&model).await;
+        if auths.is_empty() {
+            return Json(json!({
+                "error": {
+                    "message": "No valid Kiro credentials found. Please login with Kiro first.",
+                    "type": "authentication_error",
+                    "code": 401
+                }
+            }))
+            .into_response();
         }
 
         let resolution = kiro::resolve_model(&model);
         let conversation_id = kiro::generate_conversation_id(raw.get("messages"));
-        let profile_arn = if matches!(auth.auth_type, kiro::KiroAuthType::KiroDesktop) {
-            auth.profile_arn.clone()
-        } else {
-            None
-        };
+        let mut last_error: Option<String> = None;
+        let total = auths.len();
 
-        let payload = match kiro::build_kiro_payload_from_openai(
-            &raw,
-            &resolution.internal_id,
-            conversation_id,
-            profile_arn,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                return error_response(
-                    400,
-                    &format!("Invalid Kiro request: {}", e),
-                    "invalid_request_error",
-                    provider,
-                    account_id,
-                    &model,
-                );
+        for (idx, kiro_auth) in auths.into_iter().enumerate() {
+            let auth = &kiro_auth.auth;
+            let account_id = &kiro_auth.account_id;
+            let provider = &kiro_auth.provider;
+
+            if kiro::ensure_model_cache(auth).await.is_err() {
+                last_error = Some("Failed to load Kiro models".to_string());
+                continue;
             }
-        };
 
-        let response = match kiro::send_kiro_request(auth, &payload, true).await {
-            Ok(r) => r,
-            Err(e) => {
-                return error_response(
-                    500,
-                    &format!("Kiro API error: {}", e),
-                    "api_error",
-                    provider,
-                    account_id,
-                    &model,
+            let profile_arn = if matches!(auth.auth_type, kiro::KiroAuthType::KiroDesktop) {
+                auth.profile_arn.clone()
+            } else {
+                None
+            };
+
+            let payload = match kiro::build_kiro_payload_from_openai(
+                &raw,
+                &resolution.internal_id,
+                conversation_id.clone(),
+                profile_arn,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    return error_response(
+                        400,
+                        &format!("Invalid Kiro request: {}", e),
+                        "invalid_request_error",
+                        provider,
+                        account_id,
+                        &model,
+                    );
+                }
+            };
+
+            let response = match kiro::send_kiro_request(auth, &payload, true).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::error!("Kiro API error (account {}): {}", account_id, msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_kiro_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(provider, account_id);
+                        }
+                        continue;
+                    }
+                    return error_response(500, &format!("Kiro API error: {}", msg), "api_error", provider, account_id, &model);
+                }
+            };
+
+            clear_account_exhausted(provider, account_id);
+
+            if is_stream {
+                let upstream = kiro::stream_kiro_to_openai(
+                    response,
+                    model.clone(),
+                    raw.get("messages").cloned(),
+                    raw.get("tools").cloned(),
                 );
+                let stream = upstream.filter_map(|chunk| async move {
+                    match chunk {
+                        Ok(data) => strip_sse_data_line(&data),
+                        Err(_) => None,
+                    }
+                });
+                let stream = stream.map(|p| Ok::<Event, Infallible>(Event::default().data(p)));
+                return with_log_info(Sse::new(stream), provider, account_id, &model);
             }
-        };
 
-        if is_stream {
-            let upstream = kiro::stream_kiro_to_openai(
+            match kiro::collect_stream_response(
                 response,
                 model.clone(),
                 raw.get("messages").cloned(),
                 raw.get("tools").cloned(),
-            );
-            let stream = upstream.filter_map(|chunk| async move {
-                match chunk {
-                    Ok(data) => strip_sse_data_line(&data),
-                    Err(_) => None,
+            )
+            .await
+            {
+                Ok(openai_response) => {
+                    return with_log_info(Json(openai_response), provider, account_id, &model)
                 }
-            });
-            let stream =
-                stream.map(|payload| Ok::<Event, Infallible>(Event::default().data(payload)));
-            return with_log_info(Sse::new(stream), provider, account_id, &model);
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::error!("Kiro collect error (account {}): {}", account_id, msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_kiro_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(provider, account_id);
+                        }
+                        continue;
+                    }
+                    return error_response(500, &format!("Kiro API error: {}", msg), "api_error", provider, account_id, &model);
+                }
+            }
         }
 
-        match kiro::collect_stream_response(
-            response,
-            model.clone(),
-            raw.get("messages").cloned(),
-            raw.get("tools").cloned(),
-        )
-        .await
-        {
-            Ok(openai_response) => {
-                return with_log_info(Json(openai_response), provider, account_id, &model)
+        let message = last_error.unwrap_or_else(|| "Kiro API error".to_string());
+        return Json(json!({
+            "error": {
+                "message": format!("Kiro API error: {}", message),
+                "type": "api_error",
+                "code": 500
             }
-            Err(e) => {
-                return error_response(
-                    500,
-                    &format!("Kiro API error: {}", e),
-                    "api_error",
-                    provider,
-                    account_id,
-                    &model,
-                );
-            }
-        }
+        }))
+        .into_response();
     }
 
     if matches!(provider_override.as_deref(), Some("kimi") | Some("glm")) {
@@ -5323,125 +5417,138 @@ pub async fn completions(State(_state): State<AppState>, Json(raw): Json<Value>)
     }
 
     if provider_override.as_deref() == Some("kiro") {
-        let kiro_auth = match get_kiro_auth(&model).await {
-            Some(a) => a,
-            None => {
-                return Json(json!({
-                    "error": {
-                        "message": "No valid Kiro credentials found. Please login with Kiro first.",
-                        "type": "authentication_error",
-                        "code": 401
-                    }
-                }))
-                .into_response();
-            }
-        };
-
-        let auth = &kiro_auth.auth;
-        let account_id = &kiro_auth.account_id;
-        let provider = &kiro_auth.provider;
-
-        if kiro::ensure_model_cache(auth).await.is_err() {
-            return error_response(
-                500,
-                "Failed to load Kiro models. Please try again.",
-                "api_error",
-                provider,
-                account_id,
-                &model,
-            );
+        let auths = get_kiro_auths(&model).await;
+        if auths.is_empty() {
+            return Json(json!({
+                "error": {
+                    "message": "No valid Kiro credentials found. Please login with Kiro first.",
+                    "type": "authentication_error",
+                    "code": 401
+                }
+            }))
+            .into_response();
         }
 
         let resolution = kiro::resolve_model(&model);
         let conversation_id = kiro::generate_conversation_id(chat_request.get("messages"));
-        let profile_arn = if matches!(auth.auth_type, kiro::KiroAuthType::KiroDesktop) {
-            auth.profile_arn.clone()
-        } else {
-            None
-        };
+        let mut last_error: Option<String> = None;
+        let total = auths.len();
 
-        let payload = match kiro::build_kiro_payload_from_openai(
-            &chat_request,
-            &resolution.internal_id,
-            conversation_id,
-            profile_arn,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                return error_response(
-                    400,
-                    &format!("Invalid Kiro request: {}", e),
-                    "invalid_request_error",
-                    provider,
-                    account_id,
-                    &model,
-                );
+        for (idx, kiro_auth) in auths.into_iter().enumerate() {
+            let auth = &kiro_auth.auth;
+            let account_id = &kiro_auth.account_id;
+            let provider = &kiro_auth.provider;
+
+            if kiro::ensure_model_cache(auth).await.is_err() {
+                last_error = Some("Failed to load Kiro models".to_string());
+                continue;
             }
-        };
 
-        let response = match kiro::send_kiro_request(auth, &payload, true).await {
-            Ok(r) => r,
-            Err(e) => {
-                return error_response(
-                    500,
-                    &format!("Kiro API error: {}", e),
-                    "api_error",
-                    provider,
-                    account_id,
-                    &model,
+            let profile_arn = if matches!(auth.auth_type, kiro::KiroAuthType::KiroDesktop) {
+                auth.profile_arn.clone()
+            } else {
+                None
+            };
+
+            let payload = match kiro::build_kiro_payload_from_openai(
+                &chat_request,
+                &resolution.internal_id,
+                conversation_id.clone(),
+                profile_arn,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    return error_response(
+                        400,
+                        &format!("Invalid Kiro request: {}", e),
+                        "invalid_request_error",
+                        provider,
+                        account_id,
+                        &model,
+                    );
+                }
+            };
+
+            let response = match kiro::send_kiro_request(auth, &payload, true).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::error!("Kiro API error (account {}): {}", account_id, msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_kiro_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(provider, account_id);
+                        }
+                        continue;
+                    }
+                    return error_response(500, &format!("Kiro API error: {}", msg), "api_error", provider, account_id, &model);
+                }
+            };
+
+            clear_account_exhausted(provider, account_id);
+
+            if is_stream {
+                let upstream = kiro::stream_kiro_to_openai(
+                    response,
+                    model.clone(),
+                    chat_request.get("messages").cloned(),
+                    chat_request.get("tools").cloned(),
                 );
+                let stream = upstream.filter_map(|chunk| async move {
+                    match chunk {
+                        Ok(data) => strip_sse_data_line(&data).filter(|p| p != "[DONE]"),
+                        Err(_) => None,
+                    }
+                });
+                let stream = stream.map(|chunk| {
+                    convert_chat_stream_chunk_to_completions(&chunk)
+                        .map(|data| Ok::<Event, Infallible>(Event::default().data(data)))
+                        .unwrap_or_else(|| {
+                            Ok::<Event, Infallible>(Event::default().data("{\"choices\":[]}"))
+                        })
+                });
+                let stream = stream.chain(futures::stream::once(async {
+                    Ok(Event::default().data("[DONE]"))
+                }));
+                return with_log_info(Sse::new(stream), provider, account_id, &model);
             }
-        };
 
-        if is_stream {
-            let upstream = kiro::stream_kiro_to_openai(
+            match kiro::collect_stream_response(
                 response,
                 model.clone(),
                 chat_request.get("messages").cloned(),
                 chat_request.get("tools").cloned(),
-            );
-            let stream = upstream.filter_map(|chunk| async move {
-                match chunk {
-                    Ok(data) => strip_sse_data_line(&data).filter(|payload| payload != "[DONE]"),
-                    Err(_) => None,
+            )
+            .await
+            {
+                Ok(openai_response) => {
+                    let completions_response = convert_chat_response_to_completions(&openai_response);
+                    return with_log_info(Json(completions_response), provider, account_id, &model);
                 }
-            });
-            let stream = stream.map(|chunk| {
-                convert_chat_stream_chunk_to_completions(&chunk)
-                    .map(|data| Ok::<Event, Infallible>(Event::default().data(data)))
-                    .unwrap_or_else(|| {
-                        Ok::<Event, Infallible>(Event::default().data("{\"choices\":[]}"))
-                    })
-            });
-            let stream = stream.chain(futures::stream::once(async {
-                Ok(Event::default().data("[DONE]"))
-            }));
-            return with_log_info(Sse::new(stream), provider, account_id, &model);
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::error!("Kiro collect error (account {}): {}", account_id, msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_kiro_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(provider, account_id);
+                        }
+                        continue;
+                    }
+                    return error_response(500, &format!("Kiro API error: {}", msg), "api_error", provider, account_id, &model);
+                }
+            }
         }
 
-        match kiro::collect_stream_response(
-            response,
-            model.clone(),
-            chat_request.get("messages").cloned(),
-            chat_request.get("tools").cloned(),
-        )
-        .await
-        {
-            Ok(openai_response) => {
-                let completions_response = convert_chat_response_to_completions(&openai_response);
-                return with_log_info(Json(completions_response), provider, account_id, &model);
+        let message = last_error.unwrap_or_else(|| "Kiro API error".to_string());
+        return Json(json!({
+            "error": {
+                "message": format!("Kiro API error: {}", message),
+                "type": "api_error",
+                "code": 500
             }
-            Err(e) => {
-                return error_response(
-                    500,
-                    &format!("Kiro API error: {}", e),
-                    "api_error",
-                    provider,
-                    account_id,
-                    &model,
-                );
-            }
-        }
+        }))
+        .into_response();
     }
 
     if matches!(provider_override.as_deref(), Some("kimi") | Some("glm")) {
@@ -5921,117 +6028,130 @@ pub async fn claude_messages(State(_state): State<AppState>, Json(raw): Json<Val
     }
 
     if provider_override.as_deref() == Some("kiro") {
-        let kiro_auth = match get_kiro_auth(&model).await {
-            Some(a) => a,
-            None => {
-                return Json(json!({
-                    "error": {
-                        "message": "No valid Kiro credentials found. Please login with Kiro first.",
-                        "type": "authentication_error",
-                        "code": 401
-                    }
-                }))
-                .into_response();
-            }
-        };
-
-        let auth = &kiro_auth.auth;
-        let account_id = &kiro_auth.account_id;
-        let provider = &kiro_auth.provider;
-
-        if kiro::ensure_model_cache(auth).await.is_err() {
-            return error_response(
-                500,
-                "Failed to load Kiro models. Please try again.",
-                "api_error",
-                provider,
-                account_id,
-                &model,
-            );
+        let auths = get_kiro_auths(&model).await;
+        if auths.is_empty() {
+            return Json(json!({
+                "error": {
+                    "message": "No valid Kiro credentials found. Please login with Kiro first.",
+                    "type": "authentication_error",
+                    "code": 401
+                }
+            }))
+            .into_response();
         }
 
         let resolution = kiro::resolve_model(&model);
         let conversation_id = kiro::generate_conversation_id(openai_raw.get("messages"));
-        let profile_arn = if matches!(auth.auth_type, kiro::KiroAuthType::KiroDesktop) {
-            auth.profile_arn.clone()
-        } else {
-            None
-        };
+        let mut last_error: Option<String> = None;
+        let total = auths.len();
 
-        let payload = match kiro::build_kiro_payload_from_openai(
-            &openai_raw,
-            &resolution.internal_id,
-            conversation_id,
-            profile_arn,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                return error_response(
-                    400,
-                    &format!("Invalid Kiro request: {}", e),
-                    "invalid_request_error",
-                    provider,
-                    account_id,
-                    &model,
-                );
+        for (idx, kiro_auth) in auths.into_iter().enumerate() {
+            let auth = &kiro_auth.auth;
+            let account_id = &kiro_auth.account_id;
+            let provider = &kiro_auth.provider;
+
+            if kiro::ensure_model_cache(auth).await.is_err() {
+                last_error = Some("Failed to load Kiro models".to_string());
+                continue;
             }
-        };
 
-        let response = match kiro::send_kiro_request(auth, &payload, true).await {
-            Ok(r) => r,
-            Err(e) => {
-                return error_response(
-                    500,
-                    &format!("Kiro API error: {}", e),
-                    "api_error",
-                    provider,
-                    account_id,
-                    &model,
+            let profile_arn = if matches!(auth.auth_type, kiro::KiroAuthType::KiroDesktop) {
+                auth.profile_arn.clone()
+            } else {
+                None
+            };
+
+            let payload = match kiro::build_kiro_payload_from_openai(
+                &openai_raw,
+                &resolution.internal_id,
+                conversation_id.clone(),
+                profile_arn,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    return error_response(
+                        400,
+                        &format!("Invalid Kiro request: {}", e),
+                        "invalid_request_error",
+                        provider,
+                        account_id,
+                        &model,
+                    );
+                }
+            };
+
+            let response = match kiro::send_kiro_request(auth, &payload, true).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::error!("Kiro API error (account {}): {}", account_id, msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_kiro_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(provider, account_id);
+                        }
+                        continue;
+                    }
+                    return error_response(500, &format!("Kiro API error: {}", msg), "api_error", provider, account_id, &model);
+                }
+            };
+
+            clear_account_exhausted(provider, account_id);
+
+            if is_stream {
+                let upstream = kiro::stream_kiro_to_openai(
+                    response,
+                    model.clone(),
+                    openai_raw.get("messages").cloned(),
+                    openai_raw.get("tools").cloned(),
                 );
+                let stream = upstream.filter_map(|chunk| async move {
+                    match chunk {
+                        Ok(data) => strip_sse_data_line(&data),
+                        Err(_) => None,
+                    }
+                });
+                let stream = openai_chunks_to_claude_events(stream, &model);
+                return with_log_info(Sse::new(stream), provider, account_id, &model);
             }
-        };
 
-        if is_stream {
-            let upstream = kiro::stream_kiro_to_openai(
+            match kiro::collect_stream_response(
                 response,
                 model.clone(),
                 openai_raw.get("messages").cloned(),
                 openai_raw.get("tools").cloned(),
-            );
-            let stream = upstream.filter_map(|chunk| async move {
-                match chunk {
-                    Ok(data) => strip_sse_data_line(&data),
-                    Err(_) => None,
+            )
+            .await
+            {
+                Ok(openai_response) => {
+                    let claude_response =
+                        claude::openai_to_claude_response(&openai_response, &model, &request_id);
+                    return with_log_info(Json(claude_response), provider, account_id, &model);
                 }
-            });
-            let stream = openai_chunks_to_claude_events(stream, &model);
-            return with_log_info(Sse::new(stream), provider, account_id, &model);
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::error!("Kiro collect error (account {}): {}", account_id, msg);
+                    last_error = Some(msg.clone());
+                    if should_rotate_kiro_error(&msg) && idx + 1 < total {
+                        if should_mark_account_exhausted(&msg) {
+                            mark_account_exhausted(provider, account_id);
+                        }
+                        continue;
+                    }
+                    return error_response(500, &format!("Kiro API error: {}", msg), "api_error", provider, account_id, &model);
+                }
+            }
         }
 
-        match kiro::collect_stream_response(
-            response,
-            model.clone(),
-            openai_raw.get("messages").cloned(),
-            openai_raw.get("tools").cloned(),
-        )
-        .await
-        {
-            Ok(openai_response) => {
-                let claude_response =
-                    claude::openai_to_claude_response(&openai_response, &model, &request_id);
-                return with_log_info(Json(claude_response), provider, account_id, &model);
+        let message = last_error.unwrap_or_else(|| "Kiro API error".to_string());
+        return Json(json!({
+            "error": {
+                "message": format!("Kiro API error: {}", message),
+                "type": "api_error",
+                "code": 500
             }
-            Err(e) => {
-                return error_response(
-                    500,
-                    &format!("Kiro API error: {}", e),
-                    "api_error",
-                    provider,
-                    account_id,
-                    &model,
-                );
-            }
-        }
+        }))
+        .into_response();
     }
 
     if provider_override.as_deref() == Some("antigravity") {
