@@ -15,6 +15,7 @@ import {
   Loader2,
   Save,
   RefreshCw,
+  Trash2,
 } from "lucide-react";
 
 interface AppConfig {
@@ -237,6 +238,11 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
     await navigator.clipboard.writeText(config["api-keys"][0]);
   }
 
+  async function handleClearApiKey() {
+    if (!config) return;
+    await saveConfig({ ...config, "api-keys": [] });
+  }
+
   function isLanAccess() {
     return config?.host === "0.0.0.0";
   }
@@ -414,10 +420,18 @@ export function Dashboard({ serverStatus, onStatusChange }: DashboardProps) {
                 </button>
                 <button
                   onClick={handleCopyApiKey}
-                  className="px-4 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 border border-gray-300/80 dark:border-gray-600/80 rounded-r-xl transition-colors text-gray-600 dark:text-gray-300 outline-none"
+                  className="px-4 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 border-y border-l border-gray-300/80 dark:border-gray-600/80 transition-colors text-gray-600 dark:text-gray-300 outline-none"
                   title="复制密钥"
                 >
                   <Copy className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={handleClearApiKey}
+                  disabled={!config?.["api-keys"]?.length}
+                  className="px-4 bg-gray-100 dark:bg-gray-700 hover:bg-red-100 dark:hover:bg-red-900/30 hover:text-red-600 dark:hover:text-red-400 border border-gray-300/80 dark:border-gray-600/80 rounded-r-xl transition-colors text-gray-600 dark:text-gray-300 outline-none disabled:opacity-40 disabled:cursor-not-allowed"
+                  title="清空密钥"
+                >
+                  <Trash2 className="w-4 h-4" />
                 </button>
               </div>
             </div>
