@@ -3825,7 +3825,7 @@ async fn send_kiro_request_with_retry(
     auth: &kiro::KiroAuth,
     payload: &Value,
 ) -> Result<reqwest::Response, String> {
-    const MAX_RETRIES: u32 = 2;
+    const MAX_RETRIES: u32 = 10;
     let mut last_err = String::new();
     for attempt in 0..=MAX_RETRIES {
         match kiro::send_kiro_request(auth, payload, true).await {
