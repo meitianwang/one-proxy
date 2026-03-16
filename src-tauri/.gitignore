@@ -8,3 +8,4 @@
 
 # OAuth credentials (not tracked in git)
 /credentials/
+claude-code-router/

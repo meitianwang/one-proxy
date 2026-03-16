@@ -929,14 +929,14 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
     ) {
         Ok(p) => p,
         Err(e) => {
-            return Json(json!({
-                "error": {
-                    "message": format!("Failed to build Kiro payload: {}", e),
-                    "type": "invalid_request_error",
-                    "code": 400
-                }
-            }))
-            .into_response();
+            return error_response(
+                400,
+                &format!("Failed to build Kiro payload: {}", e),
+                "invalid_request_error",
+                provider,
+                account_id,
+                model,
+            );
         }
     };
 
@@ -944,14 +944,14 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
     let response = match kiro::send_kiro_request(auth, &kiro_payload, true).await {
         Ok(r) => r,
         Err(e) => {
-            return Json(json!({
-                "error": {
-                    "message": format!("Kiro API error: {}", e),
-                    "type": "api_error",
-                    "code": 500
-                }
-            }))
-            .into_response();
+            return error_response(
+                500,
+                &format!("Kiro API error: {}", e),
+                "api_error",
+                provider,
+                account_id,
+                model,
+            );
         }
     };
 
@@ -982,14 +982,14 @@ async fn handle_kiro_claude_request(payload: Value, is_stream: bool) -> axum::re
         .await
         {
             Ok(json_response) => with_log_info(Json(json_response), provider, account_id, model),
-            Err(e) => Json(json!({
-                "error": {
-                    "message": format!("Kiro API error: {}", e),
-                    "type": "api_error",
-                    "code": 500
-                }
-            }))
-            .into_response(),
+            Err(e) => error_response(
+                500,
+                &format!("Kiro API error: {}", e),
+                "api_error",
+                provider,
+                account_id,
+                model,
+            ),
         }
     }
 }
@@ -4400,14 +4400,14 @@ pub async fn chat_completions(State(_state): State<AppState>, Json(raw): Json<Va
         let provider = &kiro_auth.provider;
 
         if kiro::ensure_model_cache(auth).await.is_err() {
-            return Json(json!({
-                "error": {
-                    "message": "Failed to load Kiro models. Please try again.",
-                    "type": "api_error",
-                    "code": 500
-                }
-            }))
-            .into_response();
+            return error_response(
+                500,
+                "Failed to load Kiro models. Please try again.",
+                "api_error",
+                provider,
+                account_id,
+                &model,
+            );
         }
 
         let resolution = kiro::resolve_model(&model);
@@ -4426,28 +4426,28 @@ pub async fn chat_completions(State(_state): State<AppState>, Json(raw): Json<Va
         ) {
             Ok(p) => p,
             Err(e) => {
-                return Json(json!({
-                    "error": {
-                        "message": format!("Invalid Kiro request: {}", e),
-                        "type": "invalid_request_error",
-                        "code": 400
-                    }
-                }))
-                .into_response();
+                return error_response(
+                    400,
+                    &format!("Invalid Kiro request: {}", e),
+                    "invalid_request_error",
+                    provider,
+                    account_id,
+                    &model,
+                );
             }
         };
 
         let response = match kiro::send_kiro_request(auth, &payload, true).await {
             Ok(r) => r,
             Err(e) => {
-                return Json(json!({
-                    "error": {
-                        "message": format!("Kiro API error: {}", e),
-                        "type": "api_error",
-                        "code": 500
-                    }
-                }))
-                .into_response();
+                return error_response(
+                    500,
+                    &format!("Kiro API error: {}", e),
+                    "api_error",
+                    provider,
+                    account_id,
+                    &model,
+                );
             }
         };
 
@@ -4481,14 +4481,14 @@ pub async fn chat_completions(State(_state): State<AppState>, Json(raw): Json<Va
                 return with_log_info(Json(openai_response), provider, account_id, &model)
             }
             Err(e) => {
-                return Json(json!({
-                    "error": {
-                        "message": format!("Kiro API error: {}", e),
-                        "type": "api_error",
-                        "code": 500
-                    }
-                }))
-                .into_response();
+                return error_response(
+                    500,
+                    &format!("Kiro API error: {}", e),
+                    "api_error",
+                    provider,
+                    account_id,
+                    &model,
+                );
             }
         }
     }
@@ -5342,14 +5342,14 @@ pub async fn completions(State(_state): State<AppState>, Json(raw): Json<Value>)
         let provider = &kiro_auth.provider;
 
         if kiro::ensure_model_cache(auth).await.is_err() {
-            return Json(json!({
-                "error": {
-                    "message": "Failed to load Kiro models. Please try again.",
-                    "type": "api_error",
-                    "code": 500
-                }
-            }))
-            .into_response();
+            return error_response(
+                500,
+                "Failed to load Kiro models. Please try again.",
+                "api_error",
+                provider,
+                account_id,
+                &model,
+            );
         }
 
         let resolution = kiro::resolve_model(&model);
@@ -5368,28 +5368,28 @@ pub async fn completions(State(_state): State<AppState>, Json(raw): Json<Value>)
         ) {
             Ok(p) => p,
             Err(e) => {
-                return Json(json!({
-                    "error": {
-                        "message": format!("Invalid Kiro request: {}", e),
-                        "type": "invalid_request_error",
-                        "code": 400
-                    }
-                }))
-                .into_response();
+                return error_response(
+                    400,
+                    &format!("Invalid Kiro request: {}", e),
+                    "invalid_request_error",
+                    provider,
+                    account_id,
+                    &model,
+                );
             }
         };
 
         let response = match kiro::send_kiro_request(auth, &payload, true).await {
             Ok(r) => r,
             Err(e) => {
-                return Json(json!({
-                    "error": {
-                        "message": format!("Kiro API error: {}", e),
-                        "type": "api_error",
-                        "code": 500
-                    }
-                }))
-                .into_response();
+                return error_response(
+                    500,
+                    &format!("Kiro API error: {}", e),
+                    "api_error",
+                    provider,
+                    account_id,
+                    &model,
+                );
             }
         };
 
@@ -5432,14 +5432,14 @@ pub async fn completions(State(_state): State<AppState>, Json(raw): Json<Value>)
                 return with_log_info(Json(completions_response), provider, account_id, &model);
             }
             Err(e) => {
-                return Json(json!({
-                    "error": {
-                        "message": format!("Kiro API error: {}", e),
-                        "type": "api_error",
-                        "code": 500
-                    }
-                }))
-                .into_response();
+                return error_response(
+                    500,
+                    &format!("Kiro API error: {}", e),
+                    "api_error",
+                    provider,
+                    account_id,
+                    &model,
+                );
             }
         }
     }
@@ -5940,14 +5940,14 @@ pub async fn claude_messages(State(_state): State<AppState>, Json(raw): Json<Val
         let provider = &kiro_auth.provider;
 
         if kiro::ensure_model_cache(auth).await.is_err() {
-            return Json(json!({
-                "error": {
-                    "message": "Failed to load Kiro models. Please try again.",
-                    "type": "api_error",
-                    "code": 500
-                }
-            }))
-            .into_response();
+            return error_response(
+                500,
+                "Failed to load Kiro models. Please try again.",
+                "api_error",
+                provider,
+                account_id,
+                &model,
+            );
         }
 
         let resolution = kiro::resolve_model(&model);
@@ -5966,28 +5966,28 @@ pub async fn claude_messages(State(_state): State<AppState>, Json(raw): Json<Val
         ) {
             Ok(p) => p,
             Err(e) => {
-                return Json(json!({
-                    "error": {
-                        "message": format!("Invalid Kiro request: {}", e),
-                        "type": "invalid_request_error",
-                        "code": 400
-                    }
-                }))
-                .into_response();
+                return error_response(
+                    400,
+                    &format!("Invalid Kiro request: {}", e),
+                    "invalid_request_error",
+                    provider,
+                    account_id,
+                    &model,
+                );
             }
         };
 
         let response = match kiro::send_kiro_request(auth, &payload, true).await {
             Ok(r) => r,
             Err(e) => {
-                return Json(json!({
-                    "error": {
-                        "message": format!("Kiro API error: {}", e),
-                        "type": "api_error",
-                        "code": 500
-                    }
-                }))
-                .into_response();
+                return error_response(
+                    500,
+                    &format!("Kiro API error: {}", e),
+                    "api_error",
+                    provider,
+                    account_id,
+                    &model,
+                );
             }
         };
 
@@ -6022,14 +6022,14 @@ pub async fn claude_messages(State(_state): State<AppState>, Json(raw): Json<Val
                 return with_log_info(Json(claude_response), provider, account_id, &model);
             }
             Err(e) => {
-                return Json(json!({
-                    "error": {
-                        "message": format!("Kiro API error: {}", e),
-                        "type": "api_error",
-                        "code": 500
-                    }
-                }))
-                .into_response();
+                return error_response(
+                    500,
+                    &format!("Kiro API error: {}", e),
+                    "api_error",
+                    provider,
+                    account_id,
+                    &model,
+                );
             }
         }
     }
