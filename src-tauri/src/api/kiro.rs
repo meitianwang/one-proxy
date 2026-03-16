@@ -84,6 +84,7 @@ static FALLBACK_MODELS: Lazy<Vec<Value>> = Lazy::new(|| {
         json!({"modelId": "claude-haiku-4.5"}),
         json!({"modelId": "claude-sonnet-4.5"}),
         json!({"modelId": "claude-opus-4.5"}),
+        json!({"modelId": "claude-opus-4.6"}),
     ]
 });
 
@@ -1073,9 +1074,16 @@ pub async fn ensure_model_cache(auth: &KiroAuth) -> Result<()> {
         return Ok(());
     }
 
-    let models = fetch_models(auth)
-        .await
-        .unwrap_or_else(|_| FALLBACK_MODELS.clone());
+    let (models, fetch_ok) = match fetch_models(auth).await {
+        Ok(m) => {
+            tracing::info!("[Kiro] fetch_models succeeded, got {} models: {:?}", m.len(), m.iter().filter_map(|v| v.get("modelId").and_then(|id| id.as_str())).collect::<Vec<_>>());
+            (m, true)
+        }
+        Err(e) => {
+            tracing::warn!("[Kiro] fetch_models failed (auth_type={:?}, region={}): {}, falling back to static list", auth.auth_type, auth.region, e);
+            (FALLBACK_MODELS.clone(), false)
+        }
+    };
     let mut cache = MODEL_CACHE.write();
     cache.models.clear();
     for model in models {
@@ -1083,7 +1091,10 @@ pub async fn ensure_model_cache(auth: &KiroAuth) -> Result<()> {
             cache.models.insert(model_id.to_string(), model);
         }
     }
-    cache.last_update = Some(Instant::now());
+    // 只有成功时才更新 last_update，失败时不设置，下次请求会立即重试
+    if fetch_ok {
+        cache.last_update = Some(Instant::now());
+    }
 
     for (display, internal) in HIDDEN_MODELS.iter() {
         if !cache.models.contains_key(display) {
@@ -1101,17 +1112,22 @@ pub async fn ensure_model_cache(auth: &KiroAuth) -> Result<()> {
         }
     }
 
-    // Ensure claude-opus-4.5 is always available (Enterprise accounts can use it)
-    if !cache.models.contains_key("claude-opus-4.5") {
-        cache.models.insert(
-            "claude-opus-4.5".to_string(),
-            json!({
-                "modelId": "claude-opus-4.5",
-                "modelName": "Claude Opus 4.5",
-                "description": "Claude Opus 4.5 - Premium model for Enterprise accounts",
-                "tokenLimits": {"maxInputTokens": DEFAULT_MAX_INPUT_TOKENS}
-            }),
-        );
+    // Ensure opus models are always available (Enterprise accounts can use them)
+    for (model_id, model_name) in &[
+        ("claude-opus-4.5", "Claude Opus 4.5"),
+        ("claude-opus-4.6", "Claude Opus 4.6"),
+    ] {
+        if !cache.models.contains_key(*model_id) {
+            cache.models.insert(
+                model_id.to_string(),
+                json!({
+                    "modelId": model_id,
+                    "modelName": model_name,
+                    "description": format!("{} - Premium model for Enterprise accounts", model_name),
+                    "tokenLimits": {"maxInputTokens": DEFAULT_MAX_INPUT_TOKENS}
+                }),
+            );
+        }
     }
 
     Ok(())
